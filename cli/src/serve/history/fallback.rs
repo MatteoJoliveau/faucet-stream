@@ -684,8 +684,47 @@ impl RunHistory for FallbackHistory {
         id: &str,
         tag: &str,
         version: u32,
+        evidence: Option<&super::templates::EvidenceClaim>,
     ) -> Result<(), HistoryError> {
-        strict!(self, p => p.template_set_tag(id, tag, version), f => f.template_set_tag(id, tag, version))
+        strict!(self, p => p.template_set_tag(id, tag, version, evidence), f => f.template_set_tag(id, tag, version, evidence))
+    }
+    async fn template_tag_records(
+        &self,
+        id: &str,
+    ) -> Result<Vec<super::templates::TagRecord>, HistoryError> {
+        strict!(self, p => p.template_tag_records(id), f => f.template_tag_records(id))
+    }
+    async fn template_records(
+        &self,
+        id: &str,
+    ) -> Result<Vec<super::templates::TemplateRecord>, HistoryError> {
+        strict!(self, p => p.template_records(id), f => f.template_records(id))
+    }
+    async fn template_test_results_lenient(
+        &self,
+        id: &str,
+    ) -> Result<
+        (
+            Vec<super::templates::TemplateTestResult>,
+            std::collections::BTreeSet<u32>,
+        ),
+        HistoryError,
+    > {
+        strict!(self, p => p.template_test_results_lenient(id), f => f.template_test_results_lenient(id))
+    }
+    async fn meta_get(&self, key: &str) -> Result<Option<String>, HistoryError> {
+        strict!(self, p => p.meta_get(key), f => f.meta_get(key))
+    }
+    async fn meta_compare_and_set(
+        &self,
+        key: &str,
+        expected: Option<&str>,
+        value: &str,
+    ) -> Result<bool, HistoryError> {
+        strict!(self, p => p.meta_compare_and_set(key, expected, value), f => f.meta_compare_and_set(key, expected, value))
+    }
+    async fn meta_put(&self, key: &str, value: &str) -> Result<(), HistoryError> {
+        strict!(self, p => p.meta_put(key, value), f => f.meta_put(key, value))
     }
     async fn template_tags(
         &self,
@@ -701,11 +740,30 @@ impl RunHistory for FallbackHistory {
         id: &str,
         version: u32,
         launched_by: Option<&str>,
+        evidence: Option<&super::templates::EvidenceClaim>,
     ) -> Result<Option<u32>, HistoryError> {
         strict!(
             self,
-            p => p.template_launch(id, version, launched_by),
-            f => f.template_launch(id, version, launched_by)
+            p => p.template_launch(id, version, launched_by, evidence),
+            f => f.template_launch(id, version, launched_by, evidence)
+        )
+    }
+    async fn template_record_test(
+        &self,
+        result: &crate::serve::history::templates::TemplateTestResult,
+    ) -> Result<(), HistoryError> {
+        strict!(self, p => p.template_record_test(result), f => f.template_record_test(result))
+    }
+    async fn template_test_results(
+        &self,
+        id: &str,
+        version: Option<u32>,
+        limit: usize,
+    ) -> Result<Vec<crate::serve::history::templates::TemplateTestResult>, HistoryError> {
+        strict!(
+            self,
+            p => p.template_test_results(id, version, limit),
+            f => f.template_test_results(id, version, limit)
         )
     }
     async fn template_launches(

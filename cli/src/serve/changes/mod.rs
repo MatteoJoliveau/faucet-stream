@@ -568,6 +568,14 @@ async fn plan_template_launch(
     let st = crate::templates::template_state(&store, &payload.id)
         .await
         .map_err(template_err)?;
+    let tests = crate::templates::bundle::version_tests(
+        &store,
+        &payload.id,
+        version,
+        crate::serve::history::templates::RESULTS_RETAIN,
+    )
+    .await
+    .map_err(template_err)?;
     Ok(ChangePlan {
         material: sha_hex(&format!("{}\n{}\n{:?}", payload.id, version, st.stable)),
         summary: json!({
@@ -576,6 +584,7 @@ async fn plan_template_launch(
             "selector": target,
             "stable_before": st.stable,
             "status_before": st.status,
+            "tests": tests.status,
         }),
         rows: Vec::new(),
     })
@@ -587,6 +596,9 @@ fn template_err(e: crate::error::CliError) -> ServeError {
     match e {
         CliError::UnknownPipelineTemplate { .. } => ServeError::NotFound,
         CliError::Internal(m) => ServeError::Internal(m),
+        refused @ CliError::VersionNotPassing { .. } => {
+            crate::serve::handlers::templates::not_passing(refused)
+        }
         other => ServeError::Unprocessable {
             message: other.to_string(),
             details: None,
@@ -1051,7 +1063,7 @@ async fn execute(
                     Ok(b) => b,
                     Err(e) => return finish_failed(state, actor, change, e.to_string()).await,
                 };
-            crate::templates::register(
+            crate::templates::register_tested(
                 &state.history(),
                 crate::templates::RegisterRequest {
                     id: body.id,
@@ -1064,12 +1076,12 @@ async fn execute(
                 },
             )
             .await
-            .map(|rec| {
+            .map(|r| {
                 (
                     None,
                     Some(TemplateOutcome {
-                        id: rec.id,
-                        version: rec.version,
+                        id: r.record.id,
+                        version: r.record.version,
                     }),
                 )
             })
@@ -1846,7 +1858,7 @@ mod tests {
             &actor("bob"),
             new(
                 ChangeKind::TemplateRegister,
-                json!({"id": "tpl", "config": csv_yaml(dir.path(), "tpl", "")}),
+                json!({"id": "tpl", "config": crate::templates::bundle::smoke(&csv_yaml(dir.path(), "tpl", ""))}),
             ),
         )
         .await
@@ -1868,6 +1880,37 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(launch.status, ChangeStatus::Executed, "{:?}", launch.error);
+
+        let bare = create(
+            &state,
+            &actor("bob"),
+            new(
+                ChangeKind::TemplateRegister,
+                json!({"id": "bare", "config": csv_yaml(dir.path(), "bare", "")}),
+            ),
+        )
+        .await
+        .unwrap();
+        let bare = approve(&state, &actor("alice"), &bare.id, None)
+            .await
+            .unwrap();
+        assert_eq!(bare.status, ChangeStatus::Executed, "{:?}", bare.error);
+        let refused = create(
+            &state,
+            &actor("bob"),
+            new(ChangeKind::TemplateLaunch, json!({"id": "bare"})),
+        )
+        .await
+        .unwrap();
+        let refused = approve(&state, &actor("alice"), &refused.id, None)
+            .await
+            .unwrap();
+        assert_eq!(refused.status, ChangeStatus::Failed);
+        assert!(
+            refused.error.as_deref().unwrap_or("").contains("no_tests"),
+            "{:?}",
+            refused.error
+        );
 
         for kind in [ChangeKind::TemplateRegister, ChangeKind::TemplateLaunch] {
             let c = stored(kind, json!({"x": 1}), "m", 1);

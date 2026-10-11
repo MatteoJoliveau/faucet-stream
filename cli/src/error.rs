@@ -341,6 +341,55 @@ pub enum CliError {
     )]
     UnknownPipelineTemplate { id: String, version: Option<u32> },
 
+    /// A `tests.requires_suites` range matched no registered release of the
+    /// shared suite (#856).
+    #[error(
+        "shared test suite '{suite}' has no release matching '{range}' (available: {})",
+        if available.is_empty() { String::from("none registered") } else { available.join(", ") }
+    )]
+    UnsatisfiedSuiteRequirement {
+        suite: String,
+        range: String,
+        available: Vec<String>,
+    },
+
+    /// A label (launch, rollback, a channel) asked for a version whose test
+    /// status is not `passing` (#856).
+    #[error(
+        "template '{id}' v{version} is {status} — {action} needs a passing version: {reason}{}",
+        if failing.is_empty() { String::new() } else { format!("\n  - {}", failing.join("\n  - ")) }
+    )]
+    VersionNotPassing {
+        id: String,
+        version: u32,
+        status: crate::template_tests::TestStatus,
+        action: String,
+        reason: String,
+        failing: Vec<String>,
+    },
+
+    /// A template that has been launched took a new version with no `tests:`
+    /// block and none to inherit (#856).
+    #[error(
+        "template '{id}' has been launched, so every new version needs tests, and no earlier \
+         version has a `tests:` block to inherit — add a `tests:` block to this document \
+         and register it again ({})",
+        crate::template_tests::gate::TESTS_DOC
+    )]
+    TestsRequired { id: String },
+
+    /// A version's `tests:` block is larger than a test run accepts (#856).
+    #[error(
+        "template '{id}' v{version}: the `tests:` block is {bytes} bytes, over the {limit}-byte \
+         limit for a test run — move shared cases into a `kind: test-suite` and require it"
+    )]
+    TestBundleTooLarge {
+        id: String,
+        version: u32,
+        bytes: usize,
+        limit: usize,
+    },
+
     /// A connector's `auth: { ref }` named a provider not declared in the
     /// top-level `auth:` catalog.
     #[error(

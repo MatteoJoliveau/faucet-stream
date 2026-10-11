@@ -15,7 +15,7 @@ use serde_json::{Value, json};
 use wiremock::matchers::{header, method, path, query_param};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
-const BODY: &str = "version: 1\nname: nightly\npipeline:\n  source: {type: rest, config: {base_url: \"https://x\", path: /e}}\n  sink: {type: stdout, config: {}}\n";
+const BODY: &str = "version: 1\nname: nightly\npipeline:\n  source: {type: rest, config: {base_url: \"https://x\", path: /e}}\n  sink: {type: stdout, config: {}}\ntests:\n  suite:\n    auto: {defaults_baseline: true}\n";
 
 fn free_port() -> u16 {
     std::net::TcpListener::bind("127.0.0.1:0")
@@ -34,6 +34,7 @@ fn args(port: u16, sync: Option<std::path::PathBuf>) -> ServeArgs {
         write_token: None,
         admin_token: None,
         no_auth: true,
+        allow_unauthenticated_network: false,
         max_concurrent_runs: Some(2),
         max_queued_runs: Some(8),
         default_config: None,
@@ -418,4 +419,22 @@ async fn an_invalid_sync_file_fails_startup() {
         .await
         .expect_err("overlapping prefixes must refuse to start");
     assert!(err.to_string().contains("overlapping"), "{err}");
+}
+
+#[test]
+fn test_suites_publish_into_their_own_directory() {
+    use faucet_cli::hub::spec::TemplateKind;
+    use faucet_cli::templates::sync::fetch::dir_for_kind;
+    let dirs = ["source-templates", "test-suites"];
+    assert_eq!(
+        dir_for_kind(&dirs, TemplateKind::TestSuite),
+        Some("test-suites")
+    );
+    assert_eq!(
+        dir_for_kind(
+            &["source-templates", "sink-templates"],
+            TemplateKind::TestSuite
+        ),
+        None
+    );
 }

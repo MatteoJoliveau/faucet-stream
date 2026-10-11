@@ -15,6 +15,8 @@ use crate::error::{CliError, CliResult};
 
 pub const SOURCE_DIR: &str = "source-templates";
 pub const SINK_DIR: &str = "sink-templates";
+/// Shared test suites (`kind: test-suite`, #856).
+pub const TEST_SUITE_DIR: &str = "test-suites";
 
 /// A loaded catalog.
 #[derive(Debug, Default, Clone)]
@@ -143,6 +145,36 @@ impl Catalog {
         }
         cells
     }
+}
+
+/// Every deployment overlay file under `root/deployments` (unscoped and
+/// owner directories).
+pub fn deployment_files(root: &Path) -> CliResult<Vec<PathBuf>> {
+    Ok(list_dir(&root.join(super::DEPLOYMENT_DIR))?
+        .into_iter()
+        .map(|(p, _)| p)
+        .collect())
+}
+
+/// Every shared test suite under `root/test-suites` (#856), parsed and
+/// validated; owner directories follow the same rules as templates.
+pub fn load_test_suites(
+    root: &Path,
+) -> CliResult<Vec<(PathBuf, crate::template_tests::TestSuiteTemplate)>> {
+    let mut out = Vec::new();
+    let mut seen = BTreeMap::new();
+    for (p, owner) in list_dir(&root.join(TEST_SUITE_DIR))? {
+        let text = std::fs::read_to_string(&p)
+            .map_err(|e| CliError::Config(format!("reading {}: {e}", p.display())))?;
+        let value: serde_json::Value = serde_yaml::from_str(&text)
+            .map_err(|e| CliError::Config(format!("{}: invalid YAML: {e}", p.display())))?;
+        let t = crate::template_tests::bundle::parse_test_suite(value)
+            .map_err(|e| CliError::Config(format!("{}: {e}", p.display())))?;
+        check_owner(&p, t.owner.as_deref(), owner.as_deref())?;
+        check_stem(&p, &t.name, &t.id(), &mut seen)?;
+        out.push((p, t));
+    }
+    Ok(out)
 }
 
 fn check_stem(
@@ -630,6 +662,31 @@ pub fn registry_run_command(source: &SourceTemplate, sink: &SinkTemplate) -> Str
     )
 }
 
+/// The index fields describing a template's `tests:` block (#856):
+/// `has_tests`, `test_cases` (cases written out — `cases`, `behavioral`,
+/// `fixtures`; `combine` / `auto` generate more at run time) and, where a
+/// status follows from the document alone, `stable_test_status` (`no_tests`).
+/// A catalog that runs each template's bundle in CI sets
+/// `stable_test_status` for the rest (`passing` / `failing`).
+pub fn tests_fields(tests: Option<&crate::template_tests::TestBundle>) -> Value {
+    let t = tests.filter(|t| !t.is_empty());
+    let mut out = json!({
+        "has_tests": t.is_some(),
+        "test_cases": t.map_or(0, |t| t.suite.cases.len() + t.suite.behavioral.len() + t.fixtures.len()),
+    });
+    if t.is_none() {
+        out["stable_test_status"] = json!("no_tests");
+    }
+    out
+}
+
+fn with_tests(mut entry: Value, tests: Option<&crate::template_tests::TestBundle>) -> Value {
+    if let (Some(obj), Value::Object(extra)) = (entry.as_object_mut(), tests_fields(tests)) {
+        obj.extend(extra);
+    }
+    entry
+}
+
 fn index_json_unsorted(
     cat: &Catalog,
     command: fn(&SourceTemplate, &SinkTemplate) -> String,
@@ -637,7 +694,7 @@ fn index_json_unsorted(
     let cells = cat.matrix();
     json!({
         "version": 1,
-        "sources": cat.sources.iter().map(|(p, s)| json!({
+        "sources": cat.sources.iter().map(|(p, s)| with_tests(json!({
             "id": s.id(),
             "owner": s.owner,
             "official": s.is_official(),
@@ -657,8 +714,8 @@ fn index_json_unsorted(
                 "name": n, "type": p.kind, "required": p.required, "secret": p.secret,
                 "description": p.description, "default": p.default,
             })).collect::<Vec<_>>(),
-        })).collect::<Vec<_>>(),
-        "sinks": cat.sinks.iter().map(|(p, k)| json!({
+        }), s.tests.as_ref())).collect::<Vec<_>>(),
+        "sinks": cat.sinks.iter().map(|(p, k)| with_tests(json!({
             "id": k.id(),
             "owner": k.owner,
             "official": k.is_official(),
@@ -673,7 +730,7 @@ fn index_json_unsorted(
                 "name": n, "type": p.kind, "required": p.required, "secret": p.secret,
                 "description": p.description, "default": p.default,
             })).collect::<Vec<_>>(),
-        })).collect::<Vec<_>>(),
+        }), k.tests.as_ref())).collect::<Vec<_>>(),
         "matrix": cells.iter().map(|c| json!({
             "source": c.source,
             "sink": c.sink,

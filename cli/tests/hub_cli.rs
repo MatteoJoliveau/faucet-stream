@@ -313,6 +313,25 @@ async fn hub_templates_handed_to_run_or_validate_directly_are_redirected() {
         .unwrap_err()
         .to_string();
     assert!(err.contains("is a hub source-template"), "{err}");
+    let suite = dir.path().join("suite.yaml");
+    std::fs::write(
+        &suite,
+        "kind: test-suite\nname: shared\nrelease: 1.0.0\nsuite:\n  auto: { defaults_baseline: true }\n",
+    )
+    .unwrap();
+    let err = run(&[
+        "validate",
+        suite.to_str().unwrap(),
+        "--no-env-file",
+        "--no-secrets",
+    ])
+    .await
+    .unwrap_err()
+    .to_string();
+    assert!(
+        err.contains("is a shared test suite") && err.contains("tests.requires_suites"),
+        "{err}"
+    );
     // Unknown ids name the catalog; an incompatible pairing fails at compose.
     let err = run(&[
         "run",
@@ -800,4 +819,45 @@ async fn a_community_template_may_not_read_operator_env_unless_trusted() {
     ])
     .await
     .expect("check");
+}
+
+/// Linting one file never resolves a hub it does not need: a template with no
+/// `tests:` block lints even when `--hub` names nothing, and one outside any
+/// hub directory with a bundle uses the `--hub` it was given.
+#[tokio::test]
+async fn linting_one_file_resolves_a_hub_only_for_a_bundle() {
+    let dir = tempfile::tempdir().unwrap();
+    let (hub, _out) = fixture(dir.path());
+    let loose = dir.path().join("shop.yaml");
+    std::fs::copy(format!("{hub}/source-templates/shop.yaml"), &loose).unwrap();
+    let missing = dir.path().join("no-such-hub");
+    run(&[
+        "hub",
+        "lint",
+        loose.to_str().unwrap(),
+        "--hub",
+        missing.to_str().unwrap(),
+    ])
+    .await
+    .expect("no bundle: the --hub is never resolved");
+
+    let tested = dir.path().join("tested.yaml");
+    let body = std::fs::read_to_string(&loose).unwrap();
+    std::fs::write(
+        &tested,
+        format!(
+            "{body}\ntests:\n  sink: files\n  suite:\n    auto: {{ defaults_baseline: true }}\n"
+        ),
+    )
+    .unwrap();
+    let err = run(&[
+        "hub",
+        "lint",
+        tested.to_str().unwrap(),
+        "--hub",
+        missing.to_str().unwrap(),
+    ])
+    .await
+    .expect_err("a bundle outside a hub runs against the given --hub, where its sink is absent");
+    assert!(err.to_string().contains("with findings"), "{err}");
 }

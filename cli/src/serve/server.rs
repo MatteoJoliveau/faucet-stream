@@ -155,6 +155,14 @@ pub fn build_router(
             .route(
                 "/v1/templates/{id}/versions/{version}/deprecate",
                 post(templates::deprecate_version),
+            )
+            .route(
+                "/v1/templates/{id}/versions/{version}/test",
+                post(templates::test_version),
+            )
+            .route(
+                "/v1/templates/{id}/versions/{version}/tests",
+                get(templates::version_tests),
             );
         // Template hosting + sync (RFC 0006 / #589). Static `/sync` is matched
         // ahead of the `{id}` parameter by the router, so a template can never
@@ -274,7 +282,27 @@ pub fn build_router(
         .layer(RequestBodyLimitLayer::new(config.body_limit_bytes))
         .layer(axum::middleware::from_fn(metrics::track_metrics))
         .layer(cors)
+        .layer(axum::middleware::from_fn_with_state(
+            state.clone(),
+            scope_test_policy,
+        ))
         .with_state(state)
+}
+
+/// Run each request as this server's work, so template tests it starts
+/// screen for this server's credentials and record its instance (#856).
+async fn scope_test_policy(
+    axum::extract::State(state): axum::extract::State<ServerState>,
+    req: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> axum::response::Response {
+    #[cfg(feature = "templates")]
+    if let Some(policy) = state.test_policy() {
+        return crate::template_tests::trust::with_server_policy(policy, next.run(req)).await;
+    }
+    #[cfg(not(feature = "templates"))]
+    let _ = &state;
+    next.run(req).await
 }
 
 /// The `--cors-origin` layer: the listed origins may call every `/v1` route
@@ -827,6 +855,15 @@ pub async fn serve(config: ServeConfig, mcp: crate::serve::McpServeSettings) -> 
         #[cfg(feature = "triggers")]
         triggers_handle,
     );
+    // Template tests this server runs screen for its credentials and record
+    // this instance on their results (#856).
+    #[cfg(feature = "templates")]
+    {
+        state.set_test_policy(crate::template_tests::trust::ServerTestPolicy {
+            instance: instance_id.clone(),
+        });
+        crate::templates::metrics::describe();
+    }
     #[cfg(feature = "policy")]
     if let Some(p) = policy {
         tracing::info!(rules = p.rules.len(), "data-flow policy loaded");
@@ -849,7 +886,12 @@ pub async fn serve(config: ServeConfig, mcp: crate::serve::McpServeSettings) -> 
             state.set_templates_sync(std::sync::Arc::clone(file));
             let store: crate::templates::TemplateStore = state.history();
             for origin in &file.origins {
-                match crate::templates::sync::sync_origin(&store, origin, false, None).await {
+                let synced = crate::templates::sync::sync_origin(&store, origin, false, None);
+                let synced = match state.test_policy() {
+                    Some(p) => crate::template_tests::trust::with_server_policy(p, synced).await,
+                    None => synced.await,
+                };
+                match synced {
                     Ok(r) => tracing::info!(
                         origin = %r.origin,
                         mutations = r.mutations(),
@@ -865,10 +907,35 @@ pub async fn serve(config: ServeConfig, mcp: crate::serve::McpServeSettings) -> 
                 store,
                 std::sync::Arc::clone(file),
                 shutdown.clone(),
+                state.test_policy(),
             )
         }
         None => Vec::new(),
     };
+    // On a new faucet release line, re-test every label holder and rollback
+    // target in the background; it records results only (#856).
+    #[cfg(feature = "templates")]
+    {
+        let store: crate::templates::TemplateStore = state.history();
+        let policy = state.test_policy();
+        tokio::spawn(async move {
+            let revalidated = crate::templates::revalidate::revalidate_if_new_release(&store);
+            let revalidated = match policy {
+                Some(p) => crate::template_tests::trust::with_server_policy(p, revalidated).await,
+                None => revalidated.await,
+            };
+            match revalidated {
+                Ok(Some(r)) => tracing::info!(
+                    versions = r.versions.len(),
+                    failed = r.failed(),
+                    faucet = %r.faucet,
+                    "revalidated template versions under a new faucet release"
+                ),
+                Ok(None) => {}
+                Err(e) => tracing::warn!(error = %e, "template revalidation failed"),
+            }
+        });
+    }
     let app = build_router(state.clone(), &config, &mcp);
 
     let listener = tokio::net::TcpListener::bind(config.listen)

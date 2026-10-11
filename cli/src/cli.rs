@@ -628,6 +628,10 @@ pub enum TemplateCommand {
     Rows(TemplateRowsArgs),
     /// Run a parameter-combination test suite against a template (#648).
     Test(TemplateTestArgs),
+    /// Re-run the tests of every version that holds a label or is a rollback
+    /// target, under this faucet release (#856). Records results only; never
+    /// moves a label.
+    Revalidate(TemplateRevalidateArgs),
     /// Pull templates from the origins in a `--config` sync file into the
     /// registry (RFC 0006). Appends new versions, never deletes.
     #[cfg(feature = "templates-sync")]
@@ -680,16 +684,29 @@ pub struct TemplatePublishArgs {
 #[cfg(feature = "templates")]
 #[derive(Debug, Parser)]
 pub struct TemplateTestArgs {
-    /// Suite file (YAML or JSON). See `faucet schema template-test`.
+    /// What to test: a suite file (YAML or JSON, `faucet schema
+    /// template-test`); a template file carrying a `tests:` bundle (run
+    /// offline, companions read from `--hub`); or a registered version
+    /// `<id>@<version>` (`<id>` alone = `newest`), whose bundle runs and whose
+    /// result is recorded on the version (#856).
     pub suite: PathBuf,
     /// Registry store URL. Omit when the suite's `template:` is a path to a
     /// config file — that form needs no registry, which is what lets a
-    /// template be tested before it is ever registered.
+    /// template be tested before it is ever registered. Required for
+    /// `<id>@<version>`.
     #[arg(long, env = "FAUCET_TEMPLATE_STORE", hide_env_values = true)]
     pub store: Option<String>,
     /// Override the suite's `select:` version selector.
     #[arg(long)]
     pub select: Option<String>,
+    /// For `<id>@<version>`: run the bundle without recording the result.
+    #[arg(long)]
+    pub no_record: bool,
+    /// For a template file: the hub its bundle's companions (`sink:`,
+    /// `source:`, `overlay:`) and shared suites are read from. Default: the
+    /// hub the file lives in, else `--hub` / `$FAUCET_HUB` / `./hub`.
+    #[arg(long, env = "FAUCET_HUB")]
+    pub hub: Option<String>,
     /// Run only cases whose name matches this pattern (`*` wildcards).
     #[arg(long)]
     pub filter: Option<String>,
@@ -835,6 +852,14 @@ pub struct TemplateListArgs {
     pub kind: Option<TemplateKindArg>,
 }
 
+/// `faucet template revalidate`.
+#[cfg(feature = "templates")]
+#[derive(Debug, Parser)]
+pub struct TemplateRevalidateArgs {
+    #[command(flatten)]
+    pub common: TemplateStoreArgs,
+}
+
 /// `--kind` filter for `faucet template list`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
 pub enum TemplateKindArg {
@@ -932,6 +957,11 @@ pub struct TemplateRunArgs {
     /// template, matrix rows of a pipeline. `faucet template rows` lists them.
     #[command(flatten)]
     pub selection: SelectionArgs,
+    /// Run a version whose tests are not `passing` (#856). Once the template
+    /// has been launched such a run is refused without this; a draft template
+    /// needs none.
+    #[arg(long)]
+    pub allow_untested: bool,
     #[command(flatten)]
     pub common: TemplateStoreArgs,
 }
@@ -1989,6 +2019,11 @@ pub struct ServeArgs {
     /// unauthenticated server is never accidental.
     #[arg(long)]
     pub no_auth: bool,
+    /// With `--no-auth`, allow listening on a non-loopback address. Without
+    /// it an unauthenticated server refuses to bind anything but loopback,
+    /// because anyone who can reach the port can run pipelines.
+    #[arg(long, env = "FAUCET_SERVE_ALLOW_UNAUTHENTICATED_NETWORK")]
+    pub allow_unauthenticated_network: bool,
     /// Path to an RBAC auth config (YAML/JSON) defining principals — each a
     /// `{ name, token, role }` where role is `viewer` / `operator` / `admin`.
     /// Enables role-based access control + an audit log. Mutually exclusive with
@@ -2799,6 +2834,10 @@ pub enum SchemaTarget {
     SinkTemplate,
     /// JSON Schema for a `kind: deployment` overlay (#679).
     Deployment,
+    /// JSON Schema for the `tests:` block a template version carries (#856).
+    TemplateTests,
+    /// JSON Schema for a shared `kind: test-suite` document (#856).
+    TestSuite,
     /// JSON Schema for a `faucet template test` suite file (#648).
     #[cfg(feature = "templates")]
     TemplateTest,

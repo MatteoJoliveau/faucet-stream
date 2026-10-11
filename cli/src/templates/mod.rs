@@ -50,19 +50,22 @@
 //! values are never persisted at all; see [`materialize`] for the one place that
 //! distinction is enforced.
 
+pub mod bundle;
+pub mod metrics;
+pub mod revalidate;
 pub mod rows;
 pub mod store;
-#[cfg(feature = "templates")]
-pub mod suite;
+pub use crate::template_tests as suite;
 #[cfg(feature = "templates-sync")]
 pub mod sync;
 
 pub use store::{
     LaunchOutcome, Materialize, MaterializedConfig, OverlayChoice, RegisterPreview,
-    RegisterRequest, SinkChoice, TemplateStore, deprecation_warning, launch, list_with_state,
-    materialize, materialize_for_run, materialize_for_run_selected, materialize_pair,
-    materialize_pair_overlaid, parse_body, preview_register, promote, register, resolve_store_url,
-    resolve_version, rollback, set_deprecated, set_version_deprecated, template_state,
+    RegisterRequest, Registration, SinkChoice, TemplateStore, deprecation_warning, launch,
+    list_with_state, materialize, materialize_for_run, materialize_for_run_selected,
+    materialize_pair, materialize_pair_overlaid, parse_body, preview_register, promote, register,
+    register_staged, register_tested, resolve_store_url, resolve_version, rollback, run_gate,
+    set_deprecated, set_version_deprecated, template_state,
 };
 
 use crate::error::{CliError, CliResult};

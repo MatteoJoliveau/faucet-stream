@@ -438,6 +438,8 @@ impl From<TemplateId> for String {
     }
 }
 
+pub use crate::template_tests::result::{RESULTS_RETAIN, TemplateTestResult};
+
 /// One registered version of a template.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TemplateRecord {
@@ -543,6 +545,46 @@ pub struct LaunchRecord {
     /// Principal that launched it (`None` for a CLI launch).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub launched_by: Option<String>,
+    /// The test result the launch relied on (#856); `None` for a launch made
+    /// before results were recorded.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub evidence: Option<String>,
+}
+
+/// One stored channel pointer with the evidence it moved on (#856).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct TagRecord {
+    pub tag: String,
+    pub version: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub evidence: Option<String>,
+}
+
+/// The evidence a label move relies on: a result id and the body hash it was
+/// judged against. The store re-reads the version's results in the same
+/// transaction as the move and refuses it unless this result still decides.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EvidenceClaim {
+    pub result_id: String,
+    pub body_sha256: String,
+}
+
+impl EvidenceClaim {
+    /// `Ok` when `claim`'s result is still the passing result that decides
+    /// the version (`results` newest first); otherwise why not.
+    pub fn check(&self, results: &[TemplateTestResult]) -> Result<(), super::HistoryError> {
+        match crate::template_tests::gate::deciding_evidence(results, &self.body_sha256) {
+            Some(r) if r.result_id == self.result_id && r.passed => Ok(()),
+            Some(r) => Err(super::HistoryError::StaleEvidence(format!(
+                "a newer test result ({}, {}) replaced the one this move relied on",
+                r.result_id,
+                if r.passed { "passed" } else { "failed" }
+            ))),
+            None => Err(super::HistoryError::StaleEvidence(
+                "the test result this move relied on no longer counts".into(),
+            )),
+        }
+    }
 }
 
 /// Why and when a template was retired. Stored only while deprecated; clearing it
@@ -590,6 +632,20 @@ pub struct TemplateState {
     /// Individually retired versions, newest first (#697).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub deprecated_versions: Vec<VersionDeprecation>,
+    /// Each version's test status (#856): `passing`, `failing`, `untested` or
+    /// `no_tests`. Only a `passing` version may hold a label.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub test_status: BTreeMap<u32, crate::template_tests::TestStatus>,
+    /// Whether the newest registered version carries a `tests:` block.
+    #[serde(default)]
+    pub has_tests: bool,
+    /// The launched version's test status.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stable_tests: Option<crate::template_tests::TestStatus>,
+    /// The test result each stored label moved on (`stable` and every
+    /// channel), by label name.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub evidence: BTreeMap<String, String>,
 }
 
 impl TemplateState {
@@ -615,6 +671,15 @@ impl TemplateState {
             tags,
             deprecation,
             deprecated_versions,
+            test_status: BTreeMap::new(),
+            has_tests: false,
+            stable_tests: None,
+            evidence: launches
+                .first()
+                .and_then(|l| l.evidence.clone())
+                .map(|e| (DEFAULT_CHANNEL.to_string(), e))
+                .into_iter()
+                .collect(),
         }
     }
 
@@ -694,6 +759,37 @@ pub fn protected_versions(
         .chain(previous_version(launches))
         .chain(tags.values().copied())
         .collect()
+}
+
+/// sha256 of a stored body, exactly as stored.
+pub fn body_sha256(body: &str) -> String {
+    use sha2::Digest as _;
+    format!("{:x}", sha2::Sha256::digest(body.as_bytes()))
+}
+
+/// The `newest` holder of a launched template (#856): the highest version, not
+/// in `retired`, whose exact body has ever had a passing result. `records`
+/// and `results` cover the whole template.
+pub fn sticky_newest(
+    records: &[TemplateRecord],
+    results: &[TemplateTestResult],
+    retired: &std::collections::BTreeSet<u32>,
+) -> Option<u32> {
+    let mut versions: Vec<&TemplateRecord> = records.iter().collect();
+    versions.sort_by_key(|r| std::cmp::Reverse(r.version));
+    versions
+        .into_iter()
+        .filter(|r| !retired.contains(&r.version))
+        .find(|r| {
+            let sha = body_sha256(&r.body);
+            let own: Vec<TemplateTestResult> = results
+                .iter()
+                .filter(|t| t.version == r.version)
+                .cloned()
+                .collect();
+            crate::template_tests::gate::ever_passed(&own, &sha)
+        })
+        .map(|r| r.version)
 }
 
 /// The version numbers to delete so at most [`VERSION_RETAIN`] remain for an id,
@@ -776,6 +872,7 @@ mod tests {
             version,
             launched_at: DateTime::from_timestamp(seq as i64, 0).unwrap(),
             launched_by: None,
+            evidence: None,
         };
         let launches = vec![launch(3, 2), launch(2, 1), launch(1, 4)];
         let tags = BTreeMap::from([("prod".to_string(), 3)]);

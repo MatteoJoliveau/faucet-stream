@@ -131,6 +131,16 @@ impl SyncReport {
             s.push_str(&format!("  warning    {w}\n"));
         }
         if let Some(o) = &self.outcome {
+            for t in &o.tested {
+                s.push_str(&format!(
+                    "  tested     {} v{}: {} ({} case(s), {} failed)\n",
+                    t.id,
+                    t.version,
+                    if t.passed { "pass" } else { "FAIL" },
+                    t.cases,
+                    t.failed_cases
+                ));
+            }
             for f in &o.failed {
                 s.push_str(&format!("  FAILED     {}: {}\n", f.id, f.error));
             }
@@ -251,7 +261,7 @@ pub async fn local_snapshot(store: &TemplateStore, prefix: &str) -> CliResult<Ve
         let newest = state.versions.first().copied();
         let newest_hash = match newest {
             Some(v) => match store.template_get(&s.id, Some(v)).await {
-                Ok(Some(rec)) => plan::body_hash(&rec.body).ok(),
+                Ok(Some(rec)) => plan::stored_body_hash(&rec.body).ok(),
                 Ok(None) => None,
                 Err(e) => {
                     return Err(crate::templates::store::registry_err(
@@ -479,6 +489,7 @@ pub fn spawn_interval_syncs(
     store: TemplateStore,
     file: Arc<SyncFile>,
     shutdown: tokio_util::sync::CancellationToken,
+    policy: Option<crate::template_tests::trust::ServerTestPolicy>,
 ) -> Vec<tokio::task::JoinHandle<()>> {
     file.origins
         .iter()
@@ -487,6 +498,7 @@ pub fn spawn_interval_syncs(
             let store = store.clone();
             let file = Arc::clone(&file);
             let shutdown = shutdown.clone();
+            let policy = policy.clone();
             tokio::spawn(async move {
                 let interval = std::time::Duration::from_secs(secs);
                 loop {
@@ -496,7 +508,12 @@ pub fn spawn_interval_syncs(
                         _ = tokio::time::sleep(interval) => {}
                     }
                     let Ok(origin) = file.origin(&name) else { break };
-                    match sync_origin(&store, origin, false, None).await {
+                    let synced = sync_origin(&store, origin, false, None);
+                    let synced = match policy.clone() {
+                        Some(p) => crate::template_tests::trust::with_server_policy(p, synced).await,
+                        None => synced.await,
+                    };
+                    match synced {
                         Ok(r) => {
                             if r.failed() > 0 {
                                 tracing::warn!(origin = %name, failed = r.failed(), "periodic template sync had failures");
@@ -520,7 +537,7 @@ mod tests {
     use wiremock::matchers::{header, method, path, query_param};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
-    const BODY: &str = "version: 1\nname: t\npipeline:\n  source: {type: rest, config: {base_url: \"https://x\", path: /e}}\n  sink: {type: stdout, config: {}}\n";
+    const BODY: &str = "version: 1\nname: t\npipeline:\n  source: {type: rest, config: {base_url: \"https://x\", path: /e}}\n  sink: {type: stdout, config: {}}\ntests:\n  suite:\n    auto: { defaults_baseline: true }\n";
 
     fn store() -> TemplateStore {
         Arc::new(MemoryHistory::new(Duration::from_secs(60)))
@@ -694,7 +711,7 @@ mod tests {
                 &s,
                 crate::templates::RegisterRequest {
                     id: Some(id.into()),
-                    body: BODY.into(),
+                    body: crate::templates::bundle::smoke(BODY),
                     format: ConfigFormat::Yaml,
                     description: None,
                     tags: vec![],
@@ -812,7 +829,7 @@ mod tests {
             &s,
             crate::templates::RegisterRequest {
                 id: Some("plat-out".into()),
-                body: BODY.into(),
+                body: crate::templates::bundle::smoke(BODY),
                 format: ConfigFormat::Yaml,
                 description: None,
                 tags: vec![],
@@ -940,6 +957,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial_test::serial(env)]
     async fn load_sync_file_interpolates_validates_and_redacts() {
         let dir = tempfile::tempdir().unwrap();
         let p = dir.path().join("sync.yaml");
@@ -994,6 +1012,7 @@ mod tests {
     /// newline stays inside its string (#789 CLI-106), and a whole-value
     /// directive can still produce a number.
     #[tokio::test]
+    #[serial_test::serial(env)]
     async fn load_sync_file_cannot_be_restructured_by_an_env_value() {
         let dir = tempfile::tempdir().unwrap();
         let p = dir.path().join("sync.yaml");
@@ -1037,7 +1056,7 @@ mod tests {
             &s,
             crate::templates::RegisterRequest {
                 id: Some("flaky".into()),
-                body: BODY.into(),
+                body: crate::templates::bundle::smoke(BODY),
                 format: ConfigFormat::Yaml,
                 description: None,
                 tags: Vec::new(),
@@ -1065,7 +1084,7 @@ mod tests {
                 &s,
                 crate::templates::RegisterRequest {
                     id: Some(id.into()),
-                    body: body.into(),
+                    body: crate::templates::bundle::smoke(body),
                     format: ConfigFormat::Yaml,
                     description: None,
                     tags: vec![],
@@ -1106,7 +1125,7 @@ mod tests {
         // round-trip to the mock server, which paused time cannot drive
         // deterministically (it flaked on CI). One-second interval, bounded
         // real-time wait.
-        let handles = spawn_interval_syncs(s.clone(), file, shutdown.clone());
+        let handles = spawn_interval_syncs(s.clone(), file, shutdown.clone(), None);
         assert_eq!(
             handles.len(),
             1,

@@ -16,6 +16,7 @@
 //! `expand` / `run_expanded` untouched and inherits every gate they enforce.
 //! Zero `faucet-core` changes.
 
+pub mod bundles;
 pub mod catalog;
 pub mod compose;
 #[cfg(feature = "hub-remote")]
@@ -764,6 +765,12 @@ pub fn misplaced_document(path: &Path, verb: &str) -> Option<String> {
                 path.display()
             ),
         ),
+        TemplateKind::TestSuite => (
+            "shared test suite".to_string(),
+            "require it from a template's `tests.requires_suites`; it runs as part of that \
+             template's bundle"
+                .to_string(),
+        ),
         TemplateKind::Pipeline => return None,
     };
     Some(format!("{} is a {what} — {how}", path.display()))
@@ -826,6 +833,16 @@ pub struct IndexEntry {
     pub versions: Vec<IndexVersion>,
     #[serde(default)]
     pub official: bool,
+    /// Whether the template carries a `tests:` block (#856).
+    #[serde(default)]
+    pub has_tests: bool,
+    /// Cases its `tests:` block writes out (#856).
+    #[serde(default)]
+    pub test_cases: usize,
+    /// The test status of the version the catalog marks stable (`passing`,
+    /// `failing`, `no_tests`), when the catalog records one (#856).
+    #[serde(default)]
+    pub stable_test_status: Option<String>,
     /// Stars, freshness and track record, when the catalog records them (#685).
     #[serde(default)]
     pub trust: Option<trust::TrustSignals>,
@@ -1151,6 +1168,7 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial(env)]
     fn hub_location_precedence_flag_env_local_default_remote() {
         // SAFETY (test): env var private to this test binary.
         unsafe { std::env::remove_var("FAUCET_HUB") };

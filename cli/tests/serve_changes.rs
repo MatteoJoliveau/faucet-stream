@@ -47,6 +47,7 @@ fn serve_args(
         write_token: None,
         admin_token: None,
         no_auth: false,
+        allow_unauthenticated_network: false,
         max_concurrent_runs: Some(4),
         max_queued_runs: Some(16),
         default_config: None,
@@ -165,6 +166,9 @@ impl Api {
         panic!("run {run_id} did not finish");
     }
 }
+
+/// A minimal `tests:` block, so a template can be launched (#856).
+const SMOKE: &str = "tests:\n  suite:\n    auto: { defaults_baseline: true }\n";
 
 fn csv_config(input: &std::path::Path, output: &std::path::Path, name: &str) -> String {
     format!(
@@ -361,7 +365,7 @@ async fn plan_approve_run_with_policy_budget_rejection_and_audit() {
     assert_eq!(code, 200);
 
     // Template kinds: a register proposed by an operator needs an admin.
-    let tpl = "kind: pipeline\nversion: 1\nname: tpl-a\npipeline:\n  source: { type: csv, config: { path: ./in.csv } }\n  sink: { type: jsonl, config: { path: ./out.jsonl } }\n";
+    let tpl = "kind: pipeline\nversion: 1\nname: tpl-a\npipeline:\n  source: { type: csv, config: { path: ./in.csv } }\n  sink: { type: jsonl, config: { path: ./out.jsonl } }\ntests:\n  suite:\n    auto: { defaults_baseline: true }\n";
     let (code, change) = api
         .post(
             "bob-tok",
@@ -533,7 +537,7 @@ async fn plan_approve_run_with_policy_budget_rejection_and_audit() {
         .post(
             "admin-tok",
             "/v1/templates",
-            json!({ "config": format!("kind: pipeline\n{}", csv_config(&input, &tpl_out, "tpl-mcp")),
+            json!({ "config": format!("kind: pipeline\n{}{SMOKE}", csv_config(&input, &tpl_out, "tpl-mcp")),
                     "id": "tpl-mcp", "launch": true }),
         )
         .await;
@@ -704,7 +708,7 @@ async fn require_approval_turns_submissions_into_change_requests() {
         .post(
             "admin-tok",
             "/v1/templates",
-            json!({ "config": format!("kind: pipeline\n{}", csv_config(&input, &output, "tpl-gated")),
+            json!({ "config": format!("kind: pipeline\n{}{SMOKE}", csv_config(&input, &output, "tpl-gated")),
                     "id": "tpl-gated", "launch": true }),
         )
         .await;

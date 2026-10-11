@@ -414,7 +414,7 @@ function listRow(t) {
   el.innerHTML = `
     ${statusPill(st.status || "draft")}
     <span class="tpl-row-id">
-      <span class="tpl-row-title"><b class="mono">${escapeHtml(t.id)}</b></span>
+      <span class="tpl-row-title"><b class="mono">${escapeHtml(t.id)}</b>${st.stable != null && st.stable_tests ? testPill(st.stable_tests, `v${st.stable} `) : st.has_tests ? "" : testPill("no_tests")}</span>
       ${t.description ? `<span class="tpl-row-desc">${escapeHtml(t.description)}</span>` : ""}
     </span>
     <span class="tpl-row-kind">${kindPill(kindOf(t))}</span>
@@ -571,7 +571,9 @@ streams:
     try {
       const resp = await api("/v1/templates", { method: "POST", body });
       out.hidden = true;
-      toast(`${resp.id} v${resp.version} registered`);
+      const inherited = resp.tests_inherited_from != null ? ` (tests inherited from v${resp.tests_inherited_from})` : "";
+      if (resp.tests && !resp.tests.passed) toast(`${resp.id} v${resp.version} registered${inherited} — its tests fail, so it can take no label`, "error");
+      else toast(`${resp.id} v${resp.version} registered${inherited}${resp.tests ? " — tests passing" : ""}`);
       // Adding a version from the detail page stays put and reloads; the
       // list-page flow navigates into the freshly-registered template.
       if (!newVersion) navigate(`#/templates/${encodeURIComponent(resp.id)}`);
@@ -792,6 +794,60 @@ function channelsFor(v, st) {
   return out;
 }
 
+/** One vocabulary for a version's test status (#856). */
+const TEST_PILL = {
+  passing: ["passing", "pill-completed"],
+  failing: ["failing", "pill-failed"],
+  untested: ["untested", "pill-queued"],
+  no_tests: ["no tests", "pill-cancelled"],
+  unknown: ["unknown", "pill-failed"],
+};
+
+/** A small test-status pill, with an optional prefix. */
+function testPill(status, prefix = "") {
+  const [label, cls] = TEST_PILL[status] || [status, "pill-cancelled"];
+  return `<span class="pill ${cls}" title="tests: ${escapeHtml(label)}">${escapeHtml(prefix + label)}</span>`;
+}
+
+/** The test status of one version (#856), from the detail response. */
+function testsFor(d, v) {
+  return (d.tests && (d.tests.versions || []).find((x) => x.version === v)) || null;
+}
+
+/** Whether a label (launch, a channel) may move onto a version: `passing`,
+ *  or `untested` — whose tests then run first and decide. */
+function canTakeLabel(t) {
+  return !!t && (t.status === "passing" || t.status === "untested");
+}
+
+/** The pill, and the "why no label" / run-history block under a version row. */
+function testsBlock(t) {
+  if (!t) return { pill: "", body: "" };
+  const pill = testPill(t.status, "tests ");
+  const lines = [];
+  if (t.status === "failing") {
+    const cases = (t.failing || []).map((f) => `<li class="mono">${escapeHtml(f)}</li>`).join("");
+    lines.push(`<div class="tpl-tests-why"><b>Can't be launched or take a channel</b> — its tests fail.${cases ? `<ul>${cases}</ul>` : ""}</div>`);
+  } else if (t.status === "no_tests") {
+    lines.push(`<div class="tpl-tests-why"><b>Can't be launched or take a channel</b> — ${mdInline(t.reason || "it has no `tests:` block.")}</div>`);
+  } else if (t.status === "unknown") {
+    lines.push(`<div class="tpl-tests-why"><b>Can't be launched or take a channel</b> — ${mdInline(t.reason || "its tests or results cannot be read.")}</div>`);
+  } else if (t.status === "untested") {
+    lines.push(`<div class="tpl-tests-why tpl-tests-warn">No test result under this faucet version — launching or assigning a channel runs its tests first.</div>`);
+  }
+  if (t.results && t.results.length) {
+    const rows = t.results
+      .map((r) => {
+        const failed = r.cases.filter((c) => !c.passed).length;
+        const retried = r.cases.filter((c) => c.attempts > 1).length;
+        return `<tr><td class="tpl-launch-when">${fmtTime(r.recorded_at)}</td><td><span class="pill ${r.passed ? "pill-completed" : "pill-failed"}">${r.passed ? "pass" : "fail"}</span></td><td class="tpl-tests-cases">${r.cases.length - failed}/${r.cases.length}${retried ? ` · ${retried} retried` : ""}${r.error ? ` · ${escapeHtml(r.error)}` : ""}</td><td class="mono">${escapeHtml(r.faucet_version)}</td><td>${escapeHtml(r.recorded_by || "cli")}</td></tr>`;
+      })
+      .join("");
+    lines.push(`<div class="tpl-launch-wrap"><table class="tbl tpl-tests-tbl"><thead><tr><th>run</th><th>result</th><th>cases</th><th>faucet</th><th>by</th></tr></thead><tbody>${rows}</tbody></table></div>`);
+  }
+  return { pill, body: lines.length ? `<div class="tpl-tests">${lines.join("")}</div>` : "" };
+}
+
 function renderVersions(host, id, st, d, reload) {
   host.innerHTML = "";
   if (!st.versions.length) {
@@ -810,22 +866,47 @@ function renderVersions(host, id, st, d, reload) {
       channelsFor(v, st)
         .map(([name, cls]) => `<span class="pill ${cls}">${escapeHtml(name)}</span>`)
         .join("");
-    const launchTitle = st.stable === v ? "already live" : retired ? `v${v} is deprecated — revive it to launch it` : `make v${v} live for unpinned runs`;
+    const t = testsFor(d, v);
+    const tb = testsBlock(t);
+    const blocked = !canTakeLabel(t);
+    const launchTitle = st.stable === v ? "already live" : retired ? `v${v} is deprecated — revive it to launch it` : blocked ? `only a version whose tests pass can be launched (v${v} is ${t ? t.status : "unknown"})` : `make v${v} live for unpinned runs`;
     row.innerHTML = `
       <span class="tpl-vnum mono">v${v}</span>
-      <span class="tpl-vchannels">${pills || `<span class="run-meta">no channel</span>`}</span>
-      <select class="tpl-assign" data-perm="template_admin" title="point a channel at v${v}">
+      <span class="tpl-vchannels">${pills || `<span class="run-meta">no channel</span>`}${tb.pill}</span>
+      <select class="tpl-assign" data-perm="template_admin" ${blocked ? "disabled" : ""} title="${blocked ? `only a version whose tests pass can take a channel` : `point a channel at v${v}`}">
         <option value="">assign channel</option>
         ${ASSIGNABLE.map((c) => `<option value="${c}">${c}</option>`).join("")}
       </select>
-      <button class="btn-ghost tpl-launch" data-perm="template_admin" ${st.stable === v || retired ? "disabled" : ""}
-        title="${launchTitle}">Launch</button>
+      <button class="btn-ghost tpl-launch" data-perm="template_admin" ${st.stable === v || retired || blocked ? "disabled" : ""}
+        title="${escapeHtml(launchTitle)}">Launch</button>
+      ${t && t.has_tests ? `<button class="btn-ghost tpl-runtests" data-perm="template_admin" title="run v${v}'s tests: bundle and record the result">Run tests</button>` : ""}
       <button class="btn-ghost tpl-view">Config</button>
       <button class="btn-ghost tpl-view-clean" title="comments stripped, canonical YAML">Clean</button>
       <button class="${retired ? "btn-ghost" : "btn-warn"} tpl-vdeprecate" data-perm="template_admin"
         title="${retired ? `make v${v} usable again` : `retire v${v}: pinned runs still work but warn, newest skips it, launch refuses it`}">${retired ? "Revive" : "Deprecate"}</button>
       <button class="btn-danger tpl-del" data-perm="template_admin">Delete</button>
+      ${tb.body}
       <pre class="tpl-body" hidden></pre>`;
+
+    const runTests = row.querySelector(".tpl-runtests");
+    if (runTests) {
+      runTests.onclick = async (ev) => {
+        ev.stopPropagation();
+        runTests.disabled = true;
+        runTests.textContent = "Running…";
+        try {
+          const r = await api(`/v1/templates/${encodeURIComponent(id)}/versions/${v}/test`, { method: "POST", body: {} });
+          const failed = r.cases.filter((c) => !c.passed).length;
+          if (r.passed) toast(`v${v}: ${r.cases.length} case(s) passed`);
+          else toast(`v${v}: ${failed} of ${r.cases.length} case(s) failed`, "error");
+          reload();
+        } catch (e) {
+          toast(e.message, "error");
+          runTests.disabled = false;
+          runTests.textContent = "Run tests";
+        }
+      };
+    }
 
     row.querySelector(".tpl-assign").onchange = async (ev) => {
       const tag = ev.target.value;
@@ -1131,7 +1212,7 @@ async function renderTrigger(host, id, st, d, withSink = false, preselectSink = 
   for (const r of rows) {
     r.title = `run v${r.dataset.version}`;
     r.onclick = (ev) => {
-      if (ev.target.closest("button, select, a, pre")) return;
+      if (ev.target.closest("button, select, a, pre, .tpl-tests")) return;
       versionSel.value = r.dataset.version;
       markPicked();
       renderParams();

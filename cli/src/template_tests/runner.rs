@@ -1,4 +1,4 @@
-//! Running a template test suite (#648).
+//! Running a template test suite (#648) or a version's test bundle (#856).
 //!
 //! Two tiers, both offline:
 //!
@@ -18,11 +18,11 @@
 use serde_json::Value;
 use std::collections::BTreeMap;
 
+use super::bundle::Fixture;
 use super::combine::{GeneratedCase, generate};
-use super::spec::{Behavioral, SuiteFile};
+use super::spec::{Behavioral, Suite, SuiteFile};
 use crate::error::{CliError, CliResult};
 use crate::params::SuppliedParams;
-use crate::templates::{Materialize, TemplateStore, resolve_version};
 
 /// What one case did.
 #[derive(Debug, Clone, PartialEq)]
@@ -33,6 +33,11 @@ pub struct CaseOutcome {
     pub passed: bool,
     /// Why it failed, or `None` when it passed.
     pub failure: Option<String>,
+    /// How many times the case ran: `1`, or more when it asked for retries
+    /// and an earlier attempt failed.
+    pub attempts: u32,
+    /// Wall time across every attempt.
+    pub duration_ms: u64,
 }
 
 /// The whole suite's result.
@@ -56,8 +61,9 @@ pub enum Target<'a> {
     /// A registered template, resolved through the store. `sink` is the
     /// registered sink template (id, version) a `source-template` composes
     /// with; ignored by a `pipeline` template.
+    #[cfg(feature = "templates")]
     Registered {
-        store: &'a TemplateStore,
+        store: &'a crate::templates::TemplateStore,
         id: &'a str,
         version: u32,
         sink: Option<(&'a str, u32)>,
@@ -67,14 +73,16 @@ pub enum Target<'a> {
     /// A config file on disk — lets a template be tested **before** it is
     /// registered, which is when these failures are cheapest to fix.
     /// `sink_body` is the sink template document a `source-template` file
-    /// composes with.
+    /// composes with; `overlay` is a deployment overlay document applied over
+    /// the composition.
     Document {
         body: String,
         sink_body: Option<String>,
-        /// The deployment overlay applied over the composition (#679); a
-        /// file-based suite reads it from disk, so it is always inline here.
-        overlay: Option<crate::templates::OverlayChoice>,
+        overlay: Option<Value>,
     },
+    #[cfg(not(feature = "templates"))]
+    #[doc(hidden)]
+    Never(std::convert::Infallible, std::marker::PhantomData<&'a ()>),
 }
 
 /// Run every case in `file` against `target`, optionally filtered by name.
@@ -83,31 +91,194 @@ pub async fn run(
     target: Target<'_>,
     filter: Option<&str>,
 ) -> CliResult<SuiteOutcome> {
-    let params_spec = declared_params(&target).await?;
-    let cases = generate(&file.suite, &params_spec)?;
+    run_suite(&file.suite, &target, filter, file.base_dir.as_deref(), "").await
+}
+
+/// Run one suite's cases against `target`. `prefix` is prepended to every
+/// case name (a shared suite's `name@release:`), and `filter` matches the
+/// prefixed name.
+pub async fn run_suite(
+    suite: &Suite,
+    target: &Target<'_>,
+    filter: Option<&str>,
+    base_dir: Option<&std::path::Path>,
+    prefix: &str,
+) -> CliResult<SuiteOutcome> {
+    // A pairing with a stream the sink cannot run can still be tested by
+    // explicit cases that expect exactly that error; generated cases need
+    // its params.
+    let params_spec = match declared_params(target).await {
+        Ok(p) => p,
+        Err(e)
+            if suite.auto.is_none()
+                && suite.combine.is_none()
+                && e.to_string().contains(crate::hub::compose::INCOMPATIBLE) =>
+        {
+            Default::default()
+        }
+        Err(e) => return Err(e),
+    };
+    let cases = generate(suite, &params_spec)?;
 
     let mut outcome = SuiteOutcome::default();
     for case in &cases {
-        if !name_matches(&case.name, filter) {
+        let name = format!("{prefix}{}", case.name);
+        if !name_matches(&name, filter) {
             continue;
         }
-        outcome.cases.push(run_validation_case(case, &target).await);
+        let started = std::time::Instant::now();
+        let mut c = run_validation_case(case, target).await;
+        c.name = name;
+        c.duration_ms = elapsed_ms(started);
+        outcome.cases.push(c);
     }
-    for b in &file.suite.behavioral {
-        if !name_matches(&b.name, filter) {
+    for b in &suite.behavioral {
+        let name = format!("{prefix}{}", b.name);
+        if !name_matches(&name, filter) {
             continue;
         }
-        outcome
-            .cases
-            .push(run_behavioral_case(b, &target, file.base_dir.as_deref()).await);
+        let started = std::time::Instant::now();
+        let mut c = run_behavioral_case(b, target, base_dir).await;
+        c.name = name;
+        c.duration_ms = elapsed_ms(started);
+        outcome.cases.push(c);
     }
+    redact_secret_params(&mut outcome, &params_spec);
     Ok(outcome)
+}
+
+/// Record a secret param a case named as `***`, so a test result never
+/// carries its value.
+fn redact_secret_params(outcome: &mut SuiteOutcome, params: &crate::params::ParamsSpec) {
+    for c in &mut outcome.cases {
+        let mut values = Vec::new();
+        for (name, v) in c.params.iter_mut() {
+            if params.get(name).is_some_and(|p| p.secret) {
+                let text = match &*v {
+                    Value::String(s) => s.clone(),
+                    other => other.to_string(),
+                };
+                if !text.is_empty() {
+                    values.push(text);
+                }
+                *v = Value::String("***".into());
+            }
+        }
+        values.sort_by_key(|v| std::cmp::Reverse(v.len()));
+        if let Some(f) = &mut c.failure {
+            for v in &values {
+                *f = f.replace(v.as_str(), "***");
+            }
+        }
+    }
+}
+
+/// Run fixture cases (the `faucet test` grammar) against `target`.
+pub async fn run_fixtures(
+    fixtures: &[Fixture],
+    target: &Target<'_>,
+    filter: Option<&str>,
+    prefix: &str,
+) -> SuiteOutcome {
+    let mut outcome = SuiteOutcome::default();
+    for f in fixtures {
+        let name = format!("{prefix}{}", f.name);
+        if !name_matches(&name, filter) {
+            continue;
+        }
+        let started = std::time::Instant::now();
+        let (failure, attempts) =
+            attempt(f.retries, || async { fixture_inner(f, target).await }).await;
+        outcome.cases.push(CaseOutcome {
+            name,
+            origin: "fixture",
+            params: f.params.clone(),
+            passed: failure.is_none(),
+            failure,
+            attempts,
+            duration_ms: elapsed_ms(started),
+        });
+    }
+    if let Ok(params) = declared_params(target).await {
+        redact_secret_params(&mut outcome, &params);
+    }
+    outcome
+}
+
+fn elapsed_ms(started: std::time::Instant) -> u64 {
+    u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX)
+}
+
+tokio::task_local! {
+    /// The limits and deadline of the bundle run in progress (#856).
+    static RUN_LIMITS: (super::trust::TestLimits, tokio::time::Instant);
+}
+
+/// Run `fut` under `limits`: every case started inside is held to the
+/// per-case timeout and fails once the run's budget is spent.
+pub async fn with_run_limits<F: std::future::Future>(
+    limits: super::trust::TestLimits,
+    fut: F,
+) -> F::Output {
+    RUN_LIMITS
+        .scope(
+            (limits, tokio::time::Instant::now() + limits.run_budget),
+            fut,
+        )
+        .await
+}
+
+/// Run `once` up to `1 + retries` times, stopping at the first pass, within
+/// the per-case time limit and whatever is left of the run's budget. Returns
+/// the last failure (`None` on a pass) and the attempts used.
+async fn attempt<F, Fut>(retries: u32, mut once: F) -> (Option<String>, u32)
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = CliResult<Option<String>>>,
+{
+    let (limits, run_deadline) = RUN_LIMITS
+        .try_with(|l| (l.0, Some(l.1)))
+        .unwrap_or((super::trust::limits(), None));
+    let case_deadline = tokio::time::Instant::now() + limits.case_timeout;
+    let (deadline, by_run) = match run_deadline {
+        Some(r) if r < case_deadline => (r, true),
+        _ => (case_deadline, false),
+    };
+    let ran_out = || {
+        if by_run {
+            format!(
+                "the test run's {}s time budget ran out",
+                limits.run_budget.as_secs()
+            )
+        } else {
+            format!(
+                "timed out after {}s (the per-case limit)",
+                limits.case_timeout.as_secs()
+            )
+        }
+    };
+    let mut attempts = 0;
+    let mut last = None;
+    while attempts <= retries {
+        if tokio::time::Instant::now() >= deadline {
+            return (Some(ran_out()), attempts.max(1));
+        }
+        attempts += 1;
+        last = match tokio::time::timeout_at(deadline, once()).await {
+            Ok(Ok(None)) => return (None, attempts),
+            Ok(Ok(Some(msg))) => Some(msg),
+            Ok(Err(e)) => Some(e.to_string()),
+            Err(_) => return (Some(ran_out()), attempts),
+        };
+    }
+    (last, attempts)
 }
 
 /// Resolve a version selector against the store, so a suite can say
 /// `select: stable` rather than pinning a number that goes stale.
+#[cfg(feature = "templates")]
 pub async fn resolve_target_version(
-    store: &TemplateStore,
+    store: &crate::templates::TemplateStore,
     id: &str,
     select: Option<&str>,
 ) -> CliResult<u32> {
@@ -115,12 +286,12 @@ pub async fn resolve_target_version(
         Some(s) => crate::serve::history::templates::VersionSelector::parse(s)?,
         None => Default::default(),
     };
-    resolve_version(store, id, selector).await
+    crate::templates::resolve_version(store, id, selector).await
 }
 
 /// Glob-ish filter: `*` matches any run of characters. A plain name is an
 /// exact match, so `--filter auto:defaults` runs one case.
-fn name_matches(name: &str, filter: Option<&str>) -> bool {
+pub(crate) fn name_matches(name: &str, filter: Option<&str>) -> bool {
     let Some(pat) = filter else { return true };
     let mut rest = name;
     let mut parts = pat.split('*').peekable();
@@ -149,6 +320,8 @@ fn name_matches(name: &str, filter: Option<&str>) -> bool {
 /// params merged), because that is the surface a trigger binds.
 async fn declared_params(target: &Target<'_>) -> CliResult<crate::params::ParamsSpec> {
     let mut doc = effective_document(target).await?;
+    neutralize_secret_defaults(&mut doc);
+    super::trust::screen(&doc)?;
     // Defaults like `${env:PORT}` resolve before binding, as a real run does.
     crate::interpolate::interpolate_value_with_env(&mut doc, &Default::default())?;
     crate::params::declared(&doc)
@@ -190,16 +363,11 @@ async fn effective_document(target: &Target<'_>) -> CliResult<Value> {
                             })?;
                     let c = crate::hub::compose(&source, &sink)?;
                     Ok(match overlay {
-                        Some(crate::templates::OverlayChoice::Inline(v)) => {
+                        Some(v) => {
                             c.apply_overlay(&crate::hub::DeploymentTemplate::from_value(
                                 v.clone(),
                             )?)?
                             .document
-                        }
-                        Some(crate::templates::OverlayChoice::Registered { id, .. }) => {
-                            return Err(CliError::Config(format!(
-                                "template test: a file-based suite applies an overlay file, not the registered '{id}'"
-                            )));
                         }
                         None => c.document,
                     })
@@ -209,9 +377,15 @@ async fn effective_document(target: &Target<'_>) -> CliResult<Value> {
                      `template:` at a source template and name this one under `sink:`"
                         .into(),
                 )),
+                Some(crate::hub::TemplateKind::TestSuite) => Err(CliError::Config(
+                    "template test: a test-suite is not a template — it runs as part of the \
+                     bundle of a template that requires it"
+                        .into(),
+                )),
                 _ => Ok(doc),
             }
         }
+        #[cfg(feature = "templates")]
         Target::Registered {
             store,
             id,
@@ -273,46 +447,55 @@ async fn effective_document(target: &Target<'_>) -> CliResult<Value> {
                 crate::hub::TemplateKind::Deployment => Err(CliError::Config(format!(
                     "template test: '{id}' is a deployment overlay — name it under `overlay:` of a source template's suite"
                 ))),
+                crate::hub::TemplateKind::TestSuite => Err(CliError::Config(format!(
+                    "template test: '{id}' is a test-suite — it runs as part of the bundle of a template that requires it"
+                ))),
             }
         }
+        #[cfg(not(feature = "templates"))]
+        Target::Never(n, _) => match *n {},
     }
 }
 
 /// Materialize one combination and check it expands and compiles.
 async fn run_validation_case(case: &GeneratedCase, target: &Target<'_>) -> CaseOutcome {
     let supplied: SuppliedParams = case.params.clone().into_iter().collect();
-    let result = materialize_and_check(&supplied, target).await;
-
-    let (passed, failure) = match (&result, case.expect.expects_failure()) {
-        // Expected to work, and did.
-        (Ok(()), false) => (true, None),
-        // Expected to work, didn't.
-        (Err(e), false) => (false, Some(e.to_string())),
-        // Expected to fail, and did — check the message when one was named.
-        (Err(e), true) => match &case.expect.error {
-            Some(want) if !e.to_string().contains(want.as_str()) => (
-                false,
-                Some(format!(
-                    "failed as expected, but the error did not mention '{want}': {e}"
-                )),
-            ),
-            _ => (true, None),
-        },
-        // Expected to fail, didn't. This is the direction that matters most:
-        // a negative case silently turning green means the guard it pins is
-        // gone.
-        (Ok(()), true) => (
-            false,
-            Some("expected this combination to fail, but it materialized cleanly".into()),
-        ),
-    };
-
+    let (failure, attempts) = attempt(case.retries, || async {
+        let result = materialize_and_check(&supplied, target).await;
+        Ok(validation_verdict(&result, &case.expect))
+    })
+    .await;
     CaseOutcome {
         name: case.name.clone(),
         origin: case.origin.as_str(),
         params: case.params.clone(),
-        passed,
+        passed: failure.is_none(),
         failure,
+        attempts,
+        duration_ms: 0,
+    }
+}
+
+/// `None` when the case's expectation holds for `result`, else why not.
+fn validation_verdict(result: &CliResult<()>, expect: &super::spec::Expect) -> Option<String> {
+    match (result, expect.expects_failure()) {
+        // Expected to work, and did.
+        (Ok(()), false) => None,
+        // Expected to work, didn't.
+        (Err(e), false) => Some(e.to_string()),
+        // Expected to fail, and did — check the message when one was named.
+        (Err(e), true) => match &expect.error {
+            Some(want) if !e.to_string().contains(want.as_str()) => Some(format!(
+                "failed as expected, but the error did not mention '{want}': {e}"
+            )),
+            _ => None,
+        },
+        // Expected to fail, didn't. This is the direction that matters most:
+        // a negative case silently turning green means the guard it pins is
+        // gone.
+        (Ok(()), true) => {
+            Some("expected this combination to fail, but it materialized cleanly".into())
+        }
     }
 }
 
@@ -348,17 +531,18 @@ async fn run_behavioral_case(
     base_dir: Option<&std::path::Path>,
 ) -> CaseOutcome {
     let supplied: SuppliedParams = b.params.clone().into_iter().collect();
-    let failure = match behavioral_inner(b, &supplied, target, base_dir).await {
-        Ok(None) => None,
-        Ok(Some(msg)) => Some(msg),
-        Err(e) => Some(e.to_string()),
-    };
+    let (failure, attempts) = attempt(b.retries, || {
+        behavioral_inner(b, &supplied, target, base_dir)
+    })
+    .await;
     CaseOutcome {
         name: b.name.clone(),
         origin: "behavioral",
         params: b.params.clone(),
         passed: failure.is_none(),
         failure,
+        attempts,
+        duration_ms: 0,
     }
 }
 
@@ -371,22 +555,77 @@ async fn behavioral_inner(
     // Materialize first so the case tests the *combination*, not an unbound
     // template — which is the whole point of attaching fixtures to a param
     // set rather than to the template as a whole.
-    let body = materialize_body(supplied, target).await?;
-    let cfg = crate::config::PipelineConfig::from_text(&body, std::path::Path::new("suite.json"))?;
-    let nodes = crate::expand::expand(&crate::partition::offline(&cfg))?;
-    let node = pick_row(&nodes, b)?;
-
+    let node = template_row(supplied, target, &b.name, b.row.as_deref()).await?;
     let input = crate::pipeline_test::fixtures::load_input(
         base_dir.unwrap_or(std::path::Path::new(".")),
         &parse_input(&b.input)?,
     )?;
     let expect: crate::pipeline_test::spec::Expectation = serde_json::from_value(b.expect.clone())
         .map_err(|e| CliError::Config(format!("behavioral case '{}': `expect`: {e}", b.name)))?;
+    let resolved = resolved_from_node(
+        b.name.clone(),
+        &node,
+        input,
+        b.page_size.unwrap_or(0),
+        super::trust::pinned_clock(),
+    );
+    evaluate(&resolved, &expect).await
+}
 
-    // The same resolved-case shape `faucet test` runs, so the matchers and
-    // their semantics are shared rather than reimplemented here.
-    let resolved = crate::pipeline_test::runner::ResolvedCase {
-        name: b.name.clone(),
+async fn fixture_inner(f: &Fixture, target: &Target<'_>) -> CliResult<Option<String>> {
+    let input = crate::pipeline_test::fixtures::load_input(std::path::Path::new("."), &f.input)?;
+    let clock = match &f.clock {
+        Some(s) => crate::commands::run::resolve_run_clock(Some(s))
+            .map_err(|e| CliError::Config(format!("fixture '{}': clock: {e}", f.name)))?,
+        None => super::trust::pinned_clock(),
+    };
+    let resolved = match &f.pipeline {
+        Some(p) => crate::pipeline_test::runner::ResolvedCase {
+            name: f.name.clone(),
+            transforms: p.transforms.clone(),
+            #[cfg(feature = "quality")]
+            quality: p.quality.clone(),
+            #[cfg(feature = "contract")]
+            contract: p.contract.clone(),
+            #[cfg(feature = "masking")]
+            masking: p.masking.clone(),
+            input,
+            page_size: f.page_size,
+            clock,
+        },
+        None => {
+            let supplied: SuppliedParams = f.params.clone().into_iter().collect();
+            let node = template_row(&supplied, target, &f.name, f.row.as_deref()).await?;
+            resolved_from_node(f.name.clone(), &node, input, f.page_size, clock)
+        }
+    };
+    evaluate(&resolved, &f.expect).await
+}
+
+/// The materialized template's row a fixture runs.
+async fn template_row(
+    supplied: &SuppliedParams,
+    target: &Target<'_>,
+    case: &str,
+    row: Option<&str>,
+) -> CliResult<crate::expand::ExpandedNode> {
+    let body = materialize_body(supplied, target).await?;
+    let cfg = crate::config::PipelineConfig::from_text(&body, std::path::Path::new("suite.json"))?;
+    let nodes = crate::expand::expand(&crate::partition::offline(&cfg))?;
+    pick_row(&nodes, case, row).cloned()
+}
+
+/// The same resolved-case shape `faucet test` runs, so the matchers and
+/// their semantics are shared rather than reimplemented here.
+fn resolved_from_node(
+    name: String,
+    node: &crate::expand::ExpandedNode,
+    input: Vec<Value>,
+    page_size: usize,
+    clock: chrono::DateTime<chrono::FixedOffset>,
+) -> crate::pipeline_test::runner::ResolvedCase {
+    crate::pipeline_test::runner::ResolvedCase {
+        name,
         transforms: node.transforms.clone(),
         #[cfg(feature = "quality")]
         quality: node.quality.clone(),
@@ -395,25 +634,32 @@ async fn behavioral_inner(
         #[cfg(feature = "masking")]
         masking: node.masking.clone(),
         input,
-        page_size: b.page_size.unwrap_or(0),
-        clock: chrono::Utc::now().fixed_offset(),
-    };
-    let run = crate::pipeline_test::runner::run_case(&resolved).await?;
-    let failures = crate::pipeline_test::diff::evaluate(&expect, &run);
-    Ok(failures.first().cloned())
+        page_size,
+        clock,
+    }
 }
 
-/// The row a behavioural case runs: the one it names, or the only root row.
+async fn evaluate(
+    resolved: &crate::pipeline_test::runner::ResolvedCase,
+    expect: &crate::pipeline_test::spec::Expectation,
+) -> CliResult<Option<String>> {
+    let run = crate::pipeline_test::runner::run_case(resolved).await?;
+    Ok(crate::pipeline_test::diff::evaluate(expect, &run)
+        .first()
+        .cloned())
+}
+
+/// The row a fixture runs: the one it names, or the only root row.
 fn pick_row<'a>(
     nodes: &'a [crate::expand::ExpandedNode],
-    b: &Behavioral,
+    case: &str,
+    row: Option<&str>,
 ) -> CliResult<&'a crate::expand::ExpandedNode> {
-    if let Some(row) = &b.row {
-        return nodes.iter().find(|n| &n.id == row).ok_or_else(|| {
+    if let Some(row) = row {
+        return nodes.iter().find(|n| n.id == row).ok_or_else(|| {
             let ids: Vec<&str> = nodes.iter().map(|n| n.id.as_str()).collect();
             CliError::Config(format!(
-                "behavioral case '{}': no row '{row}' (rows: {})",
-                b.name,
+                "behavioral case '{case}': no row '{row}' (rows: {})",
                 ids.join(", ")
             ))
         });
@@ -425,12 +671,10 @@ fn pick_row<'a>(
     match roots.as_slice() {
         [one] => Ok(one),
         [] => Err(CliError::Config(format!(
-            "behavioral case '{}': the materialized config expands to no rows",
-            b.name
+            "behavioral case '{case}': the materialized config expands to no rows"
         ))),
         many => Err(CliError::Config(format!(
-            "behavioral case '{}': the config has {} rows ({}) — name one with `row:`",
-            b.name,
+            "behavioral case '{case}': the config has {} rows ({}) — name one with `row:`",
             many.len(),
             many.iter()
                 .map(|n| n.id.as_str())
@@ -442,10 +686,23 @@ fn pick_row<'a>(
 
 /// Materialize the template body for one param combination.
 async fn materialize_body(supplied: &SuppliedParams, target: &Target<'_>) -> CliResult<String> {
+    // A secret param's default is never resolved: an unset one that has a
+    // default gets a placeholder (one without stays missing, and fails by
+    // name as a real trigger would). A value the case itself names is used,
+    // and recorded as `***` (see `redact_secret_params`).
+    let mut owned = supplied.clone();
+    let defaulted = secret_params_with_default(&effective_document(target).await?);
+    for (name, p) in declared_params(target).await? {
+        if defaulted.contains(&name) && !owned.contains_key(&name) {
+            owned.insert(name, p.kind.placeholder());
+        }
+    }
+    let supplied = &owned;
     match target {
-        // `Materialize::Local` (not `Persisted`): a suite runs in this
-        // process, so load-time directives resolve here exactly as they would
-        // on a `faucet template run`.
+        // Materialized without resolving load-time directives, so a secret
+        // param's default never resolves and a server can screen the result;
+        // the rest then resolve here, as on a `faucet template run`.
+        #[cfg(feature = "templates")]
         Target::Registered {
             store,
             id,
@@ -460,29 +717,75 @@ async fn materialize_body(supplied: &SuppliedParams, target: &Target<'_>) -> Cli
                     None => Default::default(),
                 },
                 overlay: overlay.clone(),
+                allow_untested: true,
             };
-            Ok(crate::templates::materialize_for_run(
+            let body = crate::templates::materialize_for_run(
                 store,
                 id,
                 *version,
                 &choice,
                 supplied,
                 &BTreeMap::new(),
-                Materialize::Local,
+                crate::templates::Materialize::Persisted,
             )
             .await?
-            .body)
+            .body;
+            let mut doc: Value = serde_json::from_str(&body)
+                .or_else(|_| serde_yaml::from_str(&body))
+                .map_err(|e| CliError::Internal(format!("template test: {e}")))?;
+            super::trust::screen(&doc)?;
+            crate::interpolate::interpolate_value_with_env(&mut doc, &Default::default())?;
+            serde_json::to_string(&doc)
+                .map_err(|e| CliError::Internal(format!("template test: {e}")))
         }
         Target::Document { .. } => {
             let mut doc = effective_document(target).await?;
+            neutralize_secret_defaults(&mut doc);
+            super::trust::screen(&doc)?;
             // The env/file/secret pass a local materialization runs first (CLI-121).
             crate::interpolate::interpolate_value_with_env(&mut doc, &Default::default())?;
             crate::params::bind_document(&mut doc, supplied, crate::params::BindMode::Strict)?;
             if let Some(map) = doc.as_object_mut() {
                 map.remove("params");
+                map.remove("tests");
             }
             serde_json::to_string(&doc)
                 .map_err(|e| CliError::Internal(format!("template test: {e}")))
+        }
+        #[cfg(not(feature = "templates"))]
+        Target::Never(n, _) => match *n {},
+    }
+}
+
+/// Drop the default of every `secret: true` param (and mark it required), so
+/// a test never resolves one: the run supplies a placeholder instead.
+/// The secret params a document declares with a `default:`.
+fn secret_params_with_default(doc: &Value) -> std::collections::BTreeSet<String> {
+    doc.get("params")
+        .and_then(Value::as_object)
+        .map(|params| {
+            params
+                .iter()
+                .filter(|(_, spec)| {
+                    spec.get("secret").and_then(Value::as_bool) == Some(true)
+                        && spec.get("default").is_some()
+                })
+                .map(|(name, _)| name.clone())
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+fn neutralize_secret_defaults(doc: &mut Value) {
+    let Some(params) = doc.get_mut("params").and_then(Value::as_object_mut) else {
+        return;
+    };
+    for spec in params.values_mut() {
+        if let Some(obj) = spec.as_object_mut()
+            && obj.get("secret").and_then(Value::as_bool) == Some(true)
+            && obj.remove("default").is_some()
+        {
+            obj.insert("required".into(), Value::Bool(true));
         }
     }
 }
@@ -870,6 +1173,7 @@ suite:
     /// Register the same fixture into an in-process store so the
     /// `Target::Registered` path — version resolution and the registry read —
     /// is exercised without a database.
+    #[cfg(feature = "templates")]
     async fn registered() -> crate::templates::TemplateStore {
         let store = crate::templates::resolve_store_url("memory")
             .await
@@ -878,7 +1182,7 @@ suite:
             &store,
             crate::templates::RegisterRequest {
                 id: Some("suite-fixture".into()),
-                body: template(),
+                body: crate::templates::bundle::smoke(&template()),
                 format: crate::serve::load::ConfigFormat::Yaml,
                 description: None,
                 tags: Vec::new(),
@@ -891,6 +1195,7 @@ suite:
         store
     }
 
+    #[cfg(feature = "templates")]
     #[tokio::test]
     async fn a_registered_template_resolves_and_runs() {
         let store = registered().await;
@@ -925,6 +1230,7 @@ suite:
         assert_eq!(out.passed(), 1, "{:?}", out.cases);
     }
 
+    #[cfg(feature = "templates")]
     #[tokio::test]
     async fn an_explicit_selector_is_honoured() {
         let store = registered().await;
@@ -948,6 +1254,7 @@ suite:
         );
     }
 
+    #[cfg(feature = "templates")]
     #[tokio::test]
     async fn an_unknown_registered_template_is_an_error() {
         let store = registered().await;
@@ -1044,6 +1351,7 @@ suite:
         assert!(err.contains("no streams"), "{err}");
     }
 
+    #[cfg(feature = "templates")]
     #[tokio::test]
     async fn suites_apply_a_deployment_overlay_to_the_composition() {
         // #679: the overlay's params join the swept surface, and its blocks
@@ -1073,31 +1381,13 @@ suite:
             Target::Document {
                 body: source.clone(),
                 sink_body: Some(sink.clone()),
-                overlay: Some(crate::templates::OverlayChoice::Inline(overlay)),
+                overlay: Some(overlay),
             },
             None,
         )
         .await
         .expect("runs");
         assert_eq!(out.passed(), 2, "{:?}", out.cases);
-
-        // A file-based suite cannot reach a registry.
-        let err = run(
-            &file,
-            Target::Document {
-                body: source.clone(),
-                sink_body: Some(sink.clone()),
-                overlay: Some(crate::templates::OverlayChoice::Registered {
-                    id: "ops".into(),
-                    version: Default::default(),
-                }),
-            },
-            None,
-        )
-        .await
-        .expect_err("registered overlay in a file suite")
-        .to_string();
-        assert!(err.contains("applies an overlay file"), "{err}");
 
         // Registered: source, sink and overlay all come from the store.
         let store = crate::templates::resolve_store_url("memory").await.unwrap();
@@ -1110,11 +1400,11 @@ suite:
                 &store,
                 crate::templates::RegisterRequest {
                     id: None,
-                    body,
+                    body: crate::templates::bundle::smoke(&body),
                     format: crate::serve::load::ConfigFormat::Yaml,
                     description: None,
                     tags: Vec::new(),
-                    launch: true,
+                    launch: false,
                     created_by: None,
                 },
             )
@@ -1132,7 +1422,7 @@ suite:
             sink: Some(("local-jsonl", 1)),
             overlay: Some(crate::templates::OverlayChoice::Registered {
                 id: "ops".into(),
-                version: Default::default(),
+                version: crate::serve::history::templates::VersionSelector::newest(),
             }),
         };
         let out = run(&file, registered(), None).await.expect("runs");
@@ -1155,6 +1445,7 @@ suite:
         assert!(err.contains("deployment overlay"), "{err}");
     }
 
+    #[cfg(feature = "templates")]
     #[tokio::test]
     async fn a_registered_source_template_composes_with_a_registered_sink() {
         let dir = tempfile::tempdir().unwrap();
@@ -1165,11 +1456,11 @@ suite:
                 &store,
                 crate::templates::RegisterRequest {
                     id: None,
-                    body,
+                    body: crate::templates::bundle::smoke(&body),
                     format: crate::serve::load::ConfigFormat::Yaml,
                     description: None,
                     tags: Vec::new(),
-                    launch: true,
+                    launch: false,
                     created_by: None,
                 },
             )
@@ -1239,6 +1530,38 @@ suite:
     }
 
     #[test]
+    fn a_secret_params_value_is_recorded_redacted() {
+        let mut params = crate::params::ParamsSpec::new();
+        for (name, secret) in [("token", true), ("region", false)] {
+            params.insert(
+                name.into(),
+                serde_json::from_value(serde_json::json!({ "type": "string", "secret": secret }))
+                    .unwrap(),
+            );
+        }
+        let mut outcome = SuiteOutcome {
+            cases: vec![CaseOutcome {
+                name: "c".into(),
+                origin: "explicit",
+                params: [
+                    ("token".to_string(), Value::from("hunter2-runner")),
+                    ("region".to_string(), Value::from("eu")),
+                ]
+                .into(),
+                passed: false,
+                failure: Some("bad token hunter2-runner".into()),
+                attempts: 1,
+                duration_ms: 0,
+            }],
+        };
+        redact_secret_params(&mut outcome, &params);
+        let c = &outcome.cases[0];
+        assert_eq!(c.params["token"], Value::from("***"));
+        assert_eq!(c.params["region"], Value::from("eu"));
+        assert!(!c.failure.as_deref().unwrap().contains("hunter2-runner"));
+    }
+
+    #[test]
     fn outcome_counts_split_passed_and_failed() {
         let outcome = SuiteOutcome {
             cases: vec![
@@ -1248,6 +1571,8 @@ suite:
                     params: BTreeMap::new(),
                     passed: true,
                     failure: None,
+                    attempts: 1,
+                    duration_ms: 0,
                 },
                 CaseOutcome {
                     name: "b".into(),
@@ -1255,6 +1580,8 @@ suite:
                     params: BTreeMap::new(),
                     passed: false,
                     failure: Some("nope".into()),
+                    attempts: 1,
+                    duration_ms: 0,
                 },
             ],
         };

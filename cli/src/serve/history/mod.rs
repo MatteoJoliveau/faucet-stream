@@ -368,6 +368,10 @@ pub enum HistoryError {
     /// degraded fallback.
     #[error("run-history backend error: {0}")]
     Unreachable(String),
+    /// A label move's evidence stopped deciding the version between the check
+    /// and the write (#856); the move was not made.
+    #[error("{0}")]
+    StaleEvidence(String),
 }
 
 impl HistoryError {
@@ -503,6 +507,10 @@ pub struct AuditEntry {
     /// `connection:<tenant>/<name>`, `mcp:<tool>`, …
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub target: Option<String>,
+    /// Free-text detail beside the outcome — e.g. the test status of a
+    /// template version run with `allow_untested` (#856).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub detail: Option<String>,
     /// Outcome: `"ok"` (action performed) or `"denied"` (403 — insufficient role).
     pub result: String,
 }
@@ -1488,13 +1496,18 @@ pub trait RunHistory: Send + Sync {
     /// Point a named channel (`dev`, `prod`, …) at an existing version, moving it
     /// if it was already set. `latest` is derived from the version list and never
     /// stored, so callers reject it before reaching here. Default: unsupported.
+    ///
+    /// With `evidence`, the version's results are re-read in the same
+    /// transaction and the move is refused with
+    /// [`HistoryError::StaleEvidence`] unless that result still decides it.
     async fn template_set_tag(
         &self,
         id: &str,
         tag: &str,
         version: u32,
+        evidence: Option<&templates::EvidenceClaim>,
     ) -> Result<(), HistoryError> {
-        let _ = (id, tag, version);
+        let _ = (id, tag, version, evidence);
         Err(HistoryError::Backend(
             "this run-history backend does not support pipeline-template channels".into(),
         ))
@@ -1505,6 +1518,24 @@ pub trait RunHistory: Send + Sync {
     async fn template_tags(&self, id: &str) -> Result<BTreeMap<String, u32>, HistoryError> {
         let _ = id;
         Ok(BTreeMap::new())
+    }
+
+    /// Every stored channel pointer with the evidence it moved on. Default:
+    /// [`template_tags`](Self::template_tags) without evidence.
+    async fn template_tag_records(
+        &self,
+        id: &str,
+    ) -> Result<Vec<templates::TagRecord>, HistoryError> {
+        Ok(self
+            .template_tags(id)
+            .await?
+            .into_iter()
+            .map(|(tag, version)| templates::TagRecord {
+                tag,
+                version,
+                evidence: None,
+            })
+            .collect())
     }
 
     /// Remove one channel pointer. Returns whether it existed. Default: `false`.
@@ -1518,13 +1549,17 @@ pub trait RunHistory: Send + Sync {
     /// stable (a re-launch is a no-op, which keeps `previous` meaningful rather
     /// than letting it degrade into a duplicate of `stable`). Default:
     /// unsupported.
+    ///
+    /// With `evidence`, checked against the version's results in the same
+    /// transaction as [`template_set_tag`](Self::template_set_tag) does.
     async fn template_launch(
         &self,
         id: &str,
         version: u32,
         launched_by: Option<&str>,
+        evidence: Option<&templates::EvidenceClaim>,
     ) -> Result<Option<u32>, HistoryError> {
-        let _ = (id, version, launched_by);
+        let _ = (id, version, launched_by, evidence);
         Err(HistoryError::Backend(
             "this run-history backend does not support pipeline-template launches".into(),
         ))
@@ -1585,6 +1620,97 @@ pub trait RunHistory: Send + Sync {
         Ok(Vec::new())
     }
 
+    /// Record one test-bundle run on a template version (#856), keeping the
+    /// newest [`templates::RESULTS_RETAIN`] per version. Deleting the version
+    /// or the template removes its results. Default: unsupported.
+    async fn template_record_test(
+        &self,
+        result: &templates::TemplateTestResult,
+    ) -> Result<(), HistoryError> {
+        let _ = result;
+        Err(HistoryError::Backend(
+            "this run-history backend does not record template test results".into(),
+        ))
+    }
+
+    /// Recorded test-bundle runs of a template, newest first — of one version
+    /// when `version` is set — at most `limit`. Default: none.
+    async fn template_test_results(
+        &self,
+        id: &str,
+        version: Option<u32>,
+        limit: usize,
+    ) -> Result<Vec<templates::TemplateTestResult>, HistoryError> {
+        let _ = (id, version, limit);
+        Ok(Vec::new())
+    }
+
+    /// A small server-wide setting (#856: the faucet release line templates
+    /// were last revalidated under). Default: none.
+    async fn meta_get(&self, key: &str) -> Result<Option<String>, HistoryError> {
+        let _ = key;
+        Ok(None)
+    }
+
+    /// Set `key` to `value` only while it still holds `expected` (`None` =
+    /// unset); returns whether this call set it. Default: unsupported.
+    async fn meta_compare_and_set(
+        &self,
+        key: &str,
+        expected: Option<&str>,
+        value: &str,
+    ) -> Result<bool, HistoryError> {
+        let _ = (key, expected, value);
+        Err(HistoryError::Backend(
+            "this run-history backend does not store server settings".into(),
+        ))
+    }
+
+    /// Store a server-wide setting. Default: unsupported.
+    async fn meta_put(&self, key: &str, value: &str) -> Result<(), HistoryError> {
+        let _ = (key, value);
+        Err(HistoryError::Backend(
+            "this run-history backend does not store server settings".into(),
+        ))
+    }
+
+    /// Every stored version of a template, newest first — one read for the
+    /// whole template. Default: one [`template_get`](Self::template_get) per
+    /// version.
+    async fn template_records(
+        &self,
+        id: &str,
+    ) -> Result<Vec<templates::TemplateRecord>, HistoryError> {
+        let mut out = Vec::new();
+        for v in self.template_versions(id).await? {
+            if let Some(r) = self.template_get(id, Some(v)).await? {
+                out.push(r);
+            }
+        }
+        Ok(out)
+    }
+
+    /// Every recorded test result of a template, newest first, in one read,
+    /// with the versions whose stored results could not be decoded (#856:
+    /// those versions read as `unknown` rather than failing the whole
+    /// template). Default: [`template_test_results`](Self::template_test_results)
+    /// with nothing undecodable.
+    async fn template_test_results_lenient(
+        &self,
+        id: &str,
+    ) -> Result<
+        (
+            Vec<templates::TemplateTestResult>,
+            std::collections::BTreeSet<u32>,
+        ),
+        HistoryError,
+    > {
+        Ok((
+            self.template_test_results(id, None, usize::MAX).await?,
+            Default::default(),
+        ))
+    }
+
     /// The template's full release state: versions, launch-derived `stable` /
     /// `previous` / `newest`, channel pointers, and the derived status.
     ///
@@ -1612,10 +1738,24 @@ pub trait RunHistory: Send + Sync {
         if versions.len() <= templates::VERSION_RETAIN {
             return Ok(());
         }
-        let protected = templates::protected_versions(
-            &self.template_launches(id).await?,
-            &self.template_tags(id).await?,
-        );
+        let launches = self.template_launches(id).await?;
+        let mut protected =
+            templates::protected_versions(&launches, &self.template_tags(id).await?);
+        if !launches.is_empty() {
+            // The sticky `newest` holder is a label too (#856).
+            let (results, _) = self.template_test_results_lenient(id).await?;
+            let retired: std::collections::BTreeSet<u32> = self
+                .template_version_deprecations(id)
+                .await?
+                .iter()
+                .map(|d| d.version)
+                .collect();
+            if let Some(v) =
+                templates::sticky_newest(&self.template_records(id).await?, &results, &retired)
+            {
+                protected.insert(v);
+            }
+        }
         for stale in templates::versions_to_prune(versions, &protected) {
             self.template_delete(id, Some(stale)).await?;
         }

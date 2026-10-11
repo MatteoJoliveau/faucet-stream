@@ -177,8 +177,37 @@ async fn check(a: HubCheckArgs) -> CliResult<()> {
             println!("\n{cmd}");
         }
     }
+    let fallback = sides
+        .source
+        .first()
+        .map(|h| h.dir.clone())
+        .unwrap_or_default();
+    let mut red = Vec::new();
+    for (role, file) in [("source", &source_file), ("sink", &sink_file)] {
+        let root = hub::bundles::hub_root_for(file, &fallback);
+        if let Some(out) = hub::bundles::run_file(file, &root).await? {
+            if !a.json {
+                print!(
+                    "\n{}",
+                    crate::template_tests::result::render_human(
+                        &format!("tests ({role} {})", file.display()),
+                        &out
+                    )
+                );
+            }
+            if !out.passed() {
+                red.push(format!("{role} template {}", file.display()));
+            }
+        }
+    }
     if let Some(e) = typed_error {
         return Err(CliError::Config(e));
+    }
+    if !red.is_empty() {
+        return Err(CliError::Config(format!(
+            "test bundle failed: {}",
+            red.join(", ")
+        )));
     }
     if cell.compatible {
         Ok(())
@@ -325,14 +354,29 @@ fn render_list(
         .max()
         .unwrap_or(0)
         .max(12);
+    let status_of = |subdir: &str, id: &str| -> Option<String> {
+        index
+            .and_then(|i| i.entry(subdir, id))
+            .and_then(|e| e.stable_test_status.clone())
+    };
+    let tests = |t: Option<&crate::template_tests::TestBundle>, status: Option<String>| {
+        let f = hub::catalog::tests_fields(t);
+        match (status, f["test_cases"].as_u64()) {
+            (Some(s), _) if s != "no_tests" => format!("tests {}", s.replace('_', " ")),
+            _ if f["has_tests"] != true => "no tests".to_string(),
+            (_, Some(n)) if n > 0 => format!("{n} test(s)"),
+            _ => "tested".to_string(),
+        }
+    };
     let mut out = format!("source templates ({}):\n", cat.sources.len());
     for &i in &src_order {
         let s = &cat.sources[i].1;
         out.push_str(&format!(
-            "  {:<w$} {:<10} {:>3} stream(s) {:>7} {:<10}  {}\n",
+            "  {:<w$} {:<10} {:>3} stream(s) {:<14} {:>7} {:<10}  {}\n",
             src_ids[i],
             s.source.kind,
             s.streams.len(),
+            tests(s.tests.as_ref(), status_of(SOURCE_DIR, &src_ids[i])),
             stars(&src_trust[i]),
             updated(&src_trust[i]),
             s.description.as_deref().unwrap_or("")
@@ -342,7 +386,7 @@ fn render_list(
     for &i in &snk_order {
         let k = &cat.sinks[i].1;
         out.push_str(&format!(
-            "  {:<w$} {:<10} {:<28} {:>7} {:<10}  {}\n",
+            "  {:<w$} {:<10} {:<28} {:<14} {:>7} {:<10}  {}\n",
             snk_ids[i],
             k.sink.kind,
             crate::registry::sink_supported_write_modes(&k.sink.kind)
@@ -350,6 +394,7 @@ fn render_list(
                 .map(|m| m.as_str())
                 .collect::<Vec<_>>()
                 .join("|"),
+            tests(k.tests.as_ref(), status_of(SINK_DIR, &snk_ids[i])),
             stars(&snk_trust[i]),
             updated(&snk_trust[i]),
             k.description.as_deref().unwrap_or("")
@@ -421,6 +466,21 @@ async fn lint(a: HubLintArgs) -> CliResult<()> {
     if a.files.is_empty() {
         let cat = load_catalog(a.hub.as_deref()).await?;
         findings = hub::catalog::lint_catalog(&cat);
+        let suites = hub::catalog::load_test_suites(&cat.root)?;
+        let mut files: Vec<std::path::PathBuf> = cat
+            .sources
+            .iter()
+            .map(|(p, _)| p.clone())
+            .chain(cat.sinks.iter().map(|(p, _)| p.clone()))
+            .collect();
+        files.extend(hub::catalog::deployment_files(&cat.root)?);
+        let ran = bundle_findings(&files, &cat.root, &mut findings).await?;
+        if !a.json {
+            println!(
+                "ran {ran} test bundle(s); {} shared suite(s) parsed",
+                suites.len()
+            );
+        }
         if !a.json {
             println!(
                 "linted {} source + {} sink template(s)",
@@ -452,13 +512,40 @@ async fn lint(a: HubLintArgs) -> CliResult<()> {
                         findings.push((f.display().to_string(), r));
                     }
                 }
+                Some(hub::TemplateKind::TestSuite) => {
+                    let text = std::fs::read_to_string(f)
+                        .map_err(|e| CliError::Config(format!("reading {}: {e}", f.display())))?;
+                    let value: serde_json::Value = serde_yaml::from_str(&text).map_err(|e| {
+                        CliError::Config(format!("{}: invalid YAML: {e}", f.display()))
+                    })?;
+                    crate::template_tests::bundle::parse_test_suite(value)
+                        .map_err(|e| CliError::Config(format!("{}: {e}", f.display())))?;
+                }
                 Some(hub::TemplateKind::Pipeline) | None => {
                     return Err(CliError::Config(format!(
-                        "{}: not a hub template (no `kind: source-template` / `sink-template` / `deployment`)",
+                        "{}: not a hub template (no `kind: source-template` / `sink-template` / `deployment` / `test-suite`)",
                         f.display()
                     )));
                 }
             }
+        }
+        // A file's own location names its hub; the `--hub` / default hub is
+        // resolved (possibly fetched) only for a bundle that needs one.
+        let mut fallback: Option<std::path::PathBuf> = None;
+        for f in &a.files {
+            let root = match (a.hub.as_deref(), hub::bundles::inferred_hub_root(f)) {
+                (None, Some(root)) => root,
+                _ if hub::bundles::file_bundle(f)?.is_none() => continue,
+                _ => match &fallback {
+                    Some(root) => root.clone(),
+                    None => {
+                        let root = hub::resolve_hub(a.hub.as_deref()).await?;
+                        fallback = Some(root.clone());
+                        root
+                    }
+                },
+            };
+            bundle_findings(std::slice::from_ref(f), &root, &mut findings).await?;
         }
     }
     if a.json {
@@ -488,6 +575,36 @@ async fn lint(a: HubLintArgs) -> CliResult<()> {
             findings.len()
         )))
     }
+}
+
+/// Run the test bundle of every file in `files` against `hub`, adding a
+/// `tests:` finding per failing case. Returns how many bundles ran.
+async fn bundle_findings(
+    files: &[std::path::PathBuf],
+    hub: &std::path::Path,
+    findings: &mut Vec<(String, Vec<String>)>,
+) -> CliResult<usize> {
+    let mut ran = 0;
+    for f in files {
+        let Some(out) = hub::bundles::run_file(f, hub).await? else {
+            continue;
+        };
+        ran += 1;
+        if out.passed() {
+            continue;
+        }
+        let lines: Vec<String> = out
+            .failing()
+            .into_iter()
+            .map(|l| format!("tests: {l}"))
+            .collect();
+        let key = f.display().to_string();
+        match findings.iter_mut().find(|(t, _)| *t == key) {
+            Some((_, existing)) => existing.extend(lines),
+            None => findings.push((key, lines)),
+        }
+    }
+    Ok(ran)
 }
 
 /// `faucet hub rows <source> [--sink Y]` — a catalog source template's

@@ -209,3 +209,115 @@ async fn postgres_version_deprecation_round_trips() {
             .is_empty()
     );
 }
+
+/// #856 on the Postgres dialect: test results record, read back newest
+/// first, prune per version and cascade on delete; a launch keeps its
+/// skipped-tests note.
+#[tokio::test]
+async fn postgres_template_test_results_and_launch_notes() {
+    use faucet_cli::serve::history::templates::{
+        RESULTS_RETAIN, TemplateDraft, TemplateId, TemplateTestResult,
+    };
+    use faucet_cli::serve::load::ConfigFormat;
+    let Ok(url) = std::env::var("FAUCET_TEST_POSTGRES_URL") else {
+        eprintln!(
+            "SKIP postgres_template_test_results_and_launch_notes: FAUCET_TEST_POSTGRES_URL unset"
+        );
+        return;
+    };
+    let h = PostgresHistory::connect(
+        &url,
+        Duration::from_secs(3600),
+        Duration::from_secs(30),
+        "pg-test".into(),
+    )
+    .await
+    .expect("connect postgres history");
+    let id = format!("pgt{}", Utc::now().timestamp_nanos_opt().unwrap_or(0));
+    h.template_register(&TemplateDraft {
+        id: TemplateId::parse(&id).unwrap(),
+        name: Some(id.clone()),
+        description: None,
+        body: format!("version: 1\nname: {id}\n"),
+        format: ConfigFormat::Yaml,
+        params: Default::default(),
+        created_by: None,
+        kind: faucet_cli::hub::TemplateKind::Pipeline,
+    })
+    .await
+    .unwrap();
+    let base = TemplateTestResult::new(&id, 1, "sha".into(), Default::default(), None);
+    for i in 0..(RESULTS_RETAIN + 2) {
+        let mut r = base.clone();
+        r.recorded_at = base.recorded_at + chrono::Duration::seconds(i as i64);
+        h.template_record_test(&r).await.unwrap();
+    }
+    let got = h.template_test_results(&id, Some(1), 100).await.unwrap();
+    assert_eq!(got.len(), RESULTS_RETAIN);
+    assert!(got[0].recorded_at > got[1].recorded_at);
+    assert_eq!(
+        h.template_test_results(&id, None, 3).await.unwrap().len(),
+        3
+    );
+    // A label move re-checks its evidence in the same transaction (#856).
+    let pass = TemplateTestResult::new(
+        &id,
+        1,
+        "sha".into(),
+        faucet_cli::template_tests::result::BundleOutcome {
+            cases: vec![faucet_cli::template_tests::result::CaseResult {
+                name: "c".into(),
+                source: "bundle".into(),
+                origin: "explicit".into(),
+                passed: true,
+                attempts: 1,
+                duration_ms: 0,
+                failure: None,
+            }],
+            ..Default::default()
+        },
+        None,
+    );
+    let mut pass = pass;
+    pass.recorded_at = base.recorded_at + chrono::Duration::seconds(100);
+    h.template_record_test(&pass).await.unwrap();
+    let stale = faucet_cli::serve::history::templates::EvidenceClaim {
+        result_id: base.result_id.clone(),
+        body_sha256: "sha".into(),
+    };
+    assert!(matches!(
+        h.template_launch(&id, 1, Some("root"), Some(&stale)).await,
+        Err(faucet_cli::serve::history::HistoryError::StaleEvidence(_))
+    ));
+    let claim = faucet_cli::serve::history::templates::EvidenceClaim {
+        result_id: pass.result_id.clone(),
+        body_sha256: "sha".into(),
+    };
+    h.template_launch(&id, 1, Some("root"), Some(&claim))
+        .await
+        .unwrap();
+    h.template_set_tag(&id, "prod", 1, Some(&claim))
+        .await
+        .unwrap();
+    assert_eq!(
+        h.template_launches(&id).await.unwrap()[0]
+            .evidence
+            .as_deref(),
+        Some(pass.result_id.as_str())
+    );
+    assert_eq!(
+        h.template_tag_records(&id).await.unwrap()[0]
+            .evidence
+            .as_deref(),
+        Some(pass.result_id.as_str())
+    );
+    h.meta_put(&id, "1.13").await.unwrap();
+    assert_eq!(h.meta_get(&id).await.unwrap().as_deref(), Some("1.13"));
+    h.template_delete(&id, None).await.unwrap();
+    assert!(
+        h.template_test_results(&id, None, 5)
+            .await
+            .unwrap()
+            .is_empty()
+    );
+}

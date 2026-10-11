@@ -27,6 +27,7 @@ fn args(port: u16, auth_config: PathBuf) -> faucet_cli::cli::ServeArgs {
         write_token: None,
         admin_token: None,
         no_auth: false,
+        allow_unauthenticated_network: false,
         max_concurrent_runs: Some(4),
         max_queued_runs: Some(16),
         default_config: None,
@@ -476,10 +477,13 @@ async fn a_registered_template_may_use_a_subprocess_connector() {
         .post(
             "admin-tok",
             "/v1/templates",
-            json!({"config": singer_config(dir.path()).replace("version: 1\n", "version: 1\nkind: pipeline\n"), "id": "tap", "launch": true}),
+            json!({"config": format!(
+                "{}tests:\n  suite:\n    auto: {{ defaults_baseline: true }}\n",
+                singer_config(dir.path()).replace("version: 1\n", "version: 1\nkind: pipeline\n")
+            ), "id": "tap", "launch": true}),
         )
         .await;
-    assert_eq!(code, 201, "{reg}");
+    assert_eq!(code, 201, "its tests run on the server and pass: {reg}");
     let (code, r) = api
         .post("op-tok", "/v1/templates/tap/runs", json!({}))
         .await;

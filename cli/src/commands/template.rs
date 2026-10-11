@@ -8,8 +8,8 @@
 
 use crate::cli::{
     TemplateArgs, TemplateCommand, TemplateDeleteArgs, TemplateDeprecateArgs, TemplateLaunchArgs,
-    TemplateListArgs, TemplatePromoteArgs, TemplateRegisterArgs, TemplateRollbackArgs,
-    TemplateRunArgs, TemplateShowArgs, TemplateStoreArgs,
+    TemplateListArgs, TemplatePromoteArgs, TemplateRegisterArgs, TemplateRevalidateArgs,
+    TemplateRollbackArgs, TemplateRunArgs, TemplateShowArgs, TemplateStoreArgs,
 };
 use crate::error::{CliError, CliResult};
 use crate::serve::history::templates::{
@@ -23,6 +23,7 @@ pub async fn run(args: TemplateArgs) -> CliResult<()> {
     match args.command {
         TemplateCommand::Register(a) => register(a).await,
         TemplateCommand::List(a) => list(a).await,
+        TemplateCommand::Revalidate(a) => revalidate(a).await,
         TemplateCommand::Show(a) => show(a).await,
         TemplateCommand::Launch(a) => launch(a).await,
         TemplateCommand::Rollback(a) => rollback(a).await,
@@ -151,7 +152,7 @@ async fn register(args: TemplateRegisterArgs) -> CliResult<()> {
         .iter()
         .map(|t| VersionChannel::parse(t))
         .collect::<CliResult<Vec<_>>>()?;
-    let record = crate::templates::register(
+    let registered = crate::templates::register_tested(
         &store,
         RegisterRequest {
             id: args.id.clone(),
@@ -164,6 +165,7 @@ async fn register(args: TemplateRegisterArgs) -> CliResult<()> {
         },
     )
     .await?;
+    let record = registered.record;
     if crate::hub::detect_kind_in_file(&args.config).is_none() {
         eprintln!(
             "note: '{}' has no `kind:` — registering a complete pipeline config this way is deprecated. \
@@ -175,8 +177,29 @@ async fn register(args: TemplateRegisterArgs) -> CliResult<()> {
     }
 
     if args.common.json {
-        println!("{}", to_pretty(&record.summary())?);
-        return Ok(());
+        let mut v = serde_json::to_value(record.summary())
+            .map_err(|e| CliError::Internal(format!("rendering template JSON: {e}")))?;
+        if let Some(obj) = v.as_object_mut() {
+            obj.insert("tests".into(), serde_json::json!(registered.tests));
+            obj.insert(
+                "tests_inherited_from".into(),
+                serde_json::json!(registered.tests_inherited_from),
+            );
+        }
+        println!("{}", to_pretty(&v)?);
+        return tests_exit(registered.tests.as_ref());
+    }
+    if let Some(t) = &registered.tests {
+        print!(
+            "{}",
+            crate::template_tests::result::render_human(
+                &format!("tests: {} v{}", record.id, record.version),
+                &t.outcome()
+            )
+        );
+    }
+    if let Some(from) = registered.tests_inherited_from {
+        eprintln!("note: no `tests:` block — inherited v{from}'s tests (stored with this version)");
     }
     println!(
         "registered template '{}' version {}{}",
@@ -204,7 +227,19 @@ async fn register(args: TemplateRegisterArgs) -> CliResult<()> {
             &required_param_hint(&record.summary())
         )
     );
-    Ok(())
+    tests_exit(registered.tests.as_ref())
+}
+
+/// Fail the command (exit = failed-case count) when a recorded run failed.
+fn tests_exit(
+    result: Option<&crate::serve::history::templates::TemplateTestResult>,
+) -> CliResult<()> {
+    match result {
+        Some(r) if !r.passed => Err(CliError::TestsFailed {
+            failed: r.cases.iter().filter(|c| !c.passed).count().max(1),
+        }),
+        _ => Ok(()),
+    }
 }
 
 /// `--param name=<…>` hints for every required param, for the register / show
@@ -245,6 +280,23 @@ fn print_params(summary: &TemplateSummary) {
             }
         );
     }
+}
+
+async fn revalidate(args: TemplateRevalidateArgs) -> CliResult<()> {
+    let store = connect(&args.common).await?;
+    let report = crate::templates::revalidate::revalidate(&store, None).await?;
+    crate::templates::revalidate::record_line(&store, &report).await?;
+    if args.common.json {
+        println!("{}", to_pretty(&report)?);
+    } else {
+        print!("{}", report.render_human());
+    }
+    if report.failed() > 0 {
+        return Err(CliError::TestsFailed {
+            failed: report.failed(),
+        });
+    }
+    Ok(())
 }
 
 async fn list(args: TemplateListArgs) -> CliResult<()> {
@@ -482,10 +534,12 @@ fn report_launch(
                 "replaced": outcome.replaced,
                 "already_launched": outcome.already_launched,
                 "first_launch": outcome.first_launch,
+                "tests": outcome.tests,
             }))?
         );
         return Ok(());
     }
+
     if outcome.already_launched {
         println!(
             "template '{id}': v{} was already live — nothing changed",
@@ -604,6 +658,9 @@ fn trigger_hint(kind: crate::hub::TemplateKind, id: &str, store: &str, params: &
         Deployment => format!(
             "apply it to a composed run:\n  faucet template run <source-template> --sink <sink-template> --overlay {id} --store {store}{params}"
         ),
+        TestSuite => format!(
+            "require it from a template's bundle:\n  tests:\n    requires_suites:\n      - {{ name: {id}, version: \">=<release>\" }}"
+        ),
     }
 }
 
@@ -642,6 +699,7 @@ async fn run_template(args: TemplateRunArgs) -> CliResult<()> {
         id: args.sink.clone(),
         version: VersionSelector::parse(&args.sink_version)?,
         overlay: overlay_choice(args.overlay.as_deref(), &args.overlay_version)?,
+        allow_untested: args.allow_untested,
     };
     let selection = crate::select::SelectionRequest::from_flags(&args.selection)?;
     let materialized = crate::templates::materialize_for_run_selected(
@@ -656,6 +714,12 @@ async fn run_template(args: TemplateRunArgs) -> CliResult<()> {
         selection.as_ref(),
     )
     .await?;
+    if let Some(status) = materialized.untested {
+        eprintln!(
+            "warning: '{}' v{} is {status} — running it because of --allow-untested",
+            materialized.template_id, materialized.version
+        );
+    }
 
     tracing::info!(
         template = %materialized.template_id,
@@ -768,6 +832,12 @@ async fn test_suite(args: crate::cli::TemplateTestArgs) -> CliResult<()> {
         crate::env_loader::resolve_env_file(args.env_file.as_deref(), args.no_env_file, &cwd)?;
     crate::env_loader::load_env_file_if_present(env_path.as_deref())?;
 
+    if !args.suite.is_file() {
+        return test_registered(&args).await;
+    }
+    if is_template_with_bundle(&args.suite)? {
+        return test_document_bundle(&args).await;
+    }
     let file = SuiteFile::from_path(&args.suite)?;
     let select = args.select.as_deref().or(file.select.as_deref());
 
@@ -787,12 +857,14 @@ async fn test_suite(args: crate::cli::TemplateTestArgs) -> CliResult<()> {
             None => None,
         };
         let overlay = match &file.overlay {
-            Some(p) => overlay_choice(Some(p), "stable")?.filter(|c| {
-                matches!(c, crate::templates::OverlayChoice::Inline(_))
-            }).ok_or_else(|| CliError::Config(format!(
-                "template test: overlay '{p}' is not a readable file — a file-based suite applies an overlay file"
-            )))
-            .map(Some)?,
+            Some(p) => match overlay_choice(Some(p), "stable")? {
+                Some(crate::templates::OverlayChoice::Inline(v)) => Some(v),
+                _ => {
+                    return Err(CliError::Config(format!(
+                        "template test: overlay '{p}' is not a readable file — a file-based suite applies an overlay file"
+                    )));
+                }
+            },
             None => None,
         };
         (
@@ -890,6 +962,127 @@ async fn test_suite(args: crate::cli::TemplateTestArgs) -> CliResult<()> {
     Ok(())
 }
 
+/// A file that is a template document carrying `tests:` (rather than a
+/// `faucet template test` suite file, which has `template:` + `suite:`).
+fn is_template_with_bundle(path: &std::path::Path) -> CliResult<bool> {
+    let text = std::fs::read_to_string(path)
+        .map_err(|e| CliError::Config(format!("template test: reading {}: {e}", path.display())))?;
+    let doc: serde_json::Value = serde_yaml::from_str(&text).unwrap_or_default();
+    let is_suite = doc.get("template").is_some() && doc.get("suite").is_some();
+    Ok(!is_suite && doc.get("tests").is_some())
+}
+
+/// `faucet template test <file>` on a template carrying `tests:` — run the
+/// bundle offline, reading companions and shared suites from a hub.
+async fn test_document_bundle(args: &crate::cli::TemplateTestArgs) -> CliResult<()> {
+    let Some((kind, text, bundle)) = crate::hub::bundles::file_bundle(&args.suite)? else {
+        return Err(CliError::Config(format!(
+            "{} carries no `tests:` block",
+            args.suite.display()
+        )));
+    };
+    // Only companions and shared suites are read from a hub; a self-contained
+    // pipeline bundle never resolves one (which could mean a network fetch).
+    let self_contained =
+        kind == crate::hub::TemplateKind::Pipeline && bundle.requires_suites.is_empty();
+    let root = if self_contained {
+        args.suite
+            .parent()
+            .map(std::path::Path::to_path_buf)
+            .unwrap_or_default()
+    } else {
+        let fallback = crate::hub::resolve_hub(args.hub.as_deref()).await?;
+        crate::hub::bundles::hub_root_for(&args.suite, &fallback)
+    };
+    let outcome =
+        crate::hub::bundles::run_parsed(kind, &text, &bundle, &root, args.filter.as_deref()).await;
+    report_bundle(&args.suite.display().to_string(), &outcome, args.json)
+}
+
+/// `faucet template test <id>[@<version>] --store …` — run a registered
+/// version's bundle and record the result on it (unless `--no-record`).
+async fn test_registered(args: &crate::cli::TemplateTestArgs) -> CliResult<()> {
+    let raw = args.suite.to_string_lossy().to_string();
+    let looks_like_file = args
+        .suite
+        .extension()
+        .and_then(|e| e.to_str())
+        .is_some_and(|e| matches!(e.to_ascii_lowercase().as_str(), "yaml" | "yml" | "json"));
+    if looks_like_file {
+        return Err(CliError::Config(format!(
+            "template test suite {raw}: no such file"
+        )));
+    }
+    let (id, sel) = match raw.rsplit_once('@') {
+        Some((id, v)) => (id.to_string(), v.to_string()),
+        None => (raw.clone(), "newest".to_string()),
+    };
+    let store_url = args.store.as_deref().ok_or_else(|| {
+        CliError::Config(format!(
+            "template test: `{raw}` is not a readable file — to test a registered version pass \
+             --store (or FAUCET_TEMPLATE_STORE)"
+        ))
+    })?;
+    if args.filter.is_some() && !args.no_record {
+        return Err(CliError::Config(
+            "template test: a filtered run is not a complete result, so it is never recorded — \
+             add --no-record to run a subset"
+                .into(),
+        ));
+    }
+    let store = crate::templates::resolve_store_url(store_url).await?;
+    let version =
+        crate::templates::resolve_version(&store, &id, VersionSelector::parse(&sel)?).await?;
+    let title = format!("{id} v{version}");
+    if args.no_record {
+        let (_, outcome) =
+            crate::templates::bundle::run_version(&store, &id, version, args.filter.as_deref())
+                .await?
+                .ok_or_else(|| {
+                    CliError::Config(format!(
+                        "v{version} of template '{id}' has no `tests:` block"
+                    ))
+                })?;
+        return report_bundle(&title, &outcome, args.json);
+    }
+    let result = crate::templates::bundle::test_version(&store, &id, version, None).await?;
+    if args.json {
+        println!("{}", to_pretty(&result)?);
+        return tests_exit(Some(&result));
+    }
+    print!(
+        "{}",
+        crate::template_tests::result::render_human(&title, &result.outcome())
+    );
+    println!(
+        "recorded on {id} v{version} (faucet {})",
+        result.faucet_version
+    );
+    tests_exit(Some(&result))
+}
+
+fn report_bundle(
+    title: &str,
+    outcome: &crate::template_tests::BundleOutcome,
+    json: bool,
+) -> CliResult<()> {
+    if json {
+        println!("{}", to_pretty(outcome)?);
+    } else {
+        print!(
+            "{}",
+            crate::template_tests::result::render_human(title, outcome)
+        );
+    }
+    if outcome.passed() {
+        Ok(())
+    } else {
+        Err(CliError::TestsFailed {
+            failed: outcome.failing().len().max(1),
+        })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -959,6 +1152,7 @@ pipeline:
             dry_run: true,
             limit: None,
             selection: Default::default(),
+            allow_untested: false,
             common: common("memory", false),
         };
         let f = run_template(args);
@@ -1011,7 +1205,7 @@ pipeline:
                 id: None,
                 description: None,
                 tag: vec![],
-                launch: true,
+                launch: false,
                 common: common(&store, false),
             })
             .await
@@ -1045,7 +1239,7 @@ pipeline:
         }
         show(TemplateShowArgs {
             id: "acme-exports".into(),
-            version: "stable".into(),
+            version: "newest".into(),
             clean: false,
             common: common(&store, true),
         })
@@ -1054,16 +1248,17 @@ pipeline:
 
         let run_args = |sink: Option<&str>, dry_run: bool| TemplateRunArgs {
             id: "acme-exports".into(),
-            version: "stable".into(),
+            version: "newest".into(),
             sink: sink.map(str::to_string),
-            sink_version: "stable".into(),
+            sink_version: "newest".into(),
             overlay: None,
-            overlay_version: "stable".into(),
+            overlay_version: "newest".into(),
             param: vec![],
             param_env: vec![],
             dry_run,
             limit: None,
             selection: Default::default(),
+            allow_untested: false,
             common: common(&store, false),
         };
         let err = run_template(run_args(None, true))
@@ -1221,6 +1416,7 @@ pipeline:
     /// Without the SQL backend feature the whole test is skipped.
     #[cfg(feature = "serve-history-sqlite")]
     #[tokio::test]
+    #[serial_test::serial(env)]
     async fn register_launch_promote_run_round_trip() {
         let dir = tempfile::tempdir().unwrap();
         let input = dir.path().join("in.csv");
@@ -1229,8 +1425,11 @@ pipeline:
         let cfg_path = dir.path().join("tpl.yaml");
         std::fs::write(
             &cfg_path,
-            BODY.replace("IN_PATH", &input.display().to_string())
-                .replace("OUT_PATH", &output.display().to_string()),
+            crate::templates::bundle::smoke(
+                &BODY
+                    .replace("IN_PATH", &input.display().to_string())
+                    .replace("OUT_PATH", &output.display().to_string()),
+            ),
         )
         .unwrap();
         let store = format!("sqlite:{}", dir.path().join("registry.db").display());
@@ -1267,6 +1466,7 @@ pipeline:
             dry_run: true,
             limit: None,
             selection: Default::default(),
+            allow_untested: false,
             common: common(&store, false),
         })
         .await
@@ -1294,6 +1494,7 @@ pipeline:
             dry_run: false,
             limit: None,
             selection: Default::default(),
+            allow_untested: false,
             common: common(&store, false),
         })
         .await
@@ -1577,6 +1778,8 @@ pipeline:
             json: false,
             env_file: None,
             no_env_file: true,
+            no_record: false,
+            hub: None,
         }
     }
 
@@ -1743,7 +1946,8 @@ suite:
             &store,
             crate::templates::RegisterRequest {
                 id: Some("adapter-registered".into()),
-                body: r#"version: 1
+                body: crate::templates::bundle::smoke(
+                    r#"version: 1
 name: adapter-registered
 params:
   tenant: { type: string, required: true }
@@ -1754,8 +1958,8 @@ pipeline:
   sink:
     type: jsonl
     config: { path: "./out/${param.tenant}.jsonl" }
-"#
-                .into(),
+"#,
+                ),
                 format: ConfigFormat::Yaml,
                 description: None,
                 tags: Vec::new(),
@@ -1800,11 +2004,11 @@ pipeline:
                 &store,
                 crate::templates::RegisterRequest {
                     id: None,
-                    body,
+                    body: crate::templates::bundle::smoke(&body),
                     format: ConfigFormat::Yaml,
                     description: None,
                     tags: Vec::new(),
-                    launch: true,
+                    launch: false,
                     created_by: None,
                 },
             )
@@ -1814,7 +2018,7 @@ pipeline:
         let suite = dir.path().join("suite.yaml");
         std::fs::write(
             &suite,
-            "version: 1\ntemplate: faucet-hq/example-csv\nsink: faucet-hq/sqlite\noverlay: ops\noverlay_select: stable\nsuite:\n  cases:\n    - name: defaults\n      params: {}\n",
+            "version: 1\ntemplate: faucet-hq/example-csv\nselect: newest\nsink: faucet-hq/sqlite\nsink_select: newest\noverlay: ops\noverlay_select: newest\nsuite:\n  cases:\n    - name: defaults\n      params: {}\n",
         )
         .expect("write suite");
         let mut args = test_args(&suite);

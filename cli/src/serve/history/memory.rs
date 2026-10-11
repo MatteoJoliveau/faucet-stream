@@ -79,6 +79,12 @@ pub struct MemoryHistory {
     /// Per-version deprecation markers (#697): `{id: {version: record}}`.
     template_version_deprecations:
         Mutex<std::collections::HashMap<String, BTreeMap<u32, templates::DeprecationRecord>>>,
+    /// Test-bundle runs per template (#856), newest first.
+    template_tests: Mutex<std::collections::HashMap<String, Vec<templates::TemplateTestResult>>>,
+    /// The evidence each channel pointer moved on: id → tag → (version, result id).
+    template_tag_evidence: Mutex<std::collections::HashMap<String, TagEvidence>>,
+    /// Server-wide settings (#856).
+    meta: Mutex<std::collections::HashMap<String, String>>,
     /// Persistent run logs (#529): run_id → lines (append order == seq order).
     run_logs: Mutex<std::collections::HashMap<String, Vec<RunLogLine>>>,
     /// Log delivery rows (#806): run_id → watermark + export status.
@@ -133,6 +139,9 @@ impl MemoryHistory {
             template_launches: Mutex::new(std::collections::HashMap::new()),
             template_deprecations: Mutex::new(std::collections::HashMap::new()),
             template_version_deprecations: Mutex::new(std::collections::HashMap::new()),
+            template_tests: Mutex::new(std::collections::HashMap::new()),
+            template_tag_evidence: Mutex::new(std::collections::HashMap::new()),
+            meta: Mutex::new(std::collections::HashMap::new()),
             run_logs: Mutex::new(std::collections::HashMap::new()),
             log_ship: Mutex::new(std::collections::HashMap::new()),
             local_outputs: Mutex::new(BTreeMap::new()),
@@ -1306,6 +1315,20 @@ impl RunHistory for MemoryHistory {
         let mut retired = self.template_version_deprecations.lock().map_err(|_| {
             HistoryError::Backend("template version deprecation lock poisoned".into())
         })?;
+        let mut tests = self
+            .template_tests
+            .lock()
+            .map_err(|_| HistoryError::Backend("template test lock poisoned".into()))?;
+        match version {
+            Some(v) => {
+                if let Some(r) = tests.get_mut(id) {
+                    r.retain(|t| t.version != v);
+                }
+            }
+            None => {
+                tests.remove(id);
+            }
+        }
         match version {
             None => {
                 tags.remove(id);
@@ -1361,14 +1384,99 @@ impl RunHistory for MemoryHistory {
         id: &str,
         tag: &str,
         version: u32,
+        evidence: Option<&templates::EvidenceClaim>,
     ) -> Result<(), HistoryError> {
         let mut tags = self
             .template_tags
             .lock()
             .map_err(|_| HistoryError::Backend("template tag lock poisoned".into()))?;
+        let tests = self
+            .template_tests
+            .lock()
+            .map_err(|_| HistoryError::Backend("template test lock poisoned".into()))?;
+        if let Some(claim) = evidence {
+            claim.check(&version_results(&tests, id, version))?;
+        }
         tags.entry(id.to_string())
             .or_default()
             .insert(tag.to_string(), version);
+        let mut proofs = self
+            .template_tag_evidence
+            .lock()
+            .map_err(|_| HistoryError::Backend("template evidence lock poisoned".into()))?;
+        let by_tag = proofs.entry(id.to_string()).or_default();
+        match evidence {
+            Some(c) => {
+                by_tag.insert(tag.to_string(), (version, c.result_id.clone()));
+            }
+            None => {
+                by_tag.remove(tag);
+            }
+        }
+        Ok(())
+    }
+
+    async fn template_tag_records(
+        &self,
+        id: &str,
+    ) -> Result<Vec<templates::TagRecord>, HistoryError> {
+        let tags = self
+            .template_tags
+            .lock()
+            .map_err(|_| HistoryError::Backend("template tag lock poisoned".into()))?;
+        let proofs = self
+            .template_tag_evidence
+            .lock()
+            .map_err(|_| HistoryError::Backend("template evidence lock poisoned".into()))?;
+        let by_tag = proofs.get(id);
+        Ok(tags
+            .get(id)
+            .map(|t| {
+                t.iter()
+                    .map(|(tag, version)| templates::TagRecord {
+                        tag: tag.clone(),
+                        version: *version,
+                        evidence: by_tag
+                            .and_then(|m| m.get(tag))
+                            .filter(|(v, _)| v == version)
+                            .map(|(_, e)| e.clone()),
+                    })
+                    .collect()
+            })
+            .unwrap_or_default())
+    }
+
+    async fn meta_get(&self, key: &str) -> Result<Option<String>, HistoryError> {
+        let meta = self
+            .meta
+            .lock()
+            .map_err(|_| HistoryError::Backend("meta lock poisoned".into()))?;
+        Ok(meta.get(key).cloned())
+    }
+
+    async fn meta_compare_and_set(
+        &self,
+        key: &str,
+        expected: Option<&str>,
+        value: &str,
+    ) -> Result<bool, HistoryError> {
+        let mut meta = self
+            .meta
+            .lock()
+            .map_err(|_| HistoryError::Backend("meta lock poisoned".into()))?;
+        if meta.get(key).map(String::as_str) != expected {
+            return Ok(false);
+        }
+        meta.insert(key.to_string(), value.to_string());
+        Ok(true)
+    }
+
+    async fn meta_put(&self, key: &str, value: &str) -> Result<(), HistoryError> {
+        let mut meta = self
+            .meta
+            .lock()
+            .map_err(|_| HistoryError::Backend("meta lock poisoned".into()))?;
+        meta.insert(key.to_string(), value.to_string());
         Ok(())
     }
 
@@ -1400,16 +1508,24 @@ impl RunHistory for MemoryHistory {
         id: &str,
         version: u32,
         launched_by: Option<&str>,
+        evidence: Option<&templates::EvidenceClaim>,
     ) -> Result<Option<u32>, HistoryError> {
         let mut launches = self
             .template_launches
             .lock()
             .map_err(|_| HistoryError::Backend("template launch lock poisoned".into()))?;
+        let tests = self
+            .template_tests
+            .lock()
+            .map_err(|_| HistoryError::Backend("template test lock poisoned".into()))?;
         let log = launches.entry(id.to_string()).or_default();
         // Re-launching what is already stable is a no-op: appending would make
         // `previous` a duplicate of `stable` and destroy the rollback target.
         if templates::stable_version(log) == Some(version) {
             return Ok(None);
+        }
+        if let Some(claim) = evidence {
+            claim.check(&version_results(&tests, id, version))?;
         }
         let seq = log.first().map(|l| l.seq).unwrap_or(0) + 1;
         log.insert(
@@ -1419,9 +1535,77 @@ impl RunHistory for MemoryHistory {
                 version,
                 launched_at: Utc::now(),
                 launched_by: launched_by.map(str::to_string),
+                evidence: evidence.map(|c| c.result_id.clone()),
             },
         );
         Ok(Some(seq))
+    }
+
+    async fn template_records(
+        &self,
+        id: &str,
+    ) -> Result<Vec<templates::TemplateRecord>, HistoryError> {
+        let map = self
+            .templates
+            .lock()
+            .map_err(|_| HistoryError::Backend("template lock poisoned".into()))?;
+        Ok(map
+            .get(id)
+            .map(|v| v.values().rev().cloned().collect())
+            .unwrap_or_default())
+    }
+
+    async fn template_record_test(
+        &self,
+        result: &templates::TemplateTestResult,
+    ) -> Result<(), HistoryError> {
+        let map = self
+            .templates
+            .lock()
+            .map_err(|_| HistoryError::Backend("template lock poisoned".into()))?;
+        if !map
+            .get(&result.id)
+            .is_some_and(|v| v.contains_key(&result.version))
+        {
+            return Err(missing_version(&result.id, result.version));
+        }
+        let mut tests = self
+            .template_tests
+            .lock()
+            .map_err(|_| HistoryError::Backend("template test lock poisoned".into()))?;
+        let runs = tests.entry(result.id.clone()).or_default();
+        runs.insert(0, result.clone());
+        let mut kept = 0usize;
+        runs.retain(|r| {
+            if r.version != result.version {
+                return true;
+            }
+            kept += 1;
+            kept <= templates::RESULTS_RETAIN
+        });
+        Ok(())
+    }
+
+    async fn template_test_results(
+        &self,
+        id: &str,
+        version: Option<u32>,
+        limit: usize,
+    ) -> Result<Vec<templates::TemplateTestResult>, HistoryError> {
+        let tests = self
+            .template_tests
+            .lock()
+            .map_err(|_| HistoryError::Backend("template test lock poisoned".into()))?;
+        Ok(tests
+            .get(id)
+            .map(|runs| {
+                runs.iter()
+                    .filter(|r| version.is_none_or(|v| r.version == v))
+                    .take(limit)
+                    .cloned()
+                    .collect()
+            })
+            .unwrap_or_default())
     }
 
     async fn template_launches(
@@ -1518,6 +1702,33 @@ impl RunHistory for MemoryHistory {
     fn degraded(&self) -> bool {
         false
     }
+}
+
+/// A test result for a version that is not (or no longer) stored.
+fn missing_version(id: &str, version: u32) -> HistoryError {
+    HistoryError::Backend(format!(
+        "template '{id}' v{version} no longer exists; its test result was not recorded"
+    ))
+}
+
+/// The evidence of one template's channels: tag → (version, result id).
+type TagEvidence = BTreeMap<String, (u32, String)>;
+
+/// One version's recorded results, newest first.
+fn version_results(
+    tests: &std::collections::HashMap<String, Vec<templates::TemplateTestResult>>,
+    id: &str,
+    version: u32,
+) -> Vec<templates::TemplateTestResult> {
+    tests
+        .get(id)
+        .map(|runs| {
+            runs.iter()
+                .filter(|r| r.version == version)
+                .cloned()
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 #[cfg(test)]
@@ -1756,6 +1967,7 @@ mod tests {
                 source_ip: None,
                 tenant: None,
                 target: None,
+                detail: None,
                 result: result.into(),
             };
         h.record_audit(&entry(

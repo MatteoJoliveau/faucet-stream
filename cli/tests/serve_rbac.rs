@@ -38,6 +38,7 @@ fn args_with_auth_config(port: u16, auth_config: std::path::PathBuf) -> ServeArg
         write_token: None,
         admin_token: None,
         no_auth: false,
+        allow_unauthenticated_network: false,
         max_concurrent_runs: Some(4),
         max_queued_runs: Some(16),
         default_config: None,
@@ -368,6 +369,8 @@ fn all_v1_routes() -> Vec<(axum::http::Method, &'static str)> {
             Method::POST,
             "/v1/templates/{id}/versions/{version}/deprecate",
         ),
+        (Method::POST, "/v1/templates/{id}/versions/{version}/test"),
+        (Method::GET, "/v1/templates/{id}/versions/{version}/tests"),
     ]);
     #[cfg(feature = "templates-sync")]
     v.extend([
@@ -521,6 +524,7 @@ fn an_operator_triggers_templates_but_cannot_manage_them() {
         "/v1/templates/{id}/rollback",
         "/v1/templates/{id}/deprecate",
         "/v1/templates/{id}/versions/{version}/deprecate",
+        "/v1/templates/{id}/versions/{version}/test",
         "/v1/templates/sync",
         "/v1/templates/{id}/publish",
     ] {

@@ -1029,6 +1029,12 @@ faucet template rows      crm --sink files [--select … --include-parents …] 
 faucet template delete    tenant-sync --store sqlite:./faucet-templates.db --version 1
 faucet template test      suite.yaml                            # suite names a config path — no registry
 faucet template test      suite.yaml --store sqlite:./faucet-templates.db --select prod
+faucet template test      orders.yaml                           # a template's own tests: bundle, offline
+faucet template test      orders@3 --store sqlite:./faucet-templates.db   # run v3's bundle and record the result
+faucet template register  orders.yaml [--launch] --store …    # register (runs + records its tests); launch needs passing
+faucet template launch    orders --version 3 --store …        # only a passing version takes a label
+faucet template run       orders --version 2 --allow-untested --store …   # a pinned, unlabelled, non-passing version; labelled + audited
+faucet template revalidate --store … [--json]                 # re-test label holders + rollback targets under this release
 faucet template sync      --store sqlite:./faucet-templates.db --config sync.yaml --dry-run   # pull remote origins (RFC 0006)
 faucet template sync      --store sqlite:./faucet-templates.db --config sync.yaml --origin platform
 faucet template publish   platform-nightly --store sqlite:./faucet-templates.db --config sync.yaml --origin platform
@@ -1120,6 +1126,21 @@ readable config path, no registry is involved at all, so a template can be teste
 before it is ever registered. The exit code is the failed-case count, mirroring
 `faucet test`. See
 [Testing the parameter space](../cookbook/templates.md#testing-the-parameter-space).
+
+Given a template file with a `tests:` block, `faucet template test` runs that
+**bundle** offline (companions and shared suites from `--hub`); given
+`<id>@<version>` with `--store`, it runs the registered version's bundle and
+**records** the result on it (`--no-record` to just look; `--filter` needs
+`--no-record`, since a subset is not a result). `register` runs and records the
+new version's bundle itself. Every label move (`launch`, `rollback`, `promote`,
+`register --launch` / `--tag`, `sync`) needs a `passing` version, with no override;
+after a template's first launch, `template run` of a pinned version that holds no
+label and is not passing needs `--allow-untested`. `faucet template revalidate`
+re-runs the tests of every label holder and rollback target under the running
+faucet release, records the results, never moves a label, and exits with the
+number that no longer pass. `--require-tests` and `--skip-tests-reason` were
+removed. See
+[Template tests and labels](../cookbook/templates.md#template-tests-and-labels).
 
 ## `hub`
 
@@ -1340,6 +1361,7 @@ Selected flags (`faucet serve --help` for the full list):
 |------|---------|
 | `--listen <addr>` | Bind address (default `127.0.0.1:8080`; env `FAUCET_SERVE_LISTEN`). |
 | `--auth-token <t>` / `--no-auth` | Bearer token (prefer the env var) or explicit no-auth opt-in. |
+| `--allow-unauthenticated-network` | With `--no-auth`, allow a non-loopback `--listen` (`0.0.0.0`, `::`, a LAN address). Without it that combination refuses to start; with it the server logs a warning. Env: `FAUCET_SERVE_ALLOW_UNAUTHENTICATED_NETWORK`. |
 | `--auth-config <path>` | RBAC principals file (`{ name, token, role }`; roles `viewer`/`operator`/`admin`) — enables role enforcement + the `GET /v1/audit` log. Tokens resolve `${env:}` / `${file:}` / secret-manager references at startup; an unresolvable one refuses the start. Mutually exclusive with `--auth-token`/`--no-auth`. |
 | `--allow-subprocess-connectors` | Let a config submitted over HTTP or MCP use connectors that run a program on the host (`singer`). Off by default (`422`); configs for a tenant are refused regardless, registered templates are always allowed. See [Subprocess connectors](http-api.md#subprocess-connectors). |
 | `--read-token <t>` / `--write-token <t>` / `--admin-token <t>` | The three-token shorthand for the same RBAC (`viewer` / `operator` / `admin`) with no file to author — prefer the env vars `FAUCET_SERVE_{READ,WRITE,ADMIN}_TOKEN`. Any subset may be set; mutually exclusive with `--auth-token` / `--auth-config` / `--no-auth`. See the [role × route matrix](http-api.md#role--route-matrix). |
