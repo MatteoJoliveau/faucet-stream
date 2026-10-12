@@ -109,6 +109,10 @@ pub struct InvocationRecord {
     /// The source's lag when the invocation ended (#733).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub source_lag: Option<faucet_core::SourceLag>,
+    /// The invocation never ran: its parent or a `depends_on` row failed or
+    /// was skipped. `error` says which; it is not a failure of its own.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub skipped: bool,
 }
 
 impl From<&InvocationOutcome> for InvocationRecord {
@@ -123,6 +127,7 @@ impl From<&InvocationOutcome> for InvocationRecord {
             usage: o.usage.clone(),
             batches: o.metrics.as_ref().and_then(|m| m.batches),
             source_lag: o.metrics.as_ref().and_then(|m| m.source_lag),
+            skipped: o.error_kind == Some(crate::executor::InvocationErrorKind::Skipped),
         }
     }
 }
@@ -977,7 +982,8 @@ pub trait RunHistory: Send + Sync {
         Ok(false)
     }
 
-    /// Advance the watermark after an acknowledged batch (lease-fenced).
+    /// Advance the watermark after an acknowledged batch (lease-fenced, and
+    /// only forward: a lower `delivered_seq` than the stored one is refused).
     async fn log_ship_ack(&self, run_id: &str, delivered_seq: u64) -> Result<bool, HistoryError> {
         let _ = (run_id, delivered_seq);
         Ok(false)
@@ -1278,6 +1284,26 @@ pub trait RunHistory: Send + Sync {
     ) -> Result<bool, HistoryError> {
         match self.change_get(&change.id).await? {
             Some(cur) if cur.status == from => {
+                self.change_upsert(change).await?;
+                Ok(true)
+            }
+            _ => Ok(false),
+        }
+    }
+
+    /// Write `change` only if the stored request is still exactly `before`,
+    /// the version the caller read — so two approvals recorded on different
+    /// instances cannot both land, one dropping the other. `Ok(false)` =
+    /// someone else wrote it first. The default compares status and
+    /// `updated_at` after a read, which is not atomic; the built-in backends
+    /// override it.
+    async fn change_transition_from(
+        &self,
+        change: &crate::serve::changes::ChangeRequest,
+        before: &crate::serve::changes::ChangeRequest,
+    ) -> Result<bool, HistoryError> {
+        match self.change_get(&change.id).await? {
+            Some(cur) if cur.status == before.status && cur.updated_at == before.updated_at => {
                 self.change_upsert(change).await?;
                 Ok(true)
             }
@@ -1808,6 +1834,19 @@ pub trait RunHistory: Send + Sync {
                 protected.insert(v);
             }
         }
+        // A pending launch request names the version it will launch.
+        let pending = self
+            .change_list(&crate::serve::changes::ChangeListFilter {
+                status: Some(crate::serve::changes::ChangeStatus::Pending),
+                kind: Some(crate::serve::changes::ChangeKind::TemplateLaunch),
+                ..Default::default()
+            })
+            .await
+            .unwrap_or_default();
+        protected.extend(templates::launch_request_pins(
+            pending.iter().map(|c| &c.payload),
+            id,
+        ));
         for stale in templates::versions_to_prune(versions, &protected) {
             self.template_delete(id, Some(stale)).await?;
         }

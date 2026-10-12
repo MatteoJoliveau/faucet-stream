@@ -298,6 +298,8 @@ blake3 = "1"
 # AEAD for encryption-at-rest of FileStateStore bookmarks + JSONL/DLQ output (#207).
 aes-gcm = "0.11"
 hmac = "0.12"
+# HMAC-SHA1 for hashed OpenSSH known_hosts entries (the SFTP connectors).
+sha1 = "0.10"
 crc = "3"
 md-5 = "0.10"
 dashmap = "6"
@@ -355,7 +357,7 @@ csv = "1.3"
 csv-async = { version = "1.3", features = ["tokio"] }
 calamine = { version = "0.36", features = ["dates"] }
 rust_xlsxwriter = "0.99"
-redis = { version = "0.29", features = ["tokio-comp", "aio", "connection-manager", "tokio-rustls-comp", "tls-rustls-webpki-roots"] }
+redis = { version = "1.7.1", features = ["tokio-comp", "aio", "connection-manager", "tokio-rustls-comp", "tls-rustls-webpki-roots"] }
 axum = "0.8"
 subtle = "2"
 tower-http = { version = "0.6", features = ["limit", "cors", "trace", "request-id", "util"] }

@@ -138,6 +138,17 @@ are tracked in the roadmap epic (search the `epic` label).
   them out in the changelog. For a connector, a **breaking change** includes
   renaming/removing a config field, changing a field's type, or changing a
   default in a way that alters behavior — not just Rust API changes.
+- **Re-exported third-party crates (sanctioned exception).** A crate may
+  re-export a third-party crate wholesale so connector authors build against
+  the exact version the connector uses. Today that is `faucet-common-delta`,
+  which re-exports `deltalake` (plus `DeltaTable` / `DeltaTableError`). Such a
+  re-export follows its upstream: moving it to a new upstream major (deltalake
+  0.32 → 1.x shipped this way) is released as a **minor** bump of the
+  re-exporting crate, not a major. Code that names types through the re-export
+  (`faucet_common_delta::deltalake::…`) must be ready to follow upstream's
+  breaking changes; faucet-owned types keep the normal SemVer guarantee. A new
+  wholesale re-export of this kind needs the maintainer's sign-off and an entry
+  here.
 - **Independent crate versions.** Connector crates version independently on
   crates.io, so `faucet-source-rest` and `faucet-sink-bigquery` may sit at
   different versions. Per-crate tags use the form `<crate>-v<X.Y.Z>` (e.g.
@@ -190,12 +201,34 @@ README-only edit never causes a spurious publish.
 **Crate ownership.** crates.io makes the publishing account the only owner of
 a brand-new crate. After publishing, the release job adds the
 `github:faucet-hq:owners` team to every crate it released, so each crate is
-owned by both the publisher and the team.
+owned by both the publisher and the team. The manual fallback does the same
+for the crates it was asked to publish (both call `scripts/add-crate-team.sh`).
 
 **Manual fallback.** `.github/workflows/release.yml` (`Release (manual fallback)`)
 is kept as a `workflow_dispatch` workflow for ad-hoc / bulk re-publishes (e.g.
 after a registry incident, or to re-publish all 46 crates from a known-good
 revision). Day-to-day releases should go through release-plz.
+
+**Recovering a stalled release.** If the publish job dies mid-release, the
+release commit's push is consumed and no new release PR appears while `main`'s
+versions are already bumped. The publish job runs on a push whose commit
+subject is `chore: release …`, `chore(<crate>): release …` or
+`chore(release): …` (the branch name does not matter), so merge a trivial PR
+whose squash subject is `chore(release): …` to re-fire it. Publishing is
+idempotent: crates already on crates.io are skipped. Past incidents:
+
+- 2026-07-10: a versioned dev-dependency stopped the publish (#296).
+- 2026-07-18: the 1.5.0 release published every crate except `faucet-cli`,
+  whose `include_str!` read a file outside the crate (#329).
+- 2026-09-30: `faucet-sink-oracle` needed `faucet-source-oracle` on crates.io
+  first (#784); #785 moved cross-connector tests into the unpublished
+  `crates/interop-tests` and added `scripts/connector-deps.py`.
+
+**Public API in patch releases.** release-plz picks the bump from the commit
+type alone (`feat` → minor, `fix`/`perf` → patch) and its semver check is off,
+so a PR that adds public API (a new pub item, field or variant, a new config
+field) must be titled `feat:` even when it also fixes a bug — otherwise the
+addition ships in a patch release.
 
 **Dry-run locally.** Before relying on a release PR, you can preview what
 release-plz would do:
@@ -215,6 +248,10 @@ release-plz release    --dry-run     # prints what it would publish, in order
   with `contents: write` + `pull-requests: write`. Without it the release PR
   is opened by the default `GITHUB_TOKEN`, which by GitHub policy does **not**
   trigger downstream workflow runs — CI won't run on the release PR.
+- `DOCKERHUB_USERNAME` / `DOCKERHUB_TOKEN` (optional) — a read-only Docker Hub
+  token. CI pulls Docker Hub images through `mirror.gcr.io`; with these set,
+  images the mirror lacks (and the image builds) pull authenticated instead of
+  hitting the anonymous rate limit.
 
 ## License
 

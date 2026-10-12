@@ -30,6 +30,18 @@ async fn drain(source: &OracleCdcSource) -> (Vec<Value>, Option<Value>, usize) {
     (records, bookmark, pages)
 }
 
+/// Drain until the stream ends or fails; the error, if any.
+async fn drain_err(source: &OracleCdcSource) -> Option<String> {
+    let ctx = HashMap::new();
+    let mut s = source.stream_pages(&ctx, 0);
+    while let Some(p) = s.next().await {
+        if let Err(e) = p {
+            return Some(e.to_string());
+        }
+    }
+    None
+}
+
 fn cfg(conn: &OracleConnectionConfig) -> OracleCdcSourceConfig {
     let mut c = OracleCdcSourceConfig::new(conn.clone(), vec!["FAUCET.CDC_T".into()]);
     c.idle_timeout = Duration::from_secs(4);
@@ -356,6 +368,108 @@ GRANT CREATE SESSION, CREATE TABLE, UNLIMITED TABLESPACE, LOGMINING, SELECT ANY 
         .map(|r| format!("{}:{}", r["op"].as_str().unwrap(), r["after"]["V"]))
         .collect();
     assert_eq!(ops, vec!["i:\"s\""], "{records:#?}");
+
+    // #862 L-058: LOB reassembly and XMLType edges, and the PDB incarnation
+    // recorded in the bookmark.
+    common::exec(
+        &conn,
+        &[
+            "CREATE TABLE CDC_L (ID NUMBER PRIMARY KEY, NOTE CLOB)",
+            "ALTER TABLE CDC_L ADD SUPPLEMENTAL LOG DATA (ALL) COLUMNS",
+            "DECLARE c CLOB; BEGIN c := RPAD('b', 5000, 'b'); \
+             INSERT INTO CDC_L (ID, NOTE) VALUES (2, c); END;",
+            "CREATE TABLE CDC_X (ID NUMBER PRIMARY KEY, X XMLTYPE) \
+             XMLTYPE COLUMN X STORE AS BINARY XML",
+            "ALTER TABLE CDC_X ADD SUPPLEMENTAL LOG DATA (ALL) COLUMNS",
+            "INSERT INTO CDC_X (ID, X) VALUES (2, XMLTYPE('<a>1</a>'))",
+        ],
+    )
+    .await;
+    let mut lob_cfg = cfg(&conn);
+    lob_cfg.tables = vec!["FAUCET.CDC_L".into()];
+    let lob_src = OracleCdcSource::new(lob_cfg.clone())
+        .await
+        .expect("lob source");
+
+    // A CLOB LogMiner logs in several pieces, one holding a supplementary-plane
+    // character (the later pieces' offsets count it once), comes back whole.
+    let anchor = lob_src.capture_resume_position().await.unwrap().unwrap();
+    common::exec(
+        &conn,
+        &[
+            "DECLARE c CLOB; BEGIN c := RPAD('x', 4000, 'x') || UNISTR('\\D83D\\DE00') \
+             || RPAD('y', 3000, 'y'); INSERT INTO CDC_L (ID, NOTE) VALUES (1, c); END;",
+        ],
+    )
+    .await;
+    lob_src.apply_start_bookmark(anchor).await.unwrap();
+    let (records, bookmark, _) = drain(&lob_src).await;
+    let one = records
+        .iter()
+        .find(|r| r["after"]["ID"] == 1)
+        .expect("row 1");
+    let expected = format!("{}\u{1F600}{}", "x".repeat(4000), "y".repeat(3000));
+    assert_eq!(one["after"]["NOTE"].as_str(), Some(expected.as_str()));
+    let bookmark = bookmark.expect("bookmark");
+    assert!(
+        bookmark["pdb_incarnation_scn"].as_u64().is_some(),
+        "connected to a PDB, the bookmark records its incarnation: {bookmark}"
+    );
+    assert!(bookmark["resetlogs_scn"].as_u64().is_some(), "{bookmark}");
+
+    // An append to a CLOB whose value predates the window cannot be
+    // reassembled: it fails by default and is dropped under `skip`. The value
+    // is stored out of row, so only the appended piece is logged (an in-row
+    // value is logged whole and reads as a plain update).
+    let anchor = lob_src.capture_resume_position().await.unwrap().unwrap();
+    common::exec(
+        &conn,
+        &[
+            "DECLARE c CLOB; BEGIN SELECT NOTE INTO c FROM CDC_L WHERE ID = 2 FOR UPDATE; \
+             DBMS_LOB.APPEND(c, TO_CLOB(' more')); END;",
+        ],
+    )
+    .await;
+    lob_src.apply_start_bookmark(anchor.clone()).await.unwrap();
+    let err = drain_err(&lob_src)
+        .await
+        .expect("a partial LOB write fails");
+    assert!(err.contains("partial LOB write"), "{err}");
+    let mut skip_cfg = lob_cfg.clone();
+    skip_cfg.on_unsupported = faucet_source_oracle_cdc::OnUnsupported::Skip;
+    let skipping = OracleCdcSource::new(skip_cfg).await.unwrap();
+    skipping.apply_start_bookmark(anchor).await.unwrap();
+    let (records, _, _) = drain(&skipping).await;
+    assert!(
+        records.iter().all(|r| r["after"]["ID"] != 2),
+        "a reassembled guess never surfaces: {records:#?}"
+    );
+
+    // A binary XMLType update is logged as XML document pieces LogMiner
+    // cannot render as SQL.
+    let mut xml_cfg = cfg(&conn);
+    xml_cfg.tables = vec!["FAUCET.CDC_X".into()];
+    let xml_src = OracleCdcSource::new(xml_cfg.clone())
+        .await
+        .expect("xml source");
+    let anchor = xml_src.capture_resume_position().await.unwrap().unwrap();
+    common::exec(
+        &conn,
+        &["UPDATE CDC_X SET X = XMLTYPE('<a>2</a>') WHERE ID = 2"],
+    )
+    .await;
+    xml_src.apply_start_bookmark(anchor.clone()).await.unwrap();
+    let err = drain_err(&xml_src)
+        .await
+        .expect("a binary XMLType change fails by default");
+    assert!(
+        err.contains("binary XMLType") || err.contains("cannot decode"),
+        "{err}"
+    );
+    xml_cfg.on_unsupported = faucet_source_oracle_cdc::OnUnsupported::Skip;
+    let skipping = OracleCdcSource::new(xml_cfg).await.unwrap();
+    skipping.apply_start_bookmark(anchor).await.unwrap();
+    assert!(drain_err(&skipping).await.is_none(), "skip drops it");
 
     // Misconfiguration is reported up front.
     let missing = OracleCdcSource::new(OracleCdcSourceConfig {

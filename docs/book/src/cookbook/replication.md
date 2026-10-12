@@ -211,6 +211,15 @@ For `postgres-cdc`, position capture uses a **permanent** replication slot
 (`slot_type: permanent`, the default), which retains WAL across the snapshot.
 `slot_type: temporary` is refused at config load: a temporary slot is dropped
 with the session that creates it, before replication could start.
+The server must be **PostgreSQL 14 or newer** (the stream uses the pgoutput
+`messages` option).
+
+A `postgres-cdc` fetch cycle also ends at the first transaction boundary after
+`max_cycle_duration` (default 300 s), even under steady writes, because the
+slot's `confirmed_flush_lsn` only advances when the next cycle starts from the
+persisted bookmark. `faucet mirror` starts that next cycle straight away; under
+`faucet schedule` the next tick resumes; a one-shot `faucet run` (or a `faucet
+serve` run) ends with the cycle.
 
 ### Log retention must outlast the snapshot
 

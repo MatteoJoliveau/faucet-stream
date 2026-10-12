@@ -74,7 +74,7 @@ faucet run pipeline.yaml
 | `batch_size` | int | `1000` | Records per emitted `StreamPage`. **`0` = no batching**: the entire result set is emitted as a single page (good for small lookup tables, or sinks that prefer one large request). |
 | `shard` | object | *(unset)* | Optional [Mode B sharding](#sharded-execution-cluster-mode-b): `{ key: <integer column> }`. Opts the source into primary-key range splitting under `faucet serve --cluster`; no effect on a plain `faucet run`. |
 | `statement_timeout_secs` | int (seconds) | `300` | Bounds the query's first response and every wait for the next row. **`0` disables** (wait indefinitely). |
-| `state_key` | string | *(derived)* | Explicit state-store key for the incremental bookmark. When unset, a stable key is derived from the connection host plus a fingerprint of the query. |
+| `state_key` | string | *(derived)* | Explicit state-store key for the incremental bookmark. When unset, a stable key is derived from the connection host plus a fingerprint of the query. The query fingerprint changed in #839 (a fixed FNV-1a hash replaced Rust's `DefaultHasher`, which is not stable across releases), so a library pipeline relying on the derived key starts once from its initial position after upgrading; set `state_key` to pin it. Runs through the `faucet` CLI are unaffected — the CLI keys state by pipeline and row. |
 
 ### Replication
 
@@ -242,9 +242,9 @@ Discovery reads catalog metadata only — it never scans table data.
 | MSSQL | JSON |
 |-------|------|
 | TINYINT / SMALLINT / INT / BIGINT | number |
-| REAL / FLOAT | number |
+| REAL / FLOAT | number (`REAL` through its shortest decimal form, so `0.1` stays `0.1`) |
 | BIT | bool |
-| DECIMAL / NUMERIC / MONEY | string (precision-preserving; MONEY/SMALLMONEY as exact 4-decimal text — the driver delivers MONEY as a float, which is exact below about ±900 billion, the range we render without loss) |
+| DECIMAL / NUMERIC / MONEY | string (precision-preserving; MONEY/SMALLMONEY as exact 4-decimal text across their whole range — the source reads them as `DECIMAL(19,4)`, see below) |
 | CHAR / VARCHAR / NCHAR / NVARCHAR / TEXT / NTEXT / XML | string |
 | DATE | `YYYY-MM-DD` |
 | TIME | ISO time |
@@ -256,6 +256,16 @@ Discovery reads catalog metadata only — it never scans table data.
 | SQL NULL | `null` |
 
 Each record is keyed by column name, so a query returning two columns with the same name — a join's `id`, or two unaliased expressions (SQL Server names both `""`) — fails with a `FaucetError::Source` asking you to alias them, instead of one silently replacing the other.
+
+**Exact MONEY.** The driver decodes `MONEY` / `SMALLMONEY` as a float, which
+is exact only below about ±900 billion. So before streaming, the source asks
+SQL Server for the query's result shape (`sp_describe_first_result_set`, one
+extra round trip) and, when a column is `MONEY` or `SMALLMONEY`, reads the
+query as `SELECT …, CAST(col AS DECIMAL(19,4)) AS col FROM (<query>) AS _faucet_money`.
+A query that cannot be used as a derived table — a trailing `ORDER BY`
+without `TOP`/`OFFSET`, a CTE, a temp table, unnamed or duplicate columns —
+keeps the float path and logs one warning; cast the column yourself
+(`CAST(amount AS DECIMAL(19,4)) AS amount`) to read such a query exactly.
 
 ## Config loading & schema
 

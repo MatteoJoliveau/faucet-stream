@@ -745,14 +745,12 @@ async fn preview(ctx: &McpContext, args: &Value) -> Result<String, String> {
         .find(|n| matches!(n.role, crate::expand::NodeRole::Root))
         .ok_or_else(|| "no root row to preview".to_string())?;
 
-    let source = crate::registry::build_source(
-        &first_root.source.kind,
-        first_root.source.config.clone(),
-        &ctx.auth,
-        None,
-    )
-    .await
-    .map_err(|e| e.to_string())?;
+    let mut source_cfg = first_root.source.config.clone();
+    crate::preview_sample::bound_batch_size(&first_root.source.kind, &mut source_cfg, limit);
+    let source =
+        crate::registry::build_source(&first_root.source.kind, source_cfg, &ctx.auth, None)
+            .await
+            .map_err(|e| e.to_string())?;
     let stages =
         crate::transforms::compile_transforms(&first_root.transforms).map_err(|e| e.to_string())?;
     let compiled = stages
@@ -1215,6 +1213,15 @@ async fn run_template(ctx: &McpContext, args: &Value) -> Result<String, String> 
     )
     .await
     .map_err(|e| e.to_string())?;
+    let untested = materialized.untested.map(|s| s.as_str());
+    if let Some(status) = untested {
+        tracing::warn!(
+            template = %materialized.template_id,
+            version = materialized.version,
+            status,
+            "running a template version whose tests are not passing because of allow_untested"
+        );
+    }
 
     if dry_run {
         // Validate the materialized config without touching a sink, and never
@@ -1222,7 +1229,12 @@ async fn run_template(ctx: &McpContext, args: &Value) -> Result<String, String> 
         let cfg = parse_config_with(&materialized.body, crate::params::BindMode::Strict, None)?;
         let mut nodes = crate::expand::expand(&cfg).map_err(|e| e.to_string())?;
         if let Some(sel) = &materialized.selection {
-            nodes = sel.apply(&cfg, nodes).map_err(|e| e.to_string())?;
+            let auth = crate::auth_catalog::build_auth_catalog(cfg.auth.as_ref())
+                .map_err(|e| e.to_string())?;
+            nodes = sel
+                .apply_resolved(&cfg, nodes, &auth)
+                .await
+                .map_err(|e| e.to_string())?;
         }
         let run_set: Vec<String> = nodes.iter().map(|n| n.id.clone()).collect();
         let rows = nodes.len();
@@ -1242,6 +1254,7 @@ async fn run_template(ctx: &McpContext, args: &Value) -> Result<String, String> 
             "selection": selection.as_ref().map(|s| s.canonical()),
             "dry_run": true,
             "deprecated": deprecated,
+            "allow_untested": untested,
         })));
     }
 
@@ -1267,6 +1280,7 @@ async fn run_template(ctx: &McpContext, args: &Value) -> Result<String, String> 
         "failed": failed,
         "records_written": total,
         "deprecated": deprecated,
+        "allow_untested": untested,
     });
     if failed > 0 {
         return Err(format!(
@@ -1945,6 +1959,51 @@ mod tests {
             )
             .await;
             assert_eq!(out["isError"], true);
+        }
+
+        #[tokio::test]
+        async fn run_template_reports_an_allow_untested_run() {
+            let ctx = tpl_ctx(true);
+            let body = |written: usize| {
+                format!(
+                    "kind: pipeline\nversion: 1\nname: gated\npipeline:\n  source:\n    type: rest\n    config:\n      base_url: \"https://example.com\"\n      path: /rows\n  sink:\n    type: jsonl\n    config:\n      path: ./out.jsonl\ntests:\n  fixtures:\n    - name: rows\n      input: [{{ \"id\": 1 }}, {{ \"id\": 2 }}]\n      expect: {{ records_written: {written} }}\n"
+                )
+            };
+            let out = call_tool(&ctx, "register_template", &json!({"config": body(3)})).await;
+            assert_eq!(out["isError"], false, "{out}");
+            let out = call_tool(
+                &ctx,
+                "register_template",
+                &json!({"config": body(2), "launch": true}),
+            )
+            .await;
+            assert_eq!(out["isError"], false, "{out}");
+            let refused = call_tool(
+                &ctx,
+                "run_template",
+                &json!({"id": "gated", "version": 1, "dry_run": true}),
+            )
+            .await;
+            assert_eq!(refused["isError"], true, "{refused}");
+            let out = call_tool(
+                &ctx,
+                "run_template",
+                &json!({"id": "gated", "version": 1, "dry_run": true, "allow_untested": true}),
+            )
+            .await;
+            assert_eq!(out["isError"], false, "{out}");
+            let doc: Value =
+                serde_json::from_str(out["content"][0]["text"].as_str().unwrap()).unwrap();
+            assert_eq!(doc["allow_untested"], json!("failing"), "{doc}");
+            let out = call_tool(
+                &ctx,
+                "run_template",
+                &json!({"id": "gated", "version": 2, "dry_run": true}),
+            )
+            .await;
+            let doc: Value =
+                serde_json::from_str(out["content"][0]["text"].as_str().unwrap()).unwrap();
+            assert_eq!(doc["allow_untested"], Value::Null, "{doc}");
         }
 
         #[tokio::test]

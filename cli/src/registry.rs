@@ -1688,6 +1688,20 @@ where
     })
 }
 
+/// The BigQuery sink's construction-time refusals, so `faucet validate`
+/// reports them instead of the first run.
+#[cfg(feature = "sink-bigquery")]
+fn bigquery_sink_checks(
+    c: &faucet_sink_bigquery::BigQuerySinkConfig,
+) -> Result<(), faucet_core::FaucetError> {
+    #[cfg(feature = "arrow")]
+    if let Some(load) = &c.bulk_load {
+        load.validate()?;
+    }
+    let _ = c;
+    Ok(())
+}
+
 /// Validate a source's `config` **without building it**: deserialize the raw
 /// `Value` into the connector's typed config and discard the result.
 ///
@@ -1819,7 +1833,12 @@ pub fn validate_source_config(kind: &str, name: &str, config: Value) -> CliResul
         #[cfg(feature = "source-redis")]
         "redis" => check::<faucet_source_redis::RedisSourceConfig>("redis", name, config),
         #[cfg(feature = "source-webhook")]
-        "webhook" => check::<faucet_source_webhook::WebhookSourceConfig>("webhook", name, config),
+        "webhook" => check_with::<faucet_source_webhook::WebhookSourceConfig, _, _>(
+            "webhook",
+            name,
+            config,
+            |c| c.validate(),
+        ),
         #[cfg(feature = "source-websocket")]
         "websocket" => check_with::<faucet_source_websocket::WebsocketSourceConfig, _, _>(
             "websocket",
@@ -2139,7 +2158,12 @@ pub fn validate_sink_config(kind: &str, name: &str, config: Value) -> CliResult<
     }
     match kind {
         #[cfg(feature = "sink-bigquery")]
-        "bigquery" => check::<faucet_sink_bigquery::BigQuerySinkConfig>("bigquery", name, config),
+        "bigquery" => check_with::<faucet_sink_bigquery::BigQuerySinkConfig, _, _>(
+            "bigquery",
+            name,
+            config,
+            bigquery_sink_checks,
+        ),
         #[cfg(feature = "sink-iceberg")]
         "iceberg" => check_with::<faucet_sink_iceberg::IcebergSinkConfig, _, _>(
             "iceberg",
@@ -2882,6 +2906,25 @@ fn unknown(name: &str, kind: &'static str, available: Vec<&'static str>) -> CliE
 
 #[cfg(test)]
 mod tests {
+
+    #[cfg(all(feature = "sink-bigquery", feature = "arrow"))]
+    #[test]
+    fn validate_refuses_a_truncating_bigquery_bulk_load() {
+        let config = |disposition: &str| {
+            serde_json::json!({
+                "project_id": "p",
+                "dataset_id": "d",
+                "table_id": "t",
+                "auth": {"type": "application_default"},
+                "bulk_load": {"staging_bucket": "b", "write_disposition": disposition}
+            })
+        };
+        let err = super::validate_sink_config("bigquery", "out", config("WRITE_TRUNCATE"))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("write_disposition"), "{err}");
+        super::validate_sink_config("bigquery", "out", config("WRITE_APPEND")).unwrap();
+    }
     use super::*;
 
     use serde_json::json;
@@ -3790,6 +3833,23 @@ mod tests {
             serde_json::json!({"table_name": "t", "mode": "scan"}),
         )
         .expect("scan config is valid");
+    }
+
+    #[cfg(feature = "source-webhook")]
+    #[test]
+    fn validate_runs_the_webhook_config_checks() {
+        let err = validate_source_config("webhook", "row", serde_json::json!({"path": "webhook"}))
+            .expect_err("a path without a leading slash is refused");
+        assert!(err.to_string().contains("must start with `/`"), "{err}");
+        let err = validate_source_config(
+            "webhook",
+            "row",
+            serde_json::json!({"path": "/w", "signature": {"header": "", "secret": ""}}),
+        )
+        .expect_err("an empty signature is refused");
+        assert!(err.to_string().contains("signature.header"), "{err}");
+        validate_source_config("webhook", "row", serde_json::json!({"path": "/w"}))
+            .expect("a plain path is valid");
     }
 
     #[test]

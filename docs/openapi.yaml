@@ -2653,6 +2653,7 @@ components:
         created_by: { type: string }
         connections: { type: array, items: { $ref: "#/components/schemas/Connection" } }
         active_runs: { type: integer }
+        notifications_error: { type: string, description: "Why the sealed notifications list could not be opened; the list then reads as empty." }
     TenantDeleteReport:
       type: object
       required: [runs, usage_records, change_requests, state_keys_deleted, catalog_datasets, catalog_edges, catalog_config_snapshots]
@@ -2833,6 +2834,7 @@ components:
         error: { type: string, nullable: true }
         batches: { $ref: "#/components/schemas/BatchOutcomes" }
         source_lag: { $ref: "#/components/schemas/SourceLag" }
+        skipped: { type: boolean, description: "The invocation never ran because its parent or a `depends_on` row failed or was skipped; `error` names it. Absent when false." }
       example:
         row_id: orders_to_warehouse
         parent_record_key: example

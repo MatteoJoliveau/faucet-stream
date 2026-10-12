@@ -2104,12 +2104,13 @@
       "type": "object",
       "properties": {
         "id": {
-          "description": "Row identifier. Required for parent/child references and runtime\n`${id.path}` interpolation. Anonymous rows get a synthetic `row-N` id.",
+          "description": "Row identifier. Required for parent/child references and runtime\n`${id.path}` interpolation. Anonymous rows get a synthetic `row-N` id.\nLetters, digits, `_` and `-` only.",
           "type": [
             "string",
             "null"
           ],
-          "default": null
+          "default": null,
+          "pattern": "^[A-Za-z0-9_-]+$"
         },
         "parent": {
           "description": "If set, this row runs once per record produced by the named parent row.",
@@ -2230,6 +2231,13 @@
         },
         "tags": {
           "description": "Free-form classification tags for this row (#376). Orthogonal to the\nsource's `status:` readiness ladder — `status` gates whether a row is\neligible; `tags` narrow *within* the eligible set at runtime via\n`--tag`. Union-merged with the source template's `tags:` to form the\neffective tag set. Validated at expand time (charset\n`^[a-z0-9][a-z0-9_-]*$`, deduped).",
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "legacy_state_ids": {
+          "description": "Row ids an earlier release stored this row's state under. While the\nrow has no state of its own, its first run moves the bookmark from the\nfirst of these that holds one. `faucet discover` writes it when a\ndataset's row id changed (#862 L-040).",
           "type": "array",
           "items": {
             "type": "string"
@@ -4781,6 +4789,14 @@
                 "string",
                 "null"
               ]
+            },
+            "stop_when_short": {
+              "description": "Stop on a page shorter than `limit` (default `false`). Only for\nservers that never cap a page below `limit` — a capped page would\nend the run with rows unread — but reject an offset past the end\n(a `400`/`416` on the extra request) instead of returning an empty\npage. A readable `total_path` still wins.",
+              "type": [
+                "boolean",
+                "string"
+              ],
+              "default": false
             }
           }
         },
@@ -6410,6 +6426,14 @@
             "type": {
               "type": "string",
               "const": "PageNumber"
+            },
+            "stop_when_short": {
+              "description": "Stop on a page shorter than `page_size` (default `false`). Only for\nservers that never clamp the page size and reject a page past the\nend; a clamped page would end the run with rows unread.",
+              "type": [
+                "boolean",
+                "string"
+              ],
+              "default": false
             }
           }
         },
@@ -6434,6 +6458,14 @@
             "type": {
               "type": "string",
               "const": "Offset"
+            },
+            "stop_when_short": {
+              "description": "Stop on a page shorter than `limit` (default `false`). Only for\nservers that never clamp `limit` and reject an offset past the end;\na clamped page would end the run with rows unread.",
+              "type": [
+                "boolean",
+                "string"
+              ],
+              "default": false
             }
           }
         },
@@ -6844,6 +6876,16 @@
             "mode": {
               "type": "string",
               "const": "from_url"
+            }
+          }
+        },
+        {
+          "description": "TLS when the server offers it, else plaintext, without verifying the\ncertificate (libpq's `prefer`; open to downgrade).",
+          "type": "object",
+          "properties": {
+            "mode": {
+              "type": "string",
+              "const": "prefer"
             }
           }
         }
@@ -7438,6 +7480,9 @@
       ]
     },
     "source_sftp__CsvOptions": {
+      "x-faucet-aliases": [
+        "write_headers"
+      ],
       "description": "CSV dialect.",
       "type": "object",
       "properties": {
@@ -7447,7 +7492,7 @@
           "default": ","
         },
         "has_headers": {
-          "description": "Whether the first row names the fields. When false, fields are named\n`column_0`, `column_1`, … — the same fallback the REST source and the\n`csv` connector already use. On write it decides whether a header row\nis written.",
+          "description": "Whether the first row names the fields. When false, fields are named\n`column_0`, `column_1`, … — the same fallback the REST source and the\n`csv` connector already use. On write it decides whether a header row\nis written. `write_headers` is a deprecated name for it.",
           "type": [
             "boolean",
             "string"
@@ -7592,6 +7637,9 @@
       ]
     },
     "source_s3__CsvOptions": {
+      "x-faucet-aliases": [
+        "write_headers"
+      ],
       "description": "CSV dialect.",
       "type": "object",
       "properties": {
@@ -7601,7 +7649,7 @@
           "default": ","
         },
         "has_headers": {
-          "description": "Whether the first row names the fields. When false, fields are named\n`column_0`, `column_1`, … — the same fallback the REST source and the\n`csv` connector already use. On write it decides whether a header row\nis written.",
+          "description": "Whether the first row names the fields. When false, fields are named\n`column_0`, `column_1`, … — the same fallback the REST source and the\n`csv` connector already use. On write it decides whether a header row\nis written. `write_headers` is a deprecated name for it.",
           "type": [
             "boolean",
             "string"
@@ -8451,6 +8499,9 @@
       ]
     },
     "source_azure-blob__CsvOptions": {
+      "x-faucet-aliases": [
+        "write_headers"
+      ],
       "description": "CSV dialect.",
       "type": "object",
       "properties": {
@@ -8460,7 +8511,7 @@
           "default": ","
         },
         "has_headers": {
-          "description": "Whether the first row names the fields. When false, fields are named\n`column_0`, `column_1`, … — the same fallback the REST source and the\n`csv` connector already use. On write it decides whether a header row\nis written.",
+          "description": "Whether the first row names the fields. When false, fields are named\n`column_0`, `column_1`, … — the same fallback the REST source and the\n`csv` connector already use. On write it decides whether a header row\nis written. `write_headers` is a deprecated name for it.",
           "type": [
             "boolean",
             "string"
@@ -9950,6 +10001,9 @@
       ]
     },
     "source_gcs__CsvOptions": {
+      "x-faucet-aliases": [
+        "write_headers"
+      ],
       "description": "CSV dialect.",
       "type": "object",
       "properties": {
@@ -9959,7 +10013,7 @@
           "default": ","
         },
         "has_headers": {
-          "description": "Whether the first row names the fields. When false, fields are named\n`column_0`, `column_1`, … — the same fallback the REST source and the\n`csv` connector already use. On write it decides whether a header row\nis written.",
+          "description": "Whether the first row names the fields. When false, fields are named\n`column_0`, `column_1`, … — the same fallback the REST source and the\n`csv` connector already use. On write it decides whether a header row\nis written. `write_headers` is a deprecated name for it.",
           "type": [
             "boolean",
             "string"
@@ -11896,6 +11950,9 @@
       ]
     },
     "sink_sftp__CsvOptions": {
+      "x-faucet-aliases": [
+        "write_headers"
+      ],
       "description": "CSV dialect.",
       "type": "object",
       "properties": {
@@ -11905,7 +11962,7 @@
           "default": ","
         },
         "has_headers": {
-          "description": "Whether the first row names the fields. When false, fields are named\n`column_0`, `column_1`, … — the same fallback the REST source and the\n`csv` connector already use. On write it decides whether a header row\nis written.",
+          "description": "Whether the first row names the fields. When false, fields are named\n`column_0`, `column_1`, … — the same fallback the REST source and the\n`csv` connector already use. On write it decides whether a header row\nis written. `write_headers` is a deprecated name for it.",
           "type": [
             "boolean",
             "string"
@@ -12050,6 +12107,9 @@
       ]
     },
     "sink_s3__CsvOptions": {
+      "x-faucet-aliases": [
+        "write_headers"
+      ],
       "description": "CSV dialect.",
       "type": "object",
       "properties": {
@@ -12059,7 +12119,7 @@
           "default": ","
         },
         "has_headers": {
-          "description": "Whether the first row names the fields. When false, fields are named\n`column_0`, `column_1`, … — the same fallback the REST source and the\n`csv` connector already use. On write it decides whether a header row\nis written.",
+          "description": "Whether the first row names the fields. When false, fields are named\n`column_0`, `column_1`, … — the same fallback the REST source and the\n`csv` connector already use. On write it decides whether a header row\nis written. `write_headers` is a deprecated name for it.",
           "type": [
             "boolean",
             "string"
@@ -13846,6 +13906,9 @@
       ]
     },
     "sink_gcs__CsvOptions": {
+      "x-faucet-aliases": [
+        "write_headers"
+      ],
       "description": "CSV dialect.",
       "type": "object",
       "properties": {
@@ -13855,7 +13918,7 @@
           "default": ","
         },
         "has_headers": {
-          "description": "Whether the first row names the fields. When false, fields are named\n`column_0`, `column_1`, … — the same fallback the REST source and the\n`csv` connector already use. On write it decides whether a header row\nis written.",
+          "description": "Whether the first row names the fields. When false, fields are named\n`column_0`, `column_1`, … — the same fallback the REST source and the\n`csv` connector already use. On write it decides whether a header row\nis written. `write_headers` is a deprecated name for it.",
           "type": [
             "boolean",
             "string"
@@ -14553,6 +14616,9 @@
       ]
     },
     "sink_azure-blob__CsvOptions": {
+      "x-faucet-aliases": [
+        "write_headers"
+      ],
       "description": "CSV dialect.",
       "type": "object",
       "properties": {
@@ -14562,7 +14628,7 @@
           "default": ","
         },
         "has_headers": {
-          "description": "Whether the first row names the fields. When false, fields are named\n`column_0`, `column_1`, … — the same fallback the REST source and the\n`csv` connector already use. On write it decides whether a header row\nis written.",
+          "description": "Whether the first row names the fields. When false, fields are named\n`column_0`, `column_1`, … — the same fallback the REST source and the\n`csv` connector already use. On write it decides whether a header row\nis written. `write_headers` is a deprecated name for it.",
           "type": [
             "boolean",
             "string"
@@ -15884,7 +15950,7 @@
                       ]
                     },
                     "read_timeout_secs": {
-                      "description": "Longest the source waits on the server for the next row (or for a\nwhole result in `fetch_all`), in seconds, before the read fails.\nDefaults to 3600; `0` waits forever.\n\nA peer that disappears without closing the connection (a failover, an\nidle eviction by a NAT or load balancer) otherwise leaves the read\nwaiting forever, and a scheduled or served run stuck in \"running\".",
+                      "description": "Longest the source waits on the server for the next row (or for a\nwhole result in `fetch_all`), in seconds, before the read fails.\nThis includes the wait for the first row, so a query that computes\nlonger than this before returning anything fails. Defaults to 3600;\n`0` waits forever.\n\nA peer that disappears without closing the connection (a failover, an\nidle eviction by a NAT or load balancer) otherwise leaves the read\nwaiting forever, and a scheduled or served run stuck in \"running\".",
                       "type": [
                         "integer",
                         "string"
@@ -16072,7 +16138,7 @@
                       "default": null
                     },
                     "max_cycle_duration": {
-                      "description": "Longest a fetch cycle runs before it ends at the next transaction\nboundary. Default: 300 s; `0` means no bound.\n\nThe slot's `confirmed_flush_lsn` advances only at the start of a cycle,\nfrom the bookmark the previous cycle persisted. Under steady writes\n`idle_timeout` never fires, so without this bound a cycle — and the WAL\nthe slot pins — would grow until the primary's disk filled. A\nlong-running runtime (`faucet schedule`, `faucet serve`, `faucet\nmirror`) starts the next cycle straight away.",
+                      "description": "Longest a fetch cycle runs before it ends at the next transaction\nboundary. Default: 300 s; `0` means no bound.\n\nThe slot's `confirmed_flush_lsn` advances only at the start of a cycle,\nfrom the bookmark the previous cycle persisted. Under steady writes\n`idle_timeout` never fires, so without this bound a cycle — and the WAL\nthe slot pins — would grow until the primary's disk filled. `faucet\nmirror` starts the next cycle straight away; under `faucet schedule`\nthe next tick resumes; a one-shot `faucet run` (or `serve` run) ends.",
                       "type": [
                         "integer",
                         "string"
@@ -16101,6 +16167,16 @@
                       "format": "uint",
                       "minimum": 0,
                       "default": 100000
+                    },
+                    "max_buffered_bytes": {
+                      "description": "Upper bound, in bytes of decoded change data, on the read-ahead\nbuffer described under `max_buffered_events`; reading pauses at\nwhichever limit is reached first. This memory is held in addition to\n`max_staged_records`. Default 268 435 456 (256 MiB).",
+                      "type": [
+                        "integer",
+                        "string"
+                      ],
+                      "format": "uint",
+                      "minimum": 0,
+                      "default": 268435456
                     },
                     "status_update_interval": {
                       "description": "Interval at which Standby Status Update keepalives are sent to the\nserver. Must be shorter than `idle_timeout` and well under the\nserver's `wal_sender_timeout` (default 60 s). Default: 10 s.",
@@ -17031,6 +17107,11 @@
                         "string"
                       ],
                       "default": false
+                    },
+                    "on_decode_error": {
+                      "description": "What a payload `value_format` cannot decode does: `fail` (default)\nfails the run; `skip` logs a warning and drops it — a JetStream message\nis terminated so it is not redelivered.",
+                      "$ref": "#/$defs/source_nats__NatsOnDecodeError",
+                      "default": "fail"
                     }
                   },
                   "title": "NatsSourceConfig",
@@ -17526,7 +17607,7 @@
                     },
                     "connect_timeout_secs": {
                       "default": 30,
-                      "description": "Seconds the TCP connect, SSH handshake and authentication together may\ntake (default 30). A server that accepts and then stalls fails the run\ninstead of hanging it.",
+                      "description": "Seconds the TCP connect, SSH handshake, authentication and the SFTP\nsubsystem start together may take (default 30). A server that accepts and then stalls fails the run\ninstead of hanging it.",
                       "format": "uint64",
                       "minimum": 0,
                       "type": [
@@ -18562,7 +18643,7 @@
                       ]
                     },
                     "tls_mode": {
-                      "description": "Explicit TLS mode; overrides `tls`. `verify_ca` / `verify_full` check\nthe server certificate against `ssl_root_cert` (or the system roots),\nthe latter also its host name.",
+                      "description": "Explicit TLS mode; overrides `tls`. `verify_ca` / `verify_full` check\nthe server certificate against `ssl_root_cert` (or, without one, the\nMozilla root store bundled into the binary — not the operating\nsystem's), the latter also its host name.",
                       "anyOf": [
                         {
                           "$ref": "#/$defs/source_redshift__RedshiftTlsMode"
@@ -20133,7 +20214,7 @@
                       "default": 10
                     },
                     "request_timeout_secs": {
-                      "description": "Seconds one search or scroll request may take end to end before it\nfails as retriable. Default `300`, so a half-open connection or a\nwedged node cannot hang a run forever.",
+                      "description": "Seconds one search or scroll request may take end to end before it\nfails the run (the source does not retry it). Default `300`, so a\nhalf-open connection or a wedged node cannot hang a run forever.",
                       "type": [
                         "integer",
                         "string"
@@ -21449,7 +21530,7 @@
                       "default": 1000
                     },
                     "params": {
-                      "description": "Positional bind parameters for the query, sent as\n[`POSITIONAL`](https://cloud.google.com/bigquery/docs/parameterized-queries)\nquery parameters in declaration order before any context-derived\nvalues. Each value is shipped as a STRING parameter; BigQuery casts\nas needed at execution time.",
+                      "description": "Positional bind parameters for the query, sent as\n[`POSITIONAL`](https://cloud.google.com/bigquery/docs/parameterized-queries)\nquery parameters in declaration order before any context-derived\nvalues. Each value is typed from its JSON form: an integer as\n`INT64`, any other number as `FLOAT64`, a boolean as `BOOL`, and\neverything else (strings, arrays, objects, null) as `STRING`.",
                       "type": "array",
                       "items": true,
                       "default": []
@@ -21963,6 +22044,11 @@
                     "table_name": {
                       "description": "Table name.",
                       "type": "string"
+                    },
+                    "value_format": {
+                      "$ref": "#/$defs/source_dynamodb__ValueFormat",
+                      "default": "plain",
+                      "description": "How attribute values appear in records: `plain` JSON (default; sets\nbecome arrays, binaries base64 strings, imprecise numbers decimal\nstrings) or `typed` DynamoDB attribute JSON (`{\"S\": \"a\"}`,\n`{\"SS\": [\"x\"]}`, `{\"B\": \"<base64>\"}`) that a `value_format: typed`\nDynamoDB sink writes back losslessly. Applies to scan/query items and\nto Streams `key` / `before` / `after` images."
                     }
                   },
                   "title": "DynamoDbSourceConfig",
@@ -23691,7 +23777,7 @@
                       ]
                     },
                     "job_timeout": {
-                      "description": "Longest the sink waits, in seconds, for one BigQuery job it started (a\nMERGE, the overwrite swap, a cleanup DELETE, DDL, a load job) before\ncancelling it and failing the write. Default `3600`; `0` waits for as\nlong as the job runs. A job that times out is cancelled so it cannot\ncommit after the run has been reported failed.",
+                      "description": "Longest the sink waits, in seconds, for one BigQuery job it started (a\nMERGE, the overwrite swap, a cleanup DELETE, DDL, a load job) before\nrequesting its cancellation and failing the write. Default `3600`; `0`\nwaits for as long as the job runs. After the cancel the sink waits up\nto 30 s for the job to stop; a job that finished successfully before\nthe cancel took effect is treated as completed, and the error says\nwhen a job could not be confirmed stopped (it may still commit).",
                       "type": [
                         "integer",
                         "string"
@@ -24093,7 +24179,7 @@
                       ]
                     },
                     "write_timeout_secs": {
-                      "description": "Longest a page write may wait on the server, in seconds, before it\nfails. Defaults to 3600; `0` waits forever.\n\nA peer that disappears without closing the connection (a failover, an\nidle-eviction by a NAT or load balancer) otherwise leaves the write\nwaiting forever, and a scheduled or served run stuck in \"running\".",
+                      "description": "Longest a page write may wait on the server, in seconds, before it\nfails. Defaults to 3600; `0` waits forever. The same bound applies to\nthe commit-token read, schema reads and evolution, and the overwrite\nstaging setup and abort; the bulk statements of a scoped cleanup, a\nrollback and the overwrite commit are not bounded, because they can\nlegitimately run longer.\n\nA peer that disappears without closing the connection (a failover, an\nidle-eviction by a NAT or load balancer) otherwise leaves the write\nwaiting forever, and a scheduled or served run stuck in \"running\".",
                       "type": [
                         "integer",
                         "string"
@@ -24564,7 +24650,7 @@
                       ]
                     },
                     "write_timeout_secs": {
-                      "description": "Longest a page write may wait on the server, in seconds, before it\nfails. Defaults to 3600; `0` waits forever.\n\nA peer that disappears without closing the connection (a failover, an\nidle-eviction by a NAT or load balancer) otherwise leaves the write\nwaiting forever, and a scheduled or served run stuck in \"running\".",
+                      "description": "Longest a page write may wait on the server, in seconds, before it\nfails. Defaults to 3600; `0` waits forever. The same bound applies to\nthe commit-token read, schema reads and evolution, and the overwrite\nstaging setup, `RENAME` swap and abort; the bulk statements of a\nscoped cleanup and a rollback are not bounded, because they can\nlegitimately run longer.\n\nA peer that disappears without closing the connection (a failover, an\nidle-eviction by a NAT or load balancer) otherwise leaves the write\nwaiting forever, and a scheduled or served run stuck in \"running\".",
                       "type": [
                         "integer",
                         "string"
@@ -25308,7 +25394,7 @@
                       "default": false
                     },
                     "publish_timeout_secs": {
-                      "description": "Seconds a publish batch (publishes plus the flush, or the JetStream\nacks) may take before the write fails as retriable, so a server outage\ncannot wedge the run. Default `30`.",
+                      "description": "Seconds a publish batch (publishes plus the flush, or the JetStream\nacks) may take, so a server outage cannot wedge the run. On a timeout\nthe rows not yet confirmed fail with a `timeout`-class row error: a\n`resilience.poison` policy resubmits them, otherwise they go to the\nDLQ; earlier batches keep their outcomes. A timed-out flush is retried\nby `resilience.retry`. Default `30`.",
                       "type": [
                         "integer",
                         "string"
@@ -25539,7 +25625,7 @@
                       "default": 1000
                     },
                     "publish_timeout_secs": {
-                      "description": "Seconds one publish group (its publishes and their confirms) may take\nbefore the write fails as retriable — a broker under a memory or disk\nalarm blocks publishers indefinitely. Default `60`.",
+                      "description": "Seconds one publish group (its publishes and their confirms) may take\n— a broker under a memory or disk alarm blocks publishers indefinitely.\nOn a timeout the rows not yet confirmed fail with a `timeout`-class row\nerror: a `resilience.poison` policy resubmits them, otherwise they go\nto the DLQ; earlier groups keep their outcomes. Default `60`.",
                       "type": [
                         "integer",
                         "string"
@@ -25828,7 +25914,7 @@
                     },
                     "connect_timeout_secs": {
                       "default": 30,
-                      "description": "Seconds the TCP connect, SSH handshake and authentication together may\ntake (default 30). A server that accepts and then stalls fails the run\ninstead of hanging it.",
+                      "description": "Seconds the TCP connect, SSH handshake, authentication and the SFTP\nsubsystem start together may take (default 30). A server that accepts and then stalls fails the run\ninstead of hanging it.",
                       "format": "uint64",
                       "minimum": 0,
                       "type": [
@@ -26170,7 +26256,7 @@
                       "default": 1000
                     },
                     "compression": {
-                      "description": "Compression codec applied to each uploaded object body. Defaults to\n[`CompressionConfig::Auto`](faucet_core::CompressionConfig::Auto) —\nresolves against `file_extension` (so `.jsonl.gz` triggers gzip).\nRequires the crate-local `compression` feature. Note: this sink does\n**not** set the S3 `Content-Encoding` header, so consumers must\ndecompress explicitly.",
+                      "description": "Compression codec applied to each uploaded object body. Defaults to\n[`CompressionConfig::Auto`](faucet_core::CompressionConfig::Auto) —\nresolves against the object name (`path`'s, else `file_extension`, so\n`.jsonl.gz` triggers gzip).\nRequires the crate-local `compression` feature. Note: this sink does\n**not** set the S3 `Content-Encoding` header, so consumers must\ndecompress explicitly.",
                       "$ref": "#/$defs/sink_s3__CompressionConfig",
                       "default": "auto"
                     },
@@ -27770,7 +27856,8 @@
               "anyOf": [
                 {
                   "x-faucet-aliases": [
-                    "mode"
+                    "mode",
+                    "max_rows_per_file"
                   ],
                   "title": "FileSinkConfig",
                   "description": "Configuration for the local file sink.\n\n**Experimental** (PRINCIPLES.md §3): this block's shape may change in a\nminor release; any change is called out in the changelog.",
@@ -27796,7 +27883,7 @@
                       "default": "append"
                     },
                     "max_records_per_file": {
-                      "description": "Roll to a new file after this many records.",
+                      "description": "Roll to a new file after this many records. `max_rows_per_file` is a\ndeprecated name for it.",
                       "type": [
                         "integer",
                         "null",
@@ -28173,7 +28260,7 @@
                       ]
                     },
                     "compression": {
-                      "description": "Compression codec applied to each uploaded object body. Defaults to\n[`CompressionConfig::Auto`](faucet_core::CompressionConfig::Auto) —\nresolves against `file_extension` (so `.jsonl.gz` triggers gzip).\nRequires the crate-local `compression` feature. Note: this sink does\n**not** set the GCS `Content-Encoding` metadata, so consumers must\ndecompress explicitly.",
+                      "description": "Compression codec applied to each uploaded object body. Defaults to\n[`CompressionConfig::Auto`](faucet_core::CompressionConfig::Auto) —\nresolves against the object name (`path`'s, else `file_extension`, so\n`.jsonl.gz` triggers gzip).\nRequires the crate-local `compression` feature. Note: this sink does\n**not** set the GCS `Content-Encoding` metadata, so consumers must\ndecompress explicitly.",
                       "$ref": "#/$defs/sink_gcs__CompressionConfig",
                       "default": "auto"
                     },
@@ -28456,7 +28543,7 @@
                       "default": 5
                     },
                     "tls_mode": {
-                      "description": "Explicit TLS mode; overrides `tls`. `verify_ca` / `verify_full` check\nthe server certificate against `ssl_root_cert` (or the system roots),\nthe latter also its host name.",
+                      "description": "Explicit TLS mode; overrides `tls`. `verify_ca` / `verify_full` check\nthe server certificate against `ssl_root_cert` (or, without one, the\nMozilla root store bundled into the binary — not the operating\nsystem's), the latter also its host name.",
                       "anyOf": [
                         {
                           "$ref": "#/$defs/sink_redshift__RedshiftTlsMode"
@@ -28997,7 +29084,7 @@
                       "default": 1000
                     },
                     "compression": {
-                      "description": "Compression codec applied to each uploaded object body. Defaults to\n[`CompressionConfig::Auto`](faucet_core::CompressionConfig::Auto) —\nresolves against `file_extension` (so `.jsonl.gz` triggers gzip).\nRequires the crate-local `compression` feature. Note: this sink does\n**not** set any `Content-Encoding` metadata, so consumers must\ndecompress explicitly.",
+                      "description": "Compression codec applied to each uploaded object body. Defaults to\n[`CompressionConfig::Auto`](faucet_core::CompressionConfig::Auto) —\nresolves against the object name (`path`'s, else `file_extension`, so\n`.jsonl.gz` triggers gzip).\nRequires the crate-local `compression` feature. Note: this sink does\n**not** set any `Content-Encoding` metadata, so consumers must\ndecompress explicitly.",
                       "$ref": "#/$defs/sink_azure-blob__CompressionConfig",
                       "default": "auto"
                     },
@@ -29468,6 +29555,11 @@
                     "table_name": {
                       "description": "Table name. The table must exist.",
                       "type": "string"
+                    },
+                    "value_format": {
+                      "$ref": "#/$defs/sink_dynamodb__ValueFormat",
+                      "default": "plain",
+                      "description": "How records carry attribute values: `plain` JSON (default; arrays\nbecome lists, base64 strings stay strings) or `typed` DynamoDB\nattribute JSON (`{\"S\": \"a\"}`, `{\"SS\": [\"x\"]}`, `{\"B\": \"<base64>\"}`),\nwritten exactly as given — pair it with a `value_format: typed`\nDynamoDB source to copy sets, binaries and exact numbers losslessly.\nIn `typed` mode every attribute, keys included, must be a typed value;\na `delete_marker` field may be `{\"S\": \"<value>\"}` or a plain string."
                     },
                     "write_mode": {
                       "$ref": "#/$defs/sink_dynamodb__WriteMode",
@@ -30288,6 +30380,21 @@
         }
       ]
     },
+    "source_dynamodb__ValueFormat": {
+      "description": "How records carry attribute values: `plain` JSON (the default) or\nDynamoDB's `typed` attribute JSON (`{\"pk\": {\"S\": \"a\"}, \"tags\": {\"SS\": [..]}}`).\n`typed` keeps sets, binaries and numbers of any precision exactly, so a\nDynamoDB-to-DynamoDB copy round-trips every attribute type.",
+      "oneOf": [
+        {
+          "const": "plain",
+          "description": "Plain JSON: sets become arrays, binaries base64 strings, numbers JSON\nnumbers unless that would lose precision (then decimal strings).",
+          "type": "string"
+        },
+        {
+          "const": "typed",
+          "description": "DynamoDB attribute JSON, one `{\"<type>\": value}` object per attribute.",
+          "type": "string"
+        }
+      ]
+    },
     "sink_databricks__AuthReference": {
       "additionalProperties": true,
       "description": "A `{ ref: <name> }` pointer to a named provider in the top-level `auth:`\ncatalog. The only permitted key is `ref`.",
@@ -30697,6 +30804,21 @@
         }
       },
       "type": "object"
+    },
+    "sink_dynamodb__ValueFormat": {
+      "description": "How records carry attribute values: `plain` JSON (the default) or\nDynamoDB's `typed` attribute JSON (`{\"pk\": {\"S\": \"a\"}, \"tags\": {\"SS\": [..]}}`).\n`typed` keeps sets, binaries and numbers of any precision exactly, so a\nDynamoDB-to-DynamoDB copy round-trips every attribute type.",
+      "oneOf": [
+        {
+          "const": "plain",
+          "description": "Plain JSON: sets become arrays, binaries base64 strings, numbers JSON\nnumbers unless that would lose precision (then decimal strings).",
+          "type": "string"
+        },
+        {
+          "const": "typed",
+          "description": "DynamoDB attribute JSON, one `{\"<type>\": value}` object per attribute.",
+          "type": "string"
+        }
+      ]
     },
     "sink_dynamodb__WriteMode": {
       "description": "Write semantics for a sink. Serialized snake_case. Default `Append`.",
@@ -31682,6 +31804,9 @@
       ]
     },
     "source_file__CsvOptions": {
+      "x-faucet-aliases": [
+        "write_headers"
+      ],
       "description": "CSV dialect.",
       "type": "object",
       "properties": {
@@ -31691,7 +31816,7 @@
           "default": ","
         },
         "has_headers": {
-          "description": "Whether the first row names the fields. When false, fields are named\n`column_0`, `column_1`, … — the same fallback the REST source and the\n`csv` connector already use. On write it decides whether a header row\nis written.",
+          "description": "Whether the first row names the fields. When false, fields are named\n`column_0`, `column_1`, … — the same fallback the REST source and the\n`csv` connector already use. On write it decides whether a header row\nis written. `write_headers` is a deprecated name for it.",
           "type": [
             "boolean",
             "string"
@@ -32244,6 +32369,9 @@
       ]
     },
     "sink_file__CsvOptions": {
+      "x-faucet-aliases": [
+        "write_headers"
+      ],
       "description": "CSV dialect.",
       "type": "object",
       "properties": {
@@ -32253,7 +32381,7 @@
           "default": ","
         },
         "has_headers": {
-          "description": "Whether the first row names the fields. When false, fields are named\n`column_0`, `column_1`, … — the same fallback the REST source and the\n`csv` connector already use. On write it decides whether a header row\nis written.",
+          "description": "Whether the first row names the fields. When false, fields are named\n`column_0`, `column_1`, … — the same fallback the REST source and the\n`csv` connector already use. On write it decides whether a header row\nis written. `write_headers` is a deprecated name for it.",
           "type": [
             "boolean",
             "string"
@@ -32411,7 +32539,7 @@
       "description": "Parquet column-chunk compression.",
       "oneOf": [
         {
-          "description": "Uncompressed pages.",
+          "description": "Uncompressed pages. `uncompressed` is a deprecated name for it.",
           "type": "string",
           "const": "none"
         },
@@ -33911,7 +34039,7 @@
       "description": "Parquet column-chunk compression.",
       "oneOf": [
         {
-          "description": "Uncompressed pages.",
+          "description": "Uncompressed pages. `uncompressed` is a deprecated name for it.",
           "type": "string",
           "const": "none"
         },
@@ -34157,7 +34285,7 @@
       "description": "Parquet column-chunk compression.",
       "oneOf": [
         {
-          "description": "Uncompressed pages.",
+          "description": "Uncompressed pages. `uncompressed` is a deprecated name for it.",
           "type": "string",
           "const": "none"
         },
@@ -34403,7 +34531,7 @@
       "description": "Parquet column-chunk compression.",
       "oneOf": [
         {
-          "description": "Uncompressed pages.",
+          "description": "Uncompressed pages. `uncompressed` is a deprecated name for it.",
           "type": "string",
           "const": "none"
         },
@@ -34667,7 +34795,7 @@
       "description": "Parquet column-chunk compression.",
       "oneOf": [
         {
-          "description": "Uncompressed pages.",
+          "description": "Uncompressed pages. `uncompressed` is a deprecated name for it.",
           "type": "string",
           "const": "none"
         },
@@ -35053,6 +35181,21 @@
           "description": "The raw bytes, base64-encoded into a JSON string.",
           "type": "string",
           "const": "bytes"
+        }
+      ]
+    },
+    "source_nats__NatsOnDecodeError": {
+      "description": "[`NatsSourceConfig::on_decode_error`].",
+      "oneOf": [
+        {
+          "description": "Fail the run.",
+          "type": "string",
+          "const": "fail"
+        },
+        {
+          "description": "Warn and drop the message (JetStream: terminate it).",
+          "type": "string",
+          "const": "skip"
         }
       ]
     },

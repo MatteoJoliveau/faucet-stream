@@ -56,9 +56,10 @@ impl RedisSink {
             .map_err(|e| FaucetError::Config(format!("invalid Redis URL: {e}")))?;
         let manager = redis::aio::ConnectionManagerConfig::new()
             .set_number_of_retries(3)
-            .set_factor(2)
-            .set_max_delay(1000)
-            .set_connection_timeout(std::time::Duration::from_secs(10));
+            .set_min_delay(std::time::Duration::from_millis(2))
+            .set_max_delay(std::time::Duration::from_secs(1))
+            .set_connection_timeout(Some(std::time::Duration::from_secs(10)))
+            .set_response_timeout(None);
         let conn = ConnectionManager::new_with_config(client, manager)
             .await
             .map_err(|e| FaucetError::Sink(format!("Redis connection failed: {e}")))?;
@@ -126,8 +127,8 @@ impl faucet_core::Sink for RedisSink {
         )
     }
 
-    /// Non-mutating preflight probe: issue a Redis `PING` over the existing
-    /// multiplexed connection (probe name `"ping"`).
+    /// Non-mutating preflight probe: issue a Redis `PING` over the shared
+    /// reconnecting connection (probe name `"ping"`).
     async fn check(
         &self,
         ctx: &faucet_core::check::CheckContext,
@@ -229,7 +230,8 @@ impl faucet_core::Sink for RedisSink {
         }
         script.invoke_async::<i64>(&mut conn).await.map_err(|e| {
             FaucetError::Sink(format!(
-                "Redis exactly-once write failed (nothing was written): {e}"
+                "Redis exactly-once write failed (the watermark was not advanced; commands \
+                 before the failure may have been applied and are re-sent on retry): {e}"
             ))
         })?;
 
