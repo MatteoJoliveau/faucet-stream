@@ -161,7 +161,11 @@ async fn backfill_submits_one_run_per_unit_and_replays_on_repost() {
         .await
         .unwrap();
     assert_eq!(
-        rec["name"], "orders-backfill-20260601T000000Z",
+        rec["name"].as_str().unwrap(),
+        format!(
+            "orders-backfill-{}-20260601T000000Z",
+            out["backfill"].as_str().unwrap()
+        ),
         "namespaced unit run name: {rec}"
     );
     assert_eq!(rec["labels"]["backfill"], out["backfill"]);
@@ -289,7 +293,11 @@ async fn a_stateful_backfill_refuses_a_rerun_unless_resumed_or_restarted() {
     assert_eq!(resumed["units"][0]["run_id"], first_run.as_str());
 
     let store = faucet_core::FileStateStore::new(&state_dir);
-    let unit_key = "orders-backfill-20260601T000000Z::row-0";
+    let unit_key = format!(
+        "orders-backfill-{}-20260601T000000Z::row-0",
+        resumed["backfill"].as_str().unwrap()
+    );
+    let unit_key = unit_key.as_str();
     store
         .put(unit_key, &json!({"day": "2026-06-30"}))
         .await
@@ -302,6 +310,31 @@ async fn a_stateful_backfill_refuses_a_rerun_unless_resumed_or_restarted() {
         "restart clears each unit's scoped state"
     );
     wait_completed(&client, &url, 4).await;
+
+    // #862 M-007: an overlapping, different range keeps its own unit state.
+    let mut overlap = body(json!({}));
+    overlap["from"] = json!("2026-06-02");
+    overlap["to"] = json!("2026-06-04");
+    let (status, other) = post(overlap).await;
+    assert_eq!(status, 202, "{other}");
+    assert_ne!(other["backfill"], first["backfill"]);
+    let shared_day = other["units"][0]["run_id"].as_str().unwrap();
+    let rec: Value = client
+        .get(format!("{url}/v1/runs/{shared_day}"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(
+        rec["name"].as_str().unwrap(),
+        format!(
+            "orders-backfill-{}-20260602T000000Z",
+            other["backfill"].as_str().unwrap()
+        )
+    );
+    wait_completed(&client, &url, 6).await;
 
     server.abort();
 }
@@ -341,6 +374,19 @@ pipeline:
         .await
         .unwrap();
     assert_eq!(resp.status(), 400, "{}", resp.text().await.unwrap());
+
+    // Several windows into one fixed file destination → 400 (#862 M-096).
+    let resp = client
+        .post(format!("{url}/v1/backfill"))
+        .json(
+            &json!({ "config": scoped, "from": "2026-06-01", "to": "2026-06-03", "window": "1d" }),
+        )
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 400);
+    let body = resp.text().await.unwrap();
+    assert!(body.contains("out.jsonl"), "{body}");
 
     server.abort();
 }

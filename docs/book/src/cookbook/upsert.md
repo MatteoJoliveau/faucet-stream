@@ -155,6 +155,14 @@ Validate it offline (no database connection required):
 faucet validate cli/examples/postgres_cdc_to_postgres_upsert.yaml
 ```
 
+**Large columns.** Under the default `REPLICA IDENTITY`, Postgres does not
+re-send a large out-of-line (TOAST) value an update left unchanged, so the
+`after` image is partial. Written as-is, an upsert would replace the document
+(MongoDB, Elasticsearch) or bind `NULL` for that column, so `cdc_unwrap` fills
+it from the `before` image and otherwise fails the run naming the table and
+columns. Give tables with large `text` / `jsonb` / `bytea` columns
+`ALTER TABLE … REPLICA IDENTITY FULL` before mirroring them.
+
 ## Composing with effectively-once delivery
 
 A keyed upsert **is** an effectively-once mechanism in its own right: any
@@ -293,7 +301,8 @@ Cleanup deletes data, so it only runs when the written set is trustworthy:
 | Sharded run | Skipped — a shard reads a fraction, so the difference is other shards' rows |
 | Written rows exceed the key ceiling | **Run fails**, deleting nothing |
 | A record was quarantined by a quality / contract / drift policy | Rejected at load time — a quarantined record never reaches the sink, so cleanup could not tell it from a deleted one |
-| The source resumes from a bookmark (`replication_method: incremental`, the file source's `incremental:`, a CDC / log source) and the row has `state:` | Rejected at load time — run 2 reads only what changed, so cleanup would delete every unchanged row in scope |
+| The source resumes from a bookmark (`replication_method: incremental`, the file source's `incremental:`, a CDC / log source, a Singer tap) and the row has `state:` | Rejected at load time — run 2 reads only what changed, so cleanup would delete every unchanged row in scope |
+| The source is a queue or subscription (`sqs`, `pubsub`, `rabbitmq`, `nats`) | Rejected at load time — every run reads only the messages that arrived since the last one |
 | The row is partitioned (`partition:`) | Rejected at load time — each chunk reads one slice and would delete the other chunks' rows |
 | A `parent:` / `for_each:` row whose `scope` carries no token of its own parent record or tuple | Rejected at load time — every invocation would delete the rows its siblings wrote |
 
@@ -366,7 +375,7 @@ types you add after the first run survive every refresh. With
 
 | Sink | Atomic swap |
 |---|---|
-| `postgres` | one transaction: `TRUNCATE` + `INSERT … SELECT` from a `LIKE` staging clone + `DROP`. Generated columns are recomputed, identity columns keep the staged values (`OVERRIDING SYSTEM VALUE`), and a target other tables reference by foreign key is emptied with `DELETE` under deferred constraints (a cascading reference is refused up front) |
+| `postgres` | one transaction: `TRUNCATE` + `INSERT … SELECT` from a `LIKE` staging clone + `DROP`. Generated columns are recomputed, identity columns keep the staged values (`OVERRIDING SYSTEM VALUE`), and a target other tables reference by foreign key is emptied with `DELETE` under deferred constraints (a cascading reference, or a non-`DEFERRABLE` / `RESTRICT` one whose table holds references, is refused up front) |
 | `sqlite` | one transaction: `DELETE` + `INSERT … SELECT` from a `SELECT … WHERE 0` clone + `DROP` |
 | `mysql` | `CREATE TABLE staging LIKE target`, then an atomic `RENAME TABLE` swap (MySQL auto-commits DDL, so a transaction can't span it). A target with foreign keys or triggers is instead refilled in place — `DELETE` + `INSERT … SELECT` in one transaction — so they survive (its triggers fire for those rows); a target **other** tables reference by foreign key is refused before the run |
 | `mssql` | one transaction: `DELETE` + `INSERT` (explicit non-IDENTITY column list) from a `SELECT … INTO … WHERE 1=0` clone + `DROP` |
@@ -390,7 +399,7 @@ creates the alias); a concrete index of that name is rejected at `begin`.
 - `schema.on_drift: evolve` — the staging target is a pre-run clone, so evolving the live target mid-run would leave the staged data a column short at swap time.
 - Scoped cleanup (`complete_for`) — cleanup requires `write_mode: upsert`; a full overwrite already removes source-deleted rows wholesale.
 - `shard:` — each shard would swap in only its own slice, replacing the rest of the table.
-- A source that resumes from a bookmark (`replication_method: incremental`, the file source's `incremental:`, Iceberg `mode: incremental`, DynamoDB `mode: streams`, a CDC / Kafka / Kinesis source) on a row with `state:` — every run after the first would replace the table with only the rows changed since the last one. A scoped overwrite (`scope:`) is not affected. Library callers of `Pipeline::run` should not attach a state store to an unscoped overwrite of such a source for the same reason.
+- A source that resumes from a bookmark (`replication_method: incremental`, the file source's `incremental:`, Iceberg `mode: incremental`, DynamoDB `mode: streams`, a CDC / Kafka / Kinesis source, a Singer tap) on a row with `state:` — every run after the first would replace the table with only the rows changed since the last one. A scoped overwrite (`scope:`) is not affected. Library callers of `Pipeline::run` should not attach a state store to an unscoped overwrite of such a source for the same reason.
 - A source that acknowledges messages as it reads them (`rabbitmq`, `pubsub`, `sqs`, `nats` with `jetstream_stream`) — each page is acked once it lands in staging, and a failed or cancelled run discards staging, so those messages would be gone.
 - A post-run `verify:` check (`after_run`, the default) — the swap happens after the run, so the check would read the replaced table. Set `after_run: false` and run `faucet verify` afterwards.
 

@@ -10,6 +10,19 @@ use crate::error::FaucetError;
 use regex::Regex;
 use std::collections::HashSet;
 
+/// Once per process: `phone` stopped matching bare digit runs in faucet-core
+/// 1.13, so a policy relying on it may now pass phone numbers through (#862 M-019).
+pub(crate) fn warn_phone_narrowed() {
+    static WARNED: std::sync::Once = std::sync::Once::new();
+    WARNED.call_once(|| {
+        tracing::warn!(
+            "masking/policy: `value_detector: phone` matches only E.164 (`+…`) and separated \
+             North-American numbers; bare digit runs and national formats such as \
+             `020 7946 0958` pass through. Use `phone_loose` for the broader matcher"
+        );
+    });
+}
+
 fn config_err(msg: impl Into<String>) -> FaucetError {
     FaucetError::Config(format!("masking: {}", msg.into()))
 }
@@ -21,15 +34,28 @@ pub struct CompiledMasking {
     pub(crate) hasher: Hasher,
     /// Some rule matches by field name, so the walk must build dot-paths.
     pub(crate) needs_paths: bool,
+    /// A value-detector rule can match a number, so every number the pass
+    /// leaves unmasked is written as a string too: a column keeps one type on
+    /// every page instead of flipping when a matching value appears.
+    pub(crate) stringify_numbers: bool,
 }
 
 impl CompiledMasking {
     /// Whether a name-based rule matches the top-level field `name`, so the
     /// pass may rewrite (and re-type) every value of it.
+    #[cfg_attr(not(feature = "arrow"), allow(dead_code))]
     pub(crate) fn rewrites_name(&self, name: &str) -> bool {
         self.rules.iter().any(|r| {
             r.fields.contains(name) || r.field_pattern.as_ref().is_some_and(|p| p.is_match(name))
         })
+    }
+
+    /// Whether a value-detector rule can match a number (a card number held
+    /// as an integer), so the pass turns every number into a string and a
+    /// columnar run's Arrow schema no longer describes the masked records.
+    #[cfg_attr(not(feature = "arrow"), allow(dead_code))]
+    pub(crate) fn retypes_by_value(&self) -> bool {
+        self.stringify_numbers
     }
 }
 
@@ -77,13 +103,23 @@ impl CompiledMasking {
                 rules.push(compiled);
             }
         }
+        if rules
+            .iter()
+            .any(|r| r.value_detector == Some(Detector::Phone))
+        {
+            warn_phone_narrowed();
+        }
         let needs_paths = rules
             .iter()
             .any(|r| r.field_pattern.is_some() || !r.fields.is_empty());
+        let stringify_numbers = rules
+            .iter()
+            .any(|r| r.value_detector.is_some_and(super::detect::matches_numbers));
         Ok(Self {
             rules,
             hasher: Hasher::from_key(spec.key.as_deref()),
             needs_paths,
+            stringify_numbers,
         })
     }
 
@@ -180,6 +216,39 @@ fn compile_rule(rule: &MaskRule, index: usize) -> Result<CompiledRule, FaucetErr
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn retypes_by_value_only_for_number_matching_detectors() {
+        let with = |det: &str| {
+            let s = spec(json!({"rules": [
+                {"match": {"fields": ["id"]}, "action": {"type": "hash"}},
+                {"match": {"value_detector": det}, "action": {"type": "hash"}}
+            ]}));
+            CompiledMasking::compile(&s).unwrap().retypes_by_value()
+        };
+        assert!(with("credit_card"));
+        assert!(with("phone_loose"));
+        for det in ["email", "ssn", "phone", "ipv4"] {
+            assert!(!with(det), "{det}");
+        }
+        let name_only = spec(json!({"rules": [
+            {"match": {"field_pattern": "card"}, "action": {"type": "hash"}}
+        ]}));
+        assert!(
+            !CompiledMasking::compile(&name_only)
+                .unwrap()
+                .retypes_by_value()
+        );
+    }
+
+    #[test]
+    fn a_phone_rule_compiles_and_warns_once() {
+        let s = spec(
+            json!({"rules": [{"match": {"value_detector": "phone"}, "action": {"type": "hash"}}]}),
+        );
+        assert_eq!(CompiledMasking::compile(&s).unwrap().rule_count(), 1);
+        assert_eq!(CompiledMasking::compile(&s).unwrap().rule_count(), 1);
+    }
 
     fn spec(v: serde_json::Value) -> MaskingSpec {
         serde_json::from_value(v).unwrap()

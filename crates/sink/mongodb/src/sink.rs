@@ -464,15 +464,30 @@ impl MongoSink {
             let rejected: Vec<(usize, String)> = match result {
                 Ok(_) => Vec::new(),
                 Err(e) => match e.kind.as_ref() {
+                    // A write-concern error means the server applied the inserts
+                    // but could not confirm the requested concern: the documents
+                    // landed, so only the write errors (if any) are failures —
+                    // an outer Err would tell the pipeline nothing committed and
+                    // a DLQ replay would insert them again (#862 M-060).
                     mongodb::error::ErrorKind::InsertMany(ime)
-                        if ime.write_concern_error.is_none() && ime.write_errors.is_some() =>
+                        if ime.write_concern_error.is_some() =>
                     {
+                        tracing::warn!(
+                            error = %e,
+                            "MongoDB applied the inserts but could not confirm the write concern"
+                        );
                         ime.write_errors
                             .iter()
                             .flatten()
                             .map(|we| (we.index, we.message.clone()))
                             .collect()
                     }
+                    mongodb::error::ErrorKind::InsertMany(ime) if ime.write_errors.is_some() => ime
+                        .write_errors
+                        .iter()
+                        .flatten()
+                        .map(|we| (we.index, we.message.clone()))
+                        .collect(),
                     _ if !inserted_any => {
                         return Err(FaucetError::Sink(format!(
                             "MongoDB insert_many failed: {e}"
@@ -524,7 +539,7 @@ impl MongoSink {
 
     /// Build the match-filter [`Document`] for an upsert row by pulling the
     /// configured `key` columns out of the row. The planner
-    /// ([`faucet_core::plan_writes`]) has already validated that every key
+    /// ([`faucet_core::plan_writes_exact`]) has already validated that every key
     /// column is present and non-null on each upsert row, so a missing column
     /// here is an internal invariant violation rather than user data error.
     fn filter_from_row(row: &Value, key: &[String]) -> Result<Document, FaucetError> {
@@ -1015,7 +1030,7 @@ impl faucet_core::Sink for MongoSink {
             self.config.write.write_mode,
             faucet_core::WriteMode::Upsert | faucet_core::WriteMode::Delete
         ) {
-            let plan = faucet_core::plan_writes(records, &self.config.write);
+            let plan = faucet_core::plan_writes_exact(records, &self.config.write);
             if let Some((idx, msg)) = plan.failed.first() {
                 return Err(FaucetError::Sink(format!(
                     "mongodb {}: row {idx}: {msg}",
@@ -1091,7 +1106,7 @@ impl faucet_core::Sink for MongoSink {
             return self.insert_partial(records).await;
         }
 
-        let plan = faucet_core::plan_writes(records, &self.config.write);
+        let plan = faucet_core::plan_writes_exact(records, &self.config.write);
         self.apply_plan(&plan).await?;
 
         let mut outcomes: Vec<faucet_core::RowOutcome> = records.iter().map(|_| Ok(())).collect();
@@ -1159,7 +1174,7 @@ impl faucet_core::Sink for MongoSink {
                     .collect::<Result<Vec<_>, _>>()?,
             )
         } else {
-            let plan = faucet_core::plan_writes(records, &self.config.write);
+            let plan = faucet_core::plan_writes_exact(records, &self.config.write);
             if let Some((idx, msg)) = plan.failed.first() {
                 return Err(FaucetError::Sink(format!(
                     "mongodb {}: row {idx}: {msg}",

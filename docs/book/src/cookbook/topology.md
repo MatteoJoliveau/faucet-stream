@@ -200,16 +200,42 @@ per sink node before it returns the error.
 commit watermark. On restart, each sink's committed position is read from its
 state — or from the position embedded in its own commit token, when the sink
 committed a page the state store never recorded. The source resumes from the
-position furthest behind, and every sink ahead of it skips the replayed pages it
-has already committed:
+position furthest behind, and every sink ahead of it skips the changes it has
+already committed, by **position**: the replay does not need to repeat the
+original page boundaries. A replayed page that straddles a sink's committed
+position keeps only the records past it, judged per record by the source (a
+record must still carry the source's position fields — `lsn` for postgres-cdc,
+mysql-cdc and mssql-cdc, `resume_token` for mongodb-cdc, `commit_scn`/`xid` for
+oracle-cdc, `topic`/`partition`/`offset` for kafka — when it reaches the sink).
+A transform node that can remove or change those fields (a `select` that omits
+them, a `drop`, `cdc_unwrap`, `sql`, `wasm`, a key rename) is refused at config
+load unless every sink writes with `write_mode: upsert` + `key`, whose replays
+overwrite the same rows; a replayed record that still arrives without them at
+an append sink fails the run rather than being written twice.
 
-- by **position**, when the source can order its positions (the CDC sources), so
-  the replay does not need to repeat the original page boundaries;
-- otherwise by its **commit sequence**, with every sink started at the
-  furthest-behind sink's sequence so the sequences keep counting the same pages.
+Every built-in exactly-once source orders its positions (the CDC sources, and
+`kafka` per partition). For a source that cannot, sinks that committed different
+positions make the run fail rather than skip replayed pages by count, which
+would lose records whenever the replay cuts its pages differently. The same
+refusal hits a sink node added to an existing graph over such a source, since
+it has no committed position yet. Every later run fails the same way until the
+state is reset; the error names each sink node's state key
+(`{pipeline}::{node}`). Recover in one of two ways:
 
-No sink is resumed past its own progress, and no sink re-writes a page it already
-has.
+- **replay from the start** — delete every sink node's state entry and its
+  commit-token watermark row (the `_faucet_commit_token` row, or the sink's
+  equivalent, under the same scope), then rerun. Each sink re-writes what it
+  already holds, so pair this with a keyed upsert sink or accept the
+  duplicates;
+- **resume from the furthest-behind sink** — reset only the sinks that are
+  ahead to that sink's position. The records between the two positions are
+  written again to those sinks.
+
+A third-party source that implements `Source::position_le` (and
+`record_covered`) resumes on its own instead.
+
+No sink is resumed past its own progress, and no sink re-writes a change it
+already has.
 
 Five requirements are checked at config-load time, so `faucet validate` catches
 a violation before anything runs:

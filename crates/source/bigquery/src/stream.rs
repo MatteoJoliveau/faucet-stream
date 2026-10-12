@@ -11,7 +11,8 @@
 use crate::config::BigQuerySourceConfig;
 use crate::convert::row_to_json;
 use async_trait::async_trait;
-use faucet_common_bigquery::build_client;
+use faucet_common_bigquery::TokenProvider;
+use faucet_common_bigquery::raw::QueryResultsReader;
 use faucet_core::util::substitute_context_bind_params;
 use faucet_core::{DatasetDescriptor, FaucetError, Stream, StreamPage};
 use gcp_bigquery_client::Client;
@@ -51,6 +52,11 @@ pub struct BigQuerySource {
     /// `query` (`jobs.query`), `poll` (`jobs.getQueryResults`), `job`
     /// (`jobs.get`). Cost signal: `bytes_processed` (bytes) per query.
     roundtrips: faucet_core::observability::RecorderSlot,
+    /// The client's token provider, when the source built the client.
+    tokens: Option<TokenProvider>,
+    /// `jobs.getQueryResults` reader with integer-microsecond timestamps,
+    /// built on first use.
+    results: tokio::sync::OnceCell<QueryResultsReader>,
 }
 
 impl BigQuerySource {
@@ -83,11 +89,14 @@ impl BigQuerySource {
     pub async fn new(config: BigQuerySourceConfig) -> Result<Self, FaucetError> {
         faucet_core::validate_batch_size(config.batch_size)?;
         Self::validate_read_api(&config)?;
-        let client = build_client(&config.auth).await?;
+        let (client, tokens) =
+            faucet_common_bigquery::build_client_with_tokens(&config.auth).await?;
         Ok(Self {
             config,
             client,
             roundtrips: faucet_core::observability::RecorderSlot::new(),
+            tokens: Some(tokens),
+            results: tokio::sync::OnceCell::new(),
         })
     }
 
@@ -212,13 +221,64 @@ impl BigQuerySource {
     /// [`bigquery-emulator`](https://github.com/goccy/bigquery-emulator) or
     /// drive a wiremock-backed test fixture. Production code should prefer
     /// [`BigQuerySource::new`], which handles credential loading.
+    ///
+    /// Query result pages (`jobs.getQueryResults`) do not go through `client`:
+    /// faucet reads them itself, against `config.api_host` with credentials
+    /// from `config.auth`. Point `api_host` at the same endpoint as the client
+    /// (an emulator or mock), and use
+    /// [`BigQuerySource::from_parts_with_tokens`] to reuse the client's token
+    /// provider — otherwise result pages go to the production API with
+    /// application-default credentials.
     #[doc(hidden)]
     pub fn from_parts(config: BigQuerySourceConfig, client: Client) -> Self {
         Self {
             config,
             client,
             roundtrips: faucet_core::observability::RecorderSlot::new(),
+            tokens: None,
+            results: tokio::sync::OnceCell::new(),
         }
+    }
+
+    /// [`BigQuerySource::from_parts`] with the token provider `client`
+    /// authenticates with, so result pages reuse its cached token. Without
+    /// one, a provider is built once from `config.auth`.
+    #[doc(hidden)]
+    pub fn from_parts_with_tokens(
+        config: BigQuerySourceConfig,
+        client: Client,
+        tokens: TokenProvider,
+    ) -> Self {
+        Self {
+            tokens: Some(tokens),
+            ..Self::from_parts(config, client)
+        }
+    }
+
+    /// One page (or poll) of a query job's results, with TIMESTAMP cells as
+    /// integer microseconds on every page (#862 M-052).
+    async fn get_query_results(
+        &self,
+        job_id: &str,
+        params: GetQueryResultsParameters,
+    ) -> Result<
+        gcp_bigquery_client::model::get_query_results_response::GetQueryResultsResponse,
+        FaucetError,
+    > {
+        let reader = self
+            .results
+            .get_or_try_init(|| async {
+                let tokens = match &self.tokens {
+                    Some(t) => t.clone(),
+                    None => faucet_common_bigquery::token_provider(&self.config.auth).await?,
+                };
+                QueryResultsReader::new(tokens, self.config.api_host.clone())
+            })
+            .await?;
+        reader
+            .get(&self.config.project_id, job_id, params)
+            .await
+            .map_err(|e| FaucetError::Source(format!("BigQuery jobs.getQueryResults failed: {e}")))
     }
 
     /// Resolve the final SQL statement and ordered bind values for a given
@@ -445,6 +505,17 @@ fn table_descriptor(
     descriptor
 }
 
+/// Ask `jobs.query` for TIMESTAMP cells as integer microseconds: the default
+/// float-seconds text is already a rounded double, which cannot hold
+/// microseconds past year 2106 and turns `9999-12-31 23:59:59.999999` into
+/// year 10000 (#862 M-052). Later pages ask for the same through
+/// [`QueryResultsReader`].
+fn int64_timestamps() -> gcp_bigquery_client::model::data_format_options::DataFormatOptions {
+    gcp_bigquery_client::model::data_format_options::DataFormatOptions {
+        use_int64_timestamp: Some(true),
+    }
+}
+
 /// Free-standing version of [`BigQuerySource::build_query_request`] — kept
 /// separate so unit tests can exercise it without spinning up a real
 /// `gcp_bigquery_client::Client`.
@@ -455,6 +526,7 @@ fn build_query_request(
 ) -> QueryRequest {
     let mut req = QueryRequest::new(query);
     req.use_legacy_sql = cfg.use_legacy_sql;
+    req.format_options = Some(int64_timestamps());
     req.timeout_ms = Some(clamp_timeout_ms(cfg.statement_timeout));
     req.max_results = Some(cfg.max_results_per_page);
     if let Some(location) = &cfg.location {
@@ -672,17 +744,7 @@ impl faucet_core::Source for BigQuerySource {
 
             self.roundtrips.record("poll");
 
-            let resp = faucet_common_bigquery::raw::tolerant_get_query_results(
-                &self.client,
-                self.raw_target(),
-                &self.config.project_id,
-                &job_id,
-                params,
-            )
-            .await
-            .map_err(|e| {
-                FaucetError::Source(format!("BigQuery jobs.getQueryResults failed: {e}"))
-            })?;
+            let resp = self.get_query_results(&job_id, params).await?;
 
             job_complete = resp.job_complete.unwrap_or(false);
             if !job_complete {
@@ -816,11 +878,7 @@ impl faucet_core::Source for BigQuerySource {
 
                 self.roundtrips.record("poll");
 
-                let resp = faucet_common_bigquery::raw::tolerant_get_query_results(&self.client, self.raw_target(), &self.config.project_id, &job_id, params)
-                    .await
-                    .map_err(|e| {
-                        FaucetError::Source(format!("BigQuery jobs.getQueryResults failed: {e}"))
-                    })?;
+                let resp = self.get_query_results(&job_id, params).await?;
 
                 job_complete = resp.job_complete.unwrap_or(false);
                 if !job_complete {

@@ -187,6 +187,10 @@ pub struct RunRecord {
     /// column; defaulted for records written before the field existed.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub selection: Option<crate::select::SelectionRequest>,
+    /// The run's config came from a file on the server (the triggers file),
+    /// so a claim or resume keeps its SQL connectors' host access (#862 H-04).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub host_access: bool,
 }
 
 impl RunRecord {
@@ -222,6 +226,7 @@ impl RunRecord {
             callback: None,
             tenant: None,
             selection: None,
+            host_access: false,
         }
     }
 }
@@ -808,6 +813,15 @@ pub trait RunHistory: Send + Sync {
         Ok(false)
     }
 
+    /// Hand a running shard this instance owns back to `pending`, owner and
+    /// lease cleared and its attempt count unchanged, so a peer resumes it
+    /// from its bookmark (a clustered shutdown). `false` = not released (not
+    /// owned here, not running, or a backend without shards — the default).
+    async fn release_shard(&self, run_id: &str, shard_id: &str) -> Result<bool, HistoryError> {
+        let _ = (run_id, shard_id);
+        Ok(false)
+    }
+
     /// Aggregate shard status counts for a run (drives parent-run finalization).
     /// Default: empty.
     async fn shard_progress(&self, run_id: &str) -> Result<ShardProgress, HistoryError> {
@@ -863,6 +877,16 @@ pub trait RunHistory: Send + Sync {
     /// unsupported.
     async fn trigger_edge_retract(&self, trigger: &str, ordinal: u64) -> Result<(), HistoryError> {
         let _ = (trigger, ordinal);
+        Err(HistoryError::Backend(
+            "this run-history backend does not support queue_depth trigger edges".into(),
+        ))
+    }
+
+    /// The ordinal of `trigger`'s latest crossing while its edge is disarmed
+    /// (`None` when armed or never seen), so a watcher can re-fire a crossing
+    /// whose fire was never confirmed. Default: unsupported.
+    async fn trigger_edge_current(&self, trigger: &str) -> Result<Option<u64>, HistoryError> {
+        let _ = trigger;
         Err(HistoryError::Backend(
             "this run-history backend does not support queue_depth trigger edges".into(),
         ))
@@ -992,6 +1016,34 @@ pub trait RunHistory: Send + Sync {
     async fn log_ship_forget(&self, run_id: &str) -> Result<(), HistoryError> {
         let _ = run_id;
         Ok(())
+    }
+
+    /// Record that this instance has persisted every line it captured for
+    /// `run_id` with a key up to `through` (#862 M-099). `record_run_logs`
+    /// advances it with each batch; the log writer also advances it while the
+    /// run is quiet, so a run another instance logs to keeps shipping.
+    async fn log_ship_writer_mark(&self, run_id: &str, through: u64) -> Result<(), HistoryError> {
+        let _ = (run_id, through);
+        Ok(())
+    }
+
+    /// This instance has nothing more to persist for `run_id`.
+    async fn log_ship_writer_done(&self, run_id: &str) -> Result<(), HistoryError> {
+        let _ = run_id;
+        Ok(())
+    }
+
+    /// The lowest persisted watermark among the instances still writing
+    /// `run_id` (marked within `stale_after`). Delivery is acknowledged only up
+    /// to it, so a line another instance persists late is never below the
+    /// delivered watermark. `None`: no instance is writing.
+    async fn log_ship_writer_floor(
+        &self,
+        run_id: &str,
+        stale_after: Duration,
+    ) -> Result<Option<u64>, HistoryError> {
+        let _ = (run_id, stale_after);
+        Ok(None)
     }
 
     /// Count and size of a run's persisted lines with `after < seq <= through`.
@@ -1812,7 +1864,16 @@ async fn connect_postgres(
     {
         return Err(crate::error::CliError::Serve(e.to_string()));
     }
-    Ok(into_history(result, idem, "postgres"))
+    let (url, instance_id) = (url.to_string(), instance_id.to_string());
+    let connector: fallback::PrimaryConnector = Box::new(move || {
+        let (url, instance_id) = (url.clone(), instance_id.clone());
+        Box::pin(async move {
+            postgres::PostgresHistory::connect(&url, idem, lease_ttl, instance_id)
+                .await
+                .map(|h| Box::new(h) as Box<dyn RunHistory>)
+        })
+    });
+    Ok(into_history(result, idem, "postgres", connector))
 }
 
 #[cfg(not(feature = "serve-history-postgres"))]
@@ -1845,7 +1906,16 @@ async fn connect_sqlite(
     {
         return Err(crate::error::CliError::Serve(e.to_string()));
     }
-    Ok(into_history(result, idem, "sqlite"))
+    let (url, instance_id) = (url.to_string(), instance_id.to_string());
+    let connector: fallback::PrimaryConnector = Box::new(move || {
+        let (url, instance_id) = (url.clone(), instance_id.clone());
+        Box::pin(async move {
+            sqlite::SqliteHistory::connect(&url, idem, lease_ttl, instance_id)
+                .await
+                .map(|h| Box::new(h) as Box<dyn RunHistory>)
+        })
+    });
+    Ok(into_history(result, idem, "sqlite", connector))
 }
 
 #[cfg(not(feature = "serve-history-sqlite"))]
@@ -1917,6 +1987,7 @@ fn into_history<H: RunHistory + 'static>(
     result: Result<H, HistoryError>,
     idem: Duration,
     label: &'static str,
+    connector: fallback::PrimaryConnector,
 ) -> Arc<dyn RunHistory> {
     match result {
         Ok(backend) => Arc::new(fallback::FallbackHistory::healthy(
@@ -1927,9 +1998,13 @@ fn into_history<H: RunHistory + 'static>(
         Err(e) => {
             tracing::error!(
                 backend = label, error = %e,
-                "run-history backend unavailable at startup; starting DEGRADED on in-memory store"
+                "run-history backend unavailable at startup; starting DEGRADED on in-memory \
+                 store and reconnecting (templates, tenants, change requests and idempotency \
+                 answer 503 until it is reached)"
             );
-            Arc::new(fallback::FallbackHistory::degraded_at_startup(idem, label))
+            Arc::new(fallback::FallbackHistory::connecting(
+                connector, idem, label,
+            ))
         }
     }
 }
@@ -2012,6 +2087,7 @@ mod tests {
             h.trigger_edge_rise("q").await.unwrap_err(),
             h.trigger_edge_rearm("q").await.unwrap_err(),
             h.trigger_edge_retract("q", 1).await.unwrap_err(),
+            h.trigger_edge_current("q").await.unwrap_err(),
         ] {
             assert!(err.to_string().contains("queue_depth"), "{err}");
         }

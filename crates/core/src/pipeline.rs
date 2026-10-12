@@ -317,6 +317,20 @@ impl<'a, So: Source + ?Sized, Si: Sink + ?Sized> Pipeline<'a, So, Si> {
         self
     }
 
+    /// A masking rule that re-types values page by page would change a
+    /// column's Arrow type mid-run, so such a run takes the row path.
+    #[cfg(feature = "arrow")]
+    fn masking_retypes_by_value(&self) -> bool {
+        #[cfg(feature = "masking")]
+        {
+            self.masking.as_ref().is_some_and(|m| m.retypes_by_value())
+        }
+        #[cfg(not(feature = "masking"))]
+        {
+            false
+        }
+    }
+
     /// Attach an adaptive batch-size controller (opt-in). When `enabled`, the
     /// pipeline reslices each source page into sub-batches whose size the
     /// controller tunes from observed sink latency + error rate.
@@ -728,7 +742,8 @@ impl<'a, So: Source + ?Sized, Si: Sink + ?Sized> Pipeline<'a, So, Si> {
                     // Overwrite (#492) needs the begin/commit staging lifecycle
                     // wired below; the columnar path would append straight to
                     // the destination and skip the atomic swap.
-                    && !wrapped_sink.is_overwrite();
+                    && !wrapped_sink.is_overwrite()
+                    && !self.masking_retypes_by_value();
                 // Governance no longer disqualifies the fast path (#636) — it
                 // runs *inside* the columnar loop via the same
                 // `apply_governance` the `Value` loop uses, including
@@ -1049,8 +1064,8 @@ where
     let mut last_bookmark: Option<Value> = None;
     let mut gov_state = GovernanceState::default();
     let mut dlq_stats = crate::dlq::DlqStats::default();
-    // Top-level columns masking turned into strings; sticky for the run so
-    // every page reaches the sink with the same schema.
+    // Top-level columns a name-based masking rule turns into strings; sticky
+    // for the run. Rules that re-type by value never reach this loop.
     #[cfg_attr(not(feature = "masking"), allow(unused_mut))]
     let mut widened: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
 
@@ -2680,7 +2695,11 @@ pub(crate) async fn apply_governance<Si: Sink + ?Sized>(
     let mut drift_envelopes: Vec<Value> = Vec::new();
     let (records, drift_abort): (Vec<Value>, Option<FaucetError>) =
         if let Some(policy) = specs.schema_drift.filter(|_| !records.is_empty()) {
-            if state.dest_schema_cache.is_none() {
+            // Re-ask while the sink reports none: a target the sink creates on
+            // the first page has a schema from the second page on, and a
+            // cached `None` would leave drift inert for the rest of a first
+            // run (#862 M-054).
+            if !matches!(state.dest_schema_cache, Some(Some(_))) {
                 state.dest_schema_cache = Some(sink.current_schema().await?);
             }
             let dest = state.dest_schema_cache.as_ref().and_then(|o| o.as_ref());
@@ -2689,8 +2708,8 @@ pub(crate) async fn apply_governance<Si: Sink + ?Sized>(
                     if !state.warned_drift_inert {
                         tracing::info!(
                             connector = sink_name,
-                            "schema-drift: sink reports no destination schema; \
-                             drift handling is inert this run"
+                            "schema-drift: sink reports no destination schema yet; \
+                             drift handling is inert until it does"
                         );
                         state.warned_drift_inert = true;
                     }
@@ -7105,6 +7124,66 @@ mod tests {
         let evos = sink.evolutions.lock().unwrap();
         assert_eq!(evos.len(), 1);
         assert_eq!(evos[0].relax_nullability, vec!["legacy".to_string()]);
+    }
+
+    /// A sink that has no schema until its first write creates the target.
+    struct CreatingSink {
+        created: std::sync::atomic::AtomicBool,
+        evolutions: std::sync::Mutex<Vec<crate::drift::SchemaEvolution>>,
+    }
+    #[async_trait]
+    impl Sink for CreatingSink {
+        async fn write_batch(&self, records: &[Value]) -> Result<usize, FaucetError> {
+            self.created
+                .store(true, std::sync::atomic::Ordering::SeqCst);
+            Ok(records.len())
+        }
+        async fn current_schema(&self) -> Result<Option<Value>, FaucetError> {
+            Ok(self
+                .created
+                .load(std::sync::atomic::Ordering::SeqCst)
+                .then(|| json!({"type":"object","properties":{"id":{"type":"integer"}}})))
+        }
+        fn supports_schema_evolution(&self) -> bool {
+            true
+        }
+        async fn evolve_schema(
+            &self,
+            evo: &crate::drift::SchemaEvolution,
+        ) -> Result<(), FaucetError> {
+            self.evolutions.lock().unwrap().push(evo.clone());
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn drift_baseline_is_fetched_once_the_sink_created_the_target() {
+        // #862 M-054: page 1 creates the table; page 2's new field evolves it.
+        let sink = CreatingSink {
+            created: std::sync::atomic::AtomicBool::new(false),
+            evolutions: std::sync::Mutex::new(Vec::new()),
+        };
+        let policy = crate::drift::SchemaDriftPolicy {
+            on_drift: crate::drift::OnDrift::Evolve,
+            allow_widening: true,
+            on_incompatible: crate::drift::OnIncompatible::Fail,
+            relax_nullability_on_missing: false,
+        };
+        let pages = Box::pin(futures::stream::iter(vec![
+            Ok(StreamPage {
+                records: vec![json!({"id": 1})],
+                bookmark: None,
+            }),
+            Ok(StreamPage {
+                records: vec![json!({"id": 2, "email": "a@x.com"})],
+                bookmark: None,
+            }),
+        ]));
+        let res = run_stream(pages, &sink, drift_opts(policy)).await.unwrap();
+        assert_eq!(res.records_written, 2);
+        let evos = sink.evolutions.lock().unwrap();
+        assert_eq!(evos.len(), 1);
+        assert_eq!(evos[0].additions[0].name, "email");
     }
 
     #[tokio::test]

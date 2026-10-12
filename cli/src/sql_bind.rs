@@ -53,6 +53,9 @@ pub struct BindParam {
     pub key: String,
     pub id: String,
     pub path: String,
+    /// The token was a whole quoted literal (`'${p.code}'`), so it binds as
+    /// text whatever the value's JSON type, as the literal did.
+    pub quoted: bool,
 }
 
 /// A query with its fan-out tokens replaced by `{faucet_bind_N}` placeholders.
@@ -89,7 +92,7 @@ pub fn plan(query: &str, is_fanout: impl Fn(&str) -> bool) -> Result<BindPlan, S
                 };
                 if is_fanout(id) {
                     out.push_str(&query[copied..i]);
-                    push_param(&mut out, &mut params, id, path);
+                    push_param(&mut out, &mut params, id, path, false);
                     copied = end;
                 }
                 i = end;
@@ -104,7 +107,7 @@ pub fn plan(query: &str, is_fanout: impl Fn(&str) -> bool) -> Result<BindPlan, S
                     && is_fanout(id)
                 {
                     out.push_str(&query[copied..i]);
-                    push_param(&mut out, &mut params, id, path);
+                    push_param(&mut out, &mut params, id, path, true);
                     copied = end;
                 } else if let Some(token) = first_fanout_token(body, &is_fanout) {
                     return Err(format!(
@@ -142,7 +145,7 @@ pub fn plan(query: &str, is_fanout: impl Fn(&str) -> bool) -> Result<BindPlan, S
     Ok(BindPlan { query: out, params })
 }
 
-fn push_param(out: &mut String, params: &mut Vec<BindParam>, id: &str, path: &str) {
+fn push_param(out: &mut String, params: &mut Vec<BindParam>, id: &str, path: &str, quoted: bool) {
     let key = format!("{BIND_KEY_PREFIX}{}", params.len());
     out.push('{');
     out.push_str(&key);
@@ -151,6 +154,7 @@ fn push_param(out: &mut String, params: &mut Vec<BindParam>, id: &str, path: &st
         key,
         id: id.to_string(),
         path: path.to_string(),
+        quoted,
     });
 }
 
@@ -238,9 +242,61 @@ pub fn bind_values(
                 reference(p)
             )));
         }
-        out.insert(p.key.clone(), value);
+        out.insert(p.key.clone(), bind_type(value, p.quoted));
     }
     Ok(out)
+}
+
+/// The type a value binds as, matching what splicing its text used to mean
+/// (#862 M-028): a quoted literal is text, and a bare token holding an
+/// integer or a decimal as a string (`"42"`, `"12.50"`) is the number the
+/// spliced `42` / `12.50` was. A decimal binds only when a double holds it
+/// exactly enough (at most [`MAX_DECIMAL_DIGITS`] significant digits);
+/// beyond that it stays text, so a comparison fails loudly instead of
+/// matching a rounded value. Other values keep their JSON type.
+fn bind_type(value: Value, quoted: bool) -> Value {
+    match value {
+        Value::Number(n) if quoted => Value::String(n.to_string()),
+        Value::Bool(b) if quoted => Value::String(b.to_string()),
+        Value::String(s) if !quoted && is_plain_integer(&s) => match s.parse::<i64>() {
+            Ok(i) => Value::from(i),
+            Err(_) => Value::String(s),
+        },
+        Value::String(s) if !quoted && is_plain_decimal(&s) => {
+            match s.parse::<f64>().ok().and_then(serde_json::Number::from_f64) {
+                Some(n) => Value::Number(n),
+                None => Value::String(s),
+            }
+        }
+        other => other,
+    }
+}
+
+/// Significant digits a decimal string may carry and still bind as a number:
+/// every decimal of up to 15 significant digits survives a round trip
+/// through an IEEE 754 double.
+const MAX_DECIMAL_DIGITS: usize = 15;
+
+/// `-?(0|[1-9][0-9]*)\.[0-9]+` with at most [`MAX_DECIMAL_DIGITS`]
+/// significant digits.
+fn is_plain_decimal(s: &str) -> bool {
+    let Some((int, frac)) = s.strip_prefix('-').unwrap_or(s).split_once('.') else {
+        return false;
+    };
+    let digits = |p: &str| !p.is_empty() && p.bytes().all(|b| b.is_ascii_digit());
+    if !digits(int) || !digits(frac) || (int.len() > 1 && int.starts_with('0')) {
+        return false;
+    }
+    let all = format!("{int}{frac}");
+    all.trim_start_matches('0').trim_end_matches('0').len() <= MAX_DECIMAL_DIGITS
+}
+
+/// `-?[0-9]+` without a leading zero (a zero-padded code stays text).
+fn is_plain_integer(s: &str) -> bool {
+    let digits = s.strip_prefix('-').unwrap_or(s);
+    !digits.is_empty()
+        && digits.bytes().all(|b| b.is_ascii_digit())
+        && (digits == "0" || !digits.starts_with('0'))
 }
 
 fn reference(p: &BindParam) -> String {
@@ -364,7 +420,8 @@ mod tests {
             vec![BindParam {
                 key: "faucet_bind_0".into(),
                 id: "p".into(),
-                path: "id".into()
+                path: "id".into(),
+                quoted: false,
             }]
         );
     }
@@ -450,6 +507,63 @@ mod tests {
             bind_values(&p, &empty),
             Err(CliError::UnknownInterpolationId { .. })
         ));
+    }
+
+    #[test]
+    fn values_bind_with_the_type_their_spliced_text_had() {
+        let ctx = HashMap::from([(
+            "p".to_string(),
+            json!({"id": "42", "code": 7, "flag": true, "zip": "007", "name": "a", "big": "99999999999999999999", "neg": "-3", "zero": "0"}),
+        )]);
+        let p = plan(
+            "WHERE id = ${p.id} AND c = '${p.code}' AND f = '${p.flag}' AND z = ${p.zip} \
+             AND n = ${p.name} AND b = ${p.big} AND m = ${p.neg} AND o = ${p.zero} AND q = '${p.id}'",
+            fanout,
+        )
+        .unwrap();
+        let v = bind_values(&p, &ctx).unwrap();
+        let at = |i: usize| v[&format!("faucet_bind_{i}")].clone();
+        assert_eq!(at(0), json!(42));
+        assert_eq!(at(1), json!("7"));
+        assert_eq!(at(2), json!("true"));
+        assert_eq!(at(3), json!("007"));
+        assert_eq!(at(4), json!("a"));
+        assert_eq!(at(5), json!("99999999999999999999"));
+        assert_eq!(at(6), json!(-3));
+        assert_eq!(at(7), json!(0));
+        assert_eq!(at(8), json!("42"));
+        assert!(!is_plain_integer("-"));
+    }
+
+    /// Review of #868 (cli F10): a bare decimal string binds as the number
+    /// its spliced text was; one a double would round, a zero-padded one, an
+    /// exponent and a quoted one stay text.
+    #[test]
+    fn decimal_strings_bind_as_numbers_when_a_double_holds_them() {
+        let ctx = HashMap::from([(
+            "p".to_string(),
+            json!({"amount": "12.50", "neg": "-0.25", "wide": "1234567890.12345678", "pad": "01.5", "exp": "1e3", "dot": "5.", "lead": ".5"}),
+        )]);
+        let p = plan(
+            "WHERE a = ${p.amount} AND b = ${p.neg} AND c = ${p.wide} AND d = ${p.pad} \
+             AND e = ${p.exp} AND f = ${p.dot} AND g = ${p.lead} AND h = '${p.amount}'",
+            fanout,
+        )
+        .unwrap();
+        let v = bind_values(&p, &ctx).unwrap();
+        let at = |i: usize| v[&format!("faucet_bind_{i}")].clone();
+        assert_eq!(at(0), json!(12.5));
+        assert_eq!(at(1), json!(-0.25));
+        assert_eq!(at(2), json!("1234567890.12345678"));
+        assert_eq!(at(3), json!("01.5"));
+        assert_eq!(at(4), json!("1e3"));
+        assert_eq!(at(5), json!("5."));
+        assert_eq!(at(6), json!(".5"));
+        assert_eq!(at(7), json!("12.50"));
+        assert!(is_plain_decimal("0.000000000000001"));
+        assert!(is_plain_decimal("123456789012345.0"));
+        assert!(!is_plain_decimal("1234567890123456.0"));
+        assert!(!is_plain_decimal("-"));
     }
 
     #[test]

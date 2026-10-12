@@ -163,6 +163,22 @@ async fn a_failed_background_upload_of_earlier_records_poisons_the_writer() {
     assert!(e.contains("lost"), "{e}");
 }
 
+/// #862 M-095: an earlier file's failed upload reaped by a later roll in the
+/// same call still poisons the writer.
+#[tokio::test]
+async fn an_earlier_upload_failure_reaped_by_a_later_roll_poisons_the_writer() {
+    let mem = Arc::new(Mem::default());
+    let mut s = jsonl();
+    s.max_records_per_file = Some(3);
+    let w = remote(&mem, Some("o/"), s, 4);
+    w.write_rows(&rows(1)).await.unwrap();
+    *mem.fail_key.lock().unwrap() = Some("pre/o/part-00001.jsonl".into());
+    assert!(w.write_rows(&rows(7)).await.is_err());
+    *mem.fail_key.lock().unwrap() = None;
+    let e = w.write_rows(&rows(1)).await.unwrap_err().to_string();
+    assert!(e.contains("lost"), "{e}");
+}
+
 /// #783 H1: without `path` every name is unique to the run, so the end of
 /// the run lists nothing.
 #[tokio::test]
@@ -585,6 +601,54 @@ async fn a_widened_parquet_schema_carries_the_open_file_and_leaves_no_scratch() 
             .flatten()
             .all(|e| !crate::write::is_scratch_name(&e.file_name().to_string_lossy()))
     );
+}
+
+#[cfg(feature = "file-format-parquet")]
+#[tokio::test]
+async fn a_float_widening_that_would_round_integers_is_refused() {
+    let big = 9_007_199_254_740_993_i64;
+    let dir = tempfile::tempdir().unwrap();
+    let w = local(
+        dir.path(),
+        "big.parquet",
+        WriteSettings::new(FileFormat::Parquet, Compression::None),
+    );
+    w.write_rows(&[json!({"id": big})]).await.unwrap();
+    let e = w
+        .write_rows(&[json!({"id": 1.5})])
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(e.contains("'id'") && e.contains("2^53"), "{e}");
+    w.write_rows(&[json!({"id": 2})]).await.unwrap();
+    w.flush().await.unwrap();
+    let bytes = std::fs::read(dir.path().join("big.parquet")).unwrap();
+    assert_eq!(parquet_shape(bytes), (2, 1));
+
+    let w = local(
+        dir.path(),
+        "late.parquet",
+        WriteSettings::new(FileFormat::Parquet, Compression::None),
+    );
+    w.write_rows(&[json!({"id": 1.5})]).await.unwrap();
+    let e = w
+        .write_rows(&[json!({"id": big})])
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(
+        e.contains("2^53"),
+        "an incoming big integer is not rounded either: {e}"
+    );
+
+    let w = local(
+        dir.path(),
+        "small.parquet",
+        WriteSettings::new(FileFormat::Parquet, Compression::None),
+    );
+    w.write_rows(&[json!({"id": 7})]).await.unwrap();
+    w.write_rows(&[json!({"id": 1.5})]).await.unwrap();
+    w.flush().await.unwrap();
 }
 
 #[cfg(feature = "file-format-parquet")]
@@ -1101,6 +1165,26 @@ mod in_place {
         )
         .unwrap();
         assert_eq!(text.lines().count(), 6);
+    }
+
+    /// #862 M-088: a compressed file is renamed into place on every flush,
+    /// never appended to, so a crash cannot leave a torn member in it.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_compressed_file_is_replaced_not_appended_to() {
+        let dir = tempfile::tempdir().unwrap();
+        let w = local(
+            dir.path(),
+            "o.jsonl.zst",
+            WriteSettings::new(FileFormat::JsonLines, Compression::Zstd),
+        );
+        let out = dir.path().join("o.jsonl.zst");
+        w.write_rows(&rows(1)).await.unwrap();
+        w.flush().await.unwrap();
+        let first = inode(&out);
+        w.write_rows(&rows(1)).await.unwrap();
+        w.flush().await.unwrap();
+        assert_ne!(inode(&out), first, "renamed into place, not extended");
     }
 
     #[tokio::test]

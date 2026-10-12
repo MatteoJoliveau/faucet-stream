@@ -24,6 +24,38 @@ use std::sync::Arc;
 pub(crate) struct ParquetState {
     schema: Option<SchemaRef>,
     writer: Option<ArrowWriter<File>>,
+    /// Integer columns written so far that hold a value `Float64` cannot
+    /// represent exactly, so widening them would round rows already written.
+    inexact_ints: std::collections::HashSet<String>,
+}
+
+/// The largest integer magnitude a `Float64` holds exactly.
+const F64_EXACT: u64 = 1 << 53;
+
+fn inexact_as_f64(array: &dyn arrow::array::Array) -> bool {
+    use arrow::array::AsArray;
+    use arrow::datatypes::{Int64Type, UInt64Type};
+    match array.data_type() {
+        DataType::Int64 => array
+            .as_primitive::<Int64Type>()
+            .iter()
+            .flatten()
+            .any(|v| v.unsigned_abs() > F64_EXACT),
+        DataType::UInt64 => array
+            .as_primitive::<UInt64Type>()
+            .iter()
+            .flatten()
+            .any(|v| v > F64_EXACT),
+        _ => false,
+    }
+}
+
+fn rounding_err(column: &str) -> FaucetError {
+    FaucetError::Sink(format!(
+        "parquet: column '{column}' holds whole numbers beyond 2^53 and a fraction on another \
+         page; widening it to a float would round those integers — cast it to one type (a \
+         `cast` transform to string or number) or roll to a new file"
+    ))
 }
 
 impl ParquetState {
@@ -31,6 +63,7 @@ impl ParquetState {
         Self {
             schema: None,
             writer: None,
+            inexact_ints: std::collections::HashSet::new(),
         }
     }
 
@@ -61,6 +94,24 @@ impl ParquetState {
             Some(current) => merge(current, &inferred)?,
             None => nullable(&inferred),
         };
+        for field in inferred.fields() {
+            let to_float = schema
+                .field_with_name(field.name())
+                .is_ok_and(|f| f.data_type() == &DataType::Float64);
+            if to_float && field.data_type().is_integer() {
+                let inexact = records.iter().any(|r| {
+                    r.get(field.name()).is_some_and(|v| {
+                        v.as_i64().map_or_else(
+                            || v.as_u64().is_some_and(|u| u > F64_EXACT),
+                            |i| i.unsigned_abs() > F64_EXACT,
+                        )
+                    })
+                });
+                if inexact {
+                    return Err(rounding_err(field.name()));
+                }
+            }
+        }
         faucet_core::columnar::values_to_record_batch(records, schema)
     }
 
@@ -91,6 +142,16 @@ impl ParquetState {
             (None, Some(current)) => merge(current, batch.schema_ref()).map_err(Failure::Clean)?,
             (None, None) => nullable(batch.schema_ref()),
         };
+        if let Some(current) = &self.schema {
+            for f in target.fields() {
+                let was_int = current
+                    .field_with_name(f.name())
+                    .is_ok_and(|c| c.data_type().is_integer());
+                if was_int && f.data_type().is_floating() && self.inexact_ints.contains(f.name()) {
+                    return Err(Failure::Clean(rounding_err(f.name())));
+                }
+            }
+        }
         let batch = project(batch, &target).map_err(Failure::Clean)?;
         let widened = self
             .schema
@@ -104,7 +165,13 @@ impl ParquetState {
             .as_mut()
             .expect("writer opened above")
             .write(&batch)
-            .map_err(|e| Failure::Dirty(pq_err(tmp, e)))
+            .map_err(|e| Failure::Dirty(pq_err(tmp, e)))?;
+        for (f, column) in batch.schema().fields().iter().zip(batch.columns()) {
+            if inexact_as_f64(column.as_ref()) {
+                self.inexact_ints.insert(f.name().clone());
+            }
+        }
+        Ok(())
     }
 
     /// Open a writer for `target` at `tmp`, carrying over the rows of the
@@ -222,6 +289,9 @@ fn project(batch: &RecordBatch, schema: &SchemaRef) -> Result<RecordBatch, Fauce
         .iter()
         .map(|f| match batch.column_by_name(f.name()) {
             Some(c) if c.data_type() == f.data_type() => Ok(c.clone()),
+            Some(c) if f.data_type().is_floating() && inexact_as_f64(c.as_ref()) => {
+                Err(rounding_err(f.name()))
+            }
             Some(c) => arrow::compute::cast_with_options(
                 c,
                 f.data_type(),
@@ -244,11 +314,53 @@ fn project(batch: &RecordBatch, schema: &SchemaRef) -> Result<RecordBatch, Fauce
         .map_err(|e| FaucetError::Sink(format!("parquet: building a batch: {e}")))
 }
 
-/// `current` widened by `incoming`'s fields.
+/// The type both of two numeric types widen to without refusing a value:
+/// any integer with a float, or two floats, is `Float64`; two signed
+/// integers the wider one. `Int64` with `UInt64` has no common type.
+fn widened_number(a: &DataType, b: &DataType) -> Option<DataType> {
+    use DataType::*;
+    let signed = |t: &DataType| matches!(t, Int8 | Int16 | Int32 | Int64);
+    let unsigned = |t: &DataType| matches!(t, UInt8 | UInt16 | UInt32 | UInt64);
+    let float = |t: &DataType| matches!(t, Float16 | Float32 | Float64);
+    let int = |t: &DataType| signed(t) || unsigned(t);
+    match (a, b) {
+        _ if a == b => None,
+        (x, y) if (float(x) && (float(y) || int(y))) || (int(x) && float(y)) => Some(Float64),
+        (x, y) if signed(x) && signed(y) => Some(Int64),
+        _ => None,
+    }
+}
+
+/// `schema` with each field `other` holds as a different numeric type
+/// widened to their common type.
+fn unify_numbers(schema: &Schema, other: &Schema) -> Schema {
+    Schema::new(
+        schema
+            .fields()
+            .iter()
+            .map(|f| {
+                let common = other
+                    .field_with_name(f.name())
+                    .ok()
+                    .and_then(|o| widened_number(f.data_type(), o.data_type()));
+                match common {
+                    Some(dt) => Arc::new(f.as_ref().clone().with_data_type(dt)),
+                    None => f.clone(),
+                }
+            })
+            .collect::<Vec<_>>(),
+    )
+    .with_metadata(schema.metadata().clone())
+}
+
+/// `current` widened by `incoming`'s fields. A column that holds whole
+/// numbers on one page and fractions on another is widened to `Float64`, and
+/// the rows already written are cast to it.
 fn merge(current: &SchemaRef, incoming: &Schema) -> Result<SchemaRef, FaucetError> {
+    let incoming = nullable(incoming);
     let merged = Schema::try_merge([
-        current.as_ref().clone(),
-        nullable(incoming).as_ref().clone(),
+        unify_numbers(current, &incoming),
+        unify_numbers(&incoming, current),
     ])
     .map_err(|e| {
         FaucetError::Sink(format!(
@@ -349,6 +461,42 @@ mod tests {
     }
 
     #[test]
+    fn a_number_column_widens_to_float_whichever_page_comes_first() {
+        let ints = faucet_core::columnar::infer_arrow_schema(&[json!({"amount": 10})]).unwrap();
+        let floats = faucet_core::columnar::infer_arrow_schema(&[json!({"amount": 10.5})]).unwrap();
+        for (first, then) in [(&ints, &floats), (&floats, &ints)] {
+            let m = merge(&nullable(first), then).unwrap();
+            assert_eq!(
+                m.field_with_name("amount").unwrap().data_type(),
+                &DataType::Float64
+            );
+        }
+        assert_eq!(
+            widened_number(&DataType::Int32, &DataType::Int64),
+            Some(DataType::Int64)
+        );
+        assert_eq!(widened_number(&DataType::Int64, &DataType::UInt64), None);
+        assert_eq!(widened_number(&DataType::Utf8, &DataType::Int64), None);
+        assert_eq!(widened_number(&DataType::Int64, &DataType::Int64), None);
+        let wide = Arc::new(Schema::new(vec![Field::new(
+            "amount",
+            DataType::Float64,
+            true,
+        )]));
+        let batch = faucet_core::columnar::values_to_record_batch(
+            &[json!({"amount": 7})],
+            Arc::new(Schema::new(vec![Field::new(
+                "amount",
+                DataType::Int64,
+                true,
+            )])),
+        )
+        .unwrap();
+        let cast = project(&batch, &wide).unwrap();
+        assert_eq!(cast.column(0).data_type(), &DataType::Float64);
+    }
+
+    #[test]
     fn nullable_recurses_into_structs_and_lists() {
         let s = faucet_core::columnar::infer_arrow_schema(&[
             json!({"o": {"x": 1}, "l": [1, 2], "n": null}),
@@ -413,6 +561,47 @@ mod tests {
             let e = project(&batch, &target).unwrap_err();
             assert!(e.to_string().contains(&format!("'{field}'")), "{e}");
         }
+    }
+
+    #[test]
+    fn project_refuses_to_round_a_large_integer_into_a_float() {
+        let float: SchemaRef =
+            Arc::new(Schema::new(vec![Field::new("n", DataType::Float64, true)]));
+        for (ty, value) in [
+            (DataType::Int64, json!(-9_007_199_254_740_993_i64)),
+            (DataType::UInt64, json!(18_000_000_000_000_000_000_u64)),
+        ] {
+            let batch = faucet_core::columnar::values_to_record_batch(
+                &[json!({ "n": value })],
+                Arc::new(Schema::new(vec![Field::new("n", ty, true)])),
+            )
+            .unwrap();
+            let e = project(&batch, &float).unwrap_err();
+            assert!(e.to_string().contains("2^53"), "{e}");
+        }
+        let exact = faucet_core::columnar::values_to_record_batch(
+            &[json!({"n": 9_007_199_254_740_992_i64})],
+            Arc::new(Schema::new(vec![Field::new("n", DataType::Int64, true)])),
+        )
+        .unwrap();
+        assert!(project(&exact, &float).is_ok());
+        assert!(!inexact_as_f64(&arrow::array::Int32Array::from(vec![1])));
+    }
+
+    #[test]
+    fn batch_for_refuses_a_large_unsigned_integer_into_a_float_column() {
+        let mut state = ParquetState::new();
+        state.schema = Some(nullable(&Schema::new(vec![Field::new(
+            "n",
+            DataType::Float64,
+            true,
+        )])));
+        let opts: ParquetOptions = serde_json::from_value(json!({})).unwrap();
+        let e = state
+            .batch_for(&opts, &[json!({"n": 18_000_000_000_000_000_000_u64})])
+            .unwrap_err();
+        assert!(e.to_string().contains("2^53"), "{e}");
+        assert!(state.batch_for(&opts, &[json!({"n": 3})]).is_ok());
     }
 
     #[test]

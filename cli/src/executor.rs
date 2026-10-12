@@ -726,12 +726,20 @@ pub async fn run_expanded(nodes: Vec<ExpandedNode>, opts: ExecuteOptions) -> Cli
                         None,
                     );
                     validate_unit_state_key(&node.id, uses_state, &state_key)?;
+                    let legacy_state_keys = node
+                        .legacy_state_ids
+                        .iter()
+                        .map(|id| {
+                            build_state_key(&opts.state_scope.prefix(&opts.pipeline_name), id, None)
+                        })
+                        .collect();
                     units.push(Unit {
                         node: node.clone(),
                         parent_record: None,
                         state_key,
                         parent_record_key: None,
                         product_ctx: None,
+                        legacy_state_keys,
                     });
                 }
                 NodeRole::Discovery { dims, .. } => {
@@ -750,6 +758,7 @@ pub async fn run_expanded(nodes: Vec<ExpandedNode>, opts: ExecuteOptions) -> Cli
                             state_key,
                             parent_record_key: None,
                             product_ctx: None,
+                            legacy_state_keys: Vec::new(),
                         });
                     } else {
                         // Chained discovery (#531): fan out over the upstream
@@ -775,6 +784,7 @@ pub async fn run_expanded(nodes: Vec<ExpandedNode>, opts: ExecuteOptions) -> Cli
                                 state_key,
                                 parent_record_key: Some(suffix),
                                 product_ctx: Some(ctx),
+                                legacy_state_keys: Vec::new(),
                             });
                         }
                     }
@@ -832,6 +842,7 @@ pub async fn run_expanded(nodes: Vec<ExpandedNode>, opts: ExecuteOptions) -> Cli
                             state_key,
                             parent_record_key: Some(suffix),
                             product_ctx: Some(ctx),
+                            legacy_state_keys: Vec::new(),
                         });
                     }
                 }
@@ -856,12 +867,10 @@ pub async fn run_expanded(nodes: Vec<ExpandedNode>, opts: ExecuteOptions) -> Cli
                             .as_ref()
                             .map(value_to_string_brief)
                             .unwrap_or_else(|| "(missing)".to_string());
-                        let state_key = build_state_key(
+                        let (state_key, legacy_state_keys) = child_state_keys(
                             &opts.state_scope.prefix(&opts.pipeline_name),
                             &node.id,
-                            Some(&crate::discovery_matrix::state_key_component(
-                                &pk_string, true,
-                            )),
+                            &pk_string,
                         );
                         if let Err(e) =
                             check_unit_state_key(&node.id, uses_state, &state_key, &mut seen_keys)
@@ -880,6 +889,7 @@ pub async fn run_expanded(nodes: Vec<ExpandedNode>, opts: ExecuteOptions) -> Cli
                             state_key,
                             parent_record_key: Some(pk_string),
                             product_ctx: None,
+                            legacy_state_keys,
                         });
                     }
                 }
@@ -1245,6 +1255,9 @@ struct Unit {
     /// Per-tuple interpolation context for a discovery-driven `for_each` row
     /// (#501): `{dim_id -> { alias: value }}`. `None` for roots/children.
     product_ctx: Option<HashMap<String, Value>>,
+    /// Keys an earlier release stored this unit's state under (#862
+    /// M-021/M-025): a bookmark found there moves to `state_key` when it is empty.
+    legacy_state_keys: Vec<String>,
 }
 
 /// Resolve the enumerated dimensions a `for_each`/chained-discovery row fans out
@@ -1586,24 +1599,36 @@ async fn run_unit(
         Ok(m) => (m, None),
         Err(e) => (Default::default(), Some(e)),
     };
+    if let (Some(store), None) = (markers.store.as_ref(), refused.as_ref()) {
+        adopt_legacy_state(store.as_ref(), &unit.state_key, &unit.legacy_state_keys).await;
+    }
+    let lease_lost = markers.lease_lost();
     let result = match refused {
         Some(e) => Err(e),
         None => {
-            boxed_run_one_invocation(
+            let run_cancel = cancel.child_token();
+            let _watch = markers.stop_on_lease_loss(&run_cancel);
+            let result = boxed_run_one_invocation(
                 &unit.node,
                 unit.parent_record.as_deref(),
                 unit.product_ctx.as_ref(),
                 &unit.state_key,
                 capture,
                 opts,
-                cancel,
+                run_cancel,
                 suppress_overwrite,
                 overwrite_grouped,
                 run_id.clone(),
                 observers.clone(),
                 markers.store.clone(),
             )
-            .await
+            .await;
+            match lease_lost.as_ref().filter(|l| l.is_cancelled()) {
+                Some(_) if result.is_ok() => Err(
+                    crate::pipeline_state::markers::RunMarkers::lease_lost_error(&unit.state_key),
+                ),
+                _ => result,
+            }
         }
     };
     let duration_ms = started.elapsed().as_millis() as u64;
@@ -1815,6 +1840,60 @@ fn boxed_run_one_invocation<'a>(
 /// The durable store the run lease and run-outcome marker are written to —
 /// `None` for preview / `--limit` / shard runs and memory or absent state,
 /// whose markers would describe nothing durable.
+/// A child invocation's state key, and the key releases before #840 used —
+/// the parent-key value verbatim — when that differs and is a valid key
+/// (#862 M-021).
+fn child_state_keys(prefix: &str, row: &str, parent_key: &str) -> (String, Vec<String>) {
+    let current = build_state_key(
+        prefix,
+        row,
+        Some(&crate::discovery_matrix::state_key_component(
+            parent_key, true,
+        )),
+    );
+    let verbatim = build_state_key(prefix, row, Some(parent_key));
+    let legacy = (verbatim != current && faucet_core::state::validate_state_key(&verbatim).is_ok())
+        .then_some(verbatim)
+        .into_iter()
+        .collect();
+    (current, legacy)
+}
+
+/// Move a bookmark stored under a key an earlier release used to `key`, when
+/// `key` holds none (#862 M-021/M-025). A failure leaves both keys as they were.
+async fn adopt_legacy_state(store: &dyn StateStore, key: &str, legacy: &[String]) {
+    if legacy.is_empty() {
+        return;
+    }
+    match store.get(key).await {
+        Ok(None) => {}
+        Ok(Some(_)) => return,
+        Err(e) => {
+            tracing::warn!(key, error = %e, "state unreadable; legacy state key not checked");
+            return;
+        }
+    }
+    for old in legacy {
+        let value = match store.get(old).await {
+            Ok(Some(v)) => v,
+            Ok(None) => continue,
+            Err(e) => {
+                tracing::warn!(key = %old, error = %e, "legacy state key unreadable");
+                return;
+            }
+        };
+        if let Err(e) = store.put(key, &value).await {
+            tracing::warn!(key, error = %e, "could not move state from its legacy key");
+            return;
+        }
+        if let Err(e) = store.delete(old).await {
+            tracing::warn!(key = %old, error = %e, "legacy state key could not be removed");
+        }
+        tracing::info!(from = %old, to = key, "moved state from the key an earlier release used");
+        return;
+    }
+}
+
 fn markers_store<'a>(
     node: &'a ExpandedNode,
     opts: &'a ExecuteOptions,
@@ -2455,6 +2534,7 @@ async fn run_one_invocation(
         sql_binds =
             crate::sql_bind::bind_source_query(&node.source.kind, &mut source_cfg, &fanout_ctx)?;
         let (source_before, sink_before) = (source_cfg.clone(), sink_cfg.clone());
+        resolve_xml_body_fields(&node.source.kind, &mut source_cfg, &fanout_ctx)?;
         resolve_inplace(&mut source_cfg, &fanout_ctx)?;
         resolve_inplace(&mut sink_cfg, &fanout_ctx)?;
         let is_fanout = |id: &str| fanout_ctx.contains_key(id);
@@ -3629,6 +3709,25 @@ pub(crate) fn resolve_now_inplace(
     }
 }
 
+/// Resolve fan-out tokens in an `xml` source's request-body fields with
+/// XML-escaped values (#862 M-071); the generic pass then finds no token left
+/// in them.
+fn resolve_xml_body_fields(
+    kind: &str,
+    cfg: &mut Value,
+    ctx: &HashMap<String, Value>,
+) -> CliResult<()> {
+    if kind != "xml" {
+        return Ok(());
+    }
+    for pointer in ["/body", "/soap/body_inner"] {
+        if let Some(Value::String(s)) = cfg.pointer_mut(pointer) {
+            *s = crate::interpolate::interpolate_record_xml(s, ctx)?;
+        }
+    }
+    Ok(())
+}
+
 /// In-place runtime interpolation against a parent-record context. Walks every
 /// string leaf in `value` and replaces `${id.path}` tokens with stringified
 /// values from `ctx`.
@@ -3642,6 +3741,41 @@ fn resolve_inplace(value: &mut Value, ctx: &HashMap<String, Value>) -> CliResult
         Value::Array(a) => a.iter_mut().try_for_each(|v| resolve_inplace(v, ctx)),
         Value::Object(m) => m.values_mut().try_for_each(|v| resolve_inplace(v, ctx)),
         _ => Ok(()),
+    }
+}
+
+#[cfg(test)]
+mod xml_body_tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn xml_body_fan_out_values_are_escaped() {
+        let ctx: HashMap<String, Value> =
+            HashMap::from([("customers".into(), json!({"company": "A&B </C><F>"}))]);
+        let mut cfg = json!({
+            "url": "https://x/${customers.company}",
+            "body": "<Q>${customers.company}</Q>",
+            "soap": {"body_inner": "<C>${customers.company}</C>"}
+        });
+        resolve_xml_body_fields("xml", &mut cfg, &ctx).unwrap();
+        assert_eq!(cfg["body"], "<Q>A&amp;B &lt;/C&gt;&lt;F&gt;</Q>");
+        assert_eq!(
+            cfg["soap"]["body_inner"],
+            "<C>A&amp;B &lt;/C&gt;&lt;F&gt;</C>"
+        );
+        assert_eq!(cfg["url"], "https://x/${customers.company}");
+
+        let mut rest = json!({"body": "${customers.company}"});
+        resolve_xml_body_fields("rest", &mut rest, &ctx).unwrap();
+        assert_eq!(rest["body"], "${customers.company}");
+
+        let mut quotes = json!({"body": "<a q=\"${c.v}\"/>"});
+        let ctx = HashMap::from([("c".into(), json!({"v": "x\"'y"}))]);
+        resolve_xml_body_fields("xml", &mut quotes, &ctx).unwrap();
+        assert_eq!(quotes["body"], "<a q=\"x&quot;&apos;y\"/>");
+        let mut missing = json!({"body": "${c.nope}"});
+        assert!(resolve_xml_body_fields("xml", &mut missing, &ctx).is_err());
     }
 }
 
@@ -4204,8 +4338,15 @@ impl Sink for LimitedSink {
     async fn begin_overwrite(&self) -> Result<(), FaucetError> {
         self.inner.begin_overwrite().await
     }
+    // A capped sample must never replace the destination, whoever drives the
+    // overwrite lifecycle (#862 H-06): the swap becomes a discard.
     async fn commit_overwrite(&self) -> Result<(), FaucetError> {
-        self.inner.commit_overwrite().await
+        tracing::warn!(
+            connector = self.inner.connector_name(),
+            "--limit on a `write_mode: overwrite` sink: the staged sample is discarded \
+             and the destination is left unchanged"
+        );
+        self.inner.abort_overwrite().await
     }
     async fn abort_overwrite(&self) -> Result<(), FaucetError> {
         self.inner.abort_overwrite().await
@@ -4449,6 +4590,7 @@ mod tests {
                 local_outputs: None,
                 deferred_refs: Vec::new(),
                 source_override: None,
+                legacy_state_ids: Vec::new(),
             }
         }
 
@@ -5004,6 +5146,7 @@ mod tests {
             state_key: format!("t::c::{pid}"),
             parent_record_key: Some(pid.to_string()),
             product_ctx: None,
+            legacy_state_keys: Vec::new(),
         };
 
         // Shared destination (fixed table) → ONE group across both parents, so
@@ -5161,6 +5304,7 @@ mod tests {
             state_key: "size::row".into(),
             parent_record_key: None,
             product_ctx: None,
+            legacy_state_keys: Vec::new(),
         };
         let captured: CapturedRecords = Default::default();
         let discovered: DiscoveredDims = Default::default();
@@ -6303,6 +6447,7 @@ matrix:
                     })
                     .collect(),
                 source_override: None,
+                legacy_state_ids: Vec::new(),
             }
         }
 
@@ -6390,6 +6535,7 @@ matrix:
                 token: "${p}".into(),
             }],
             source_override: None,
+            legacy_state_ids: Vec::new(),
         };
         let nodes_by_id = HashMap::from([("c".to_string(), c)]);
         let children_of = HashMap::from([("p".to_string(), vec!["c".to_string()])]);
@@ -6798,6 +6944,7 @@ matrix:
             local_outputs: None,
             deferred_refs: Vec::new(),
             source_override: None,
+            legacy_state_ids: Vec::new(),
         }
     }
 
@@ -7060,6 +7207,7 @@ matrix:
             local_outputs: None,
             deferred_refs: Vec::new(),
             source_override: None,
+            legacy_state_ids: Vec::new(),
         };
         let err = run_expanded(vec![orphan], opts("deadlock"))
             .await
@@ -7126,6 +7274,7 @@ matrix:
             state_key: format!("t::c::{pid}"),
             parent_record_key: Some(pid.to_string()),
             product_ctx: None,
+            legacy_state_keys: Vec::new(),
         };
         // Shared destination across two parents ⇒ members == 2.
         let shared = overwrite_child_node(dir.path(), "orders");
@@ -7159,6 +7308,7 @@ matrix:
             state_key: format!("t::{}::1", node.id),
             parent_record_key: Some("1".into()),
             product_ctx: None,
+            legacy_state_keys: Vec::new(),
         };
         let (groups, task_group) = plan_overwrite_groups(&[mk(&a), mk(&b)], &opts).unwrap();
         assert_eq!(groups.len(), 1, "one table ⇒ one staging ⇒ one group");
@@ -7305,6 +7455,68 @@ matrix:
             );
             assert_eq!(capped.remaining.load(Ordering::SeqCst), 0);
         }
+
+        #[tokio::test]
+        async fn limited_sink_discards_an_overwrite_instead_of_committing_it() {
+            #[derive(Default)]
+            struct Lifecycle {
+                log: Arc<std::sync::Mutex<Vec<&'static str>>>,
+            }
+            #[async_trait]
+            impl Sink for Lifecycle {
+                async fn write_batch(&self, records: &[Value]) -> Result<usize, FaucetError> {
+                    Ok(records.len())
+                }
+                fn is_overwrite(&self) -> bool {
+                    true
+                }
+                async fn commit_overwrite(&self) -> Result<(), FaucetError> {
+                    self.log.lock().unwrap().push("commit");
+                    Ok(())
+                }
+                async fn abort_overwrite(&self) -> Result<(), FaucetError> {
+                    self.log.lock().unwrap().push("abort");
+                    Ok(())
+                }
+            }
+            let inner = Lifecycle::default();
+            let log = inner.log.clone();
+            let sink = LimitedSink::wrap(Box::new(inner), 2);
+            assert!(sink.is_overwrite());
+            sink.commit_overwrite().await.unwrap();
+            sink.abort_overwrite().await.unwrap();
+            assert_eq!(*log.lock().unwrap(), vec!["abort", "abort"]);
+        }
+    }
+
+    #[test]
+    fn child_state_keys_name_the_pre_840_key_only_when_it_differs() {
+        let (cur, legacy) = child_state_keys("p", "kid", "42");
+        assert_eq!((cur.as_str(), legacy.len()), ("p::kid::42", 0));
+        let long = "a".repeat(80);
+        let (cur, legacy) = child_state_keys("p", "kid", &long);
+        assert_ne!(cur, format!("p::kid::{long}"));
+        assert_eq!(legacy, vec![format!("p::kid::{long}")]);
+        let (_, legacy) = child_state_keys("p", "kid", "a b");
+        assert!(legacy.is_empty(), "the verbatim form was never a valid key");
+    }
+
+    #[tokio::test]
+    async fn adopt_legacy_state_moves_only_into_an_empty_key() {
+        let store = faucet_core::MemoryStateStore::new();
+        adopt_legacy_state(&store, "p::a", &[]).await;
+        store.put("p::old", &json!(1)).await.unwrap();
+        adopt_legacy_state(&store, "p::a", &["p::none".into(), "p::old".into()]).await;
+        assert_eq!(store.get("p::a").await.unwrap(), Some(json!(1)));
+        assert_eq!(store.get("p::old").await.unwrap(), None);
+        store.put("p::old", &json!(2)).await.unwrap();
+        adopt_legacy_state(&store, "p::a", &["p::old".into()]).await;
+        assert_eq!(
+            store.get("p::a").await.unwrap(),
+            Some(json!(1)),
+            "a current key wins"
+        );
+        assert_eq!(store.get("p::old").await.unwrap(), Some(json!(2)));
     }
 
     #[test]

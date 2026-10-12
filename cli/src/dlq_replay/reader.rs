@@ -132,6 +132,37 @@ impl DlqDecryptor {
         false
     }
 
+    /// The lines of `text` without those whose id is in `drop`, when `text`
+    /// is a DLQ file sealed with whole-file integrity: the kept records are
+    /// re-sealed under a fresh header and trailer (with the current key), so
+    /// the rewritten file still verifies. `None` for a file whose lines are
+    /// not sealed this way, which can be filtered line by line. A sealed file
+    /// needs a key, and one that fails its integrity check is refused.
+    pub fn reseal_without(
+        &self,
+        file: &Path,
+        text: &str,
+        drop: &std::collections::HashSet<String>,
+    ) -> Result<Option<(String, usize)>, FaucetError> {
+        let Some(first) = text.lines().map(str::trim).find(|l| !l.is_empty()) else {
+            return Ok(None);
+        };
+        if !first.starts_with(SEALED_LINE_PREFIX) {
+            return Ok(None);
+        }
+        #[cfg(feature = "encryption")]
+        if let Some(enc) = &self.inner {
+            return reseal(enc, file, text, drop);
+        }
+        #[cfg(not(feature = "encryption"))]
+        let _ = drop;
+        Err(FaucetError::Config(format!(
+            "DLQ file '{}' is encrypted; purging it rewrites its integrity trailer, which \
+             needs the key (--encryption-key, or the config's dlq `encryption` block)",
+            file.display()
+        )))
+    }
+
     fn decode(&self, line: &str) -> LineDecode {
         let trimmed = line.trim();
         if !trimmed.starts_with(SEALED_LINE_PREFIX) {
@@ -161,6 +192,48 @@ impl DlqDecryptor {
         // build): report it as encrypted rather than malformed.
         LineDecode::Undecryptable
     }
+}
+
+#[cfg(feature = "encryption")]
+fn reseal(
+    enc: &faucet_core::CompiledEncryption,
+    file: &Path,
+    text: &str,
+    drop: &std::collections::HashSet<String>,
+) -> Result<Option<(String, usize)>, FaucetError> {
+    use base64::Engine as _;
+    use faucet_common_file::sealed_lines::{LineSeal, Opened, open};
+    let damaged = |why: String| {
+        FaucetError::Source(format!(
+            "DLQ file '{}' can not be purged: {why}",
+            file.display()
+        ))
+    };
+    match open(text.as_bytes(), enc).map_err(|e| damaged(e.to_string()))? {
+        Opened::Sealed { .. } => {}
+        Opened::Legacy { .. } | Opened::Empty => return Ok(None),
+    }
+    let mut seal = LineSeal::new();
+    let mut out = String::from_utf8_lossy(&seal.header(enc)).into_owned();
+    let mut purged = 0usize;
+    for line in text.lines().filter(|l| !l.trim().is_empty()) {
+        if drop.contains(&line_id(line)) {
+            purged += 1;
+            continue;
+        }
+        let sealed = base64::engine::general_purpose::STANDARD
+            .decode(line.trim())
+            .map_err(|e| damaged(format!("a line is not base64: {e}")))?;
+        match enc.open_line(&sealed) {
+            Ok(faucet_core::SealedLine::Data(plain)) => {
+                out.push_str(&String::from_utf8_lossy(&seal.seal(enc, &plain)));
+            }
+            Ok(_) => {}
+            Err(e) => return Err(damaged(e.to_string())),
+        }
+    }
+    out.push_str(&String::from_utf8_lossy(&seal.trailer(enc)));
+    Ok(Some((out, purged)))
 }
 
 /// A pre-built source attached to a single [`ExpandedNode`](crate::expand::ExpandedNode)
@@ -323,6 +396,36 @@ pub fn discarded_lines(file: &Path) -> Result<std::collections::HashSet<String>,
 /// signal the path is wrong), so callers never silently report an empty DLQ
 /// for a typo'd path.
 pub fn expand_location(location: &str) -> Result<Vec<PathBuf>, FaucetError> {
+    // A file sink's `{part}` template, and the `-{part}` it inserts before the
+    // extension when a rollover cap is set, name numbered files (#862 M-026).
+    if location.contains("{part}") {
+        return expand_location(&location.replace("{part}", "*"));
+    }
+    match expand_plain(location) {
+        Err(e) if !location.contains(['*', '?', '[']) && !Path::new(location).exists() => {
+            match rolled_over_glob(location) {
+                Some(glob) => expand_plain(&glob).map_err(|_| e),
+                None => Err(e),
+            }
+        }
+        other => other,
+    }
+}
+
+/// The glob matching the numbered parts a rollover cap splits `path` into:
+/// `dlq/failed.jsonl` → `dlq/failed-*.jsonl`.
+fn rolled_over_glob(path: &str) -> Option<String> {
+    let p = Path::new(path);
+    let name = p.file_name()?.to_str()?;
+    let from = usize::from(name.starts_with('.'));
+    let rolled = match name[from..].find('.') {
+        Some(i) => format!("{}-*{}", &name[..i + from], &name[i + from..]),
+        None => format!("{name}-*"),
+    };
+    Some(p.with_file_name(rolled).to_string_lossy().into_owned())
+}
+
+fn expand_plain(location: &str) -> Result<Vec<PathBuf>, FaucetError> {
     let has_glob = location.contains(['*', '?', '[']);
     let mut files: Vec<PathBuf> = if has_glob {
         glob::glob(location)
@@ -459,6 +562,29 @@ mod tests {
             "record_index": 0,
         })
         .to_string()
+    }
+
+    #[test]
+    fn numbered_locations_expand_to_their_parts() {
+        let dir = tempfile::tempdir().unwrap();
+        let part = dir.path().join("f-00001.jsonl");
+        std::fs::write(&part, "x\n").unwrap();
+        let tpl = format!("{}/f-{{part}}.jsonl", dir.path().display());
+        assert_eq!(expand_location(&tpl).unwrap(), vec![part.clone()]);
+        let rolled = format!("{}/f.jsonl", dir.path().display());
+        assert_eq!(expand_location(&rolled).unwrap(), vec![part]);
+        let missing = format!("{}/g.jsonl", dir.path().display());
+        assert!(
+            expand_location(&missing)
+                .unwrap_err()
+                .to_string()
+                .contains("g.jsonl")
+        );
+        assert_eq!(
+            rolled_over_glob("d/.h.jsonl").as_deref(),
+            Some("d/.h-*.jsonl")
+        );
+        assert_eq!(rolled_over_glob("d/noext").as_deref(), Some("d/noext-*"));
     }
 
     #[test]

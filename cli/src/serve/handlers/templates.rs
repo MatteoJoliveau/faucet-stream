@@ -78,6 +78,15 @@ fn store(state: &ServerState) -> TemplateStore {
     state.history()
 }
 
+/// Whether the server gates `kind` behind an approved change request: it, or
+/// the kind that governs it, is in `--require-approval`.
+fn gated(state: &ServerState, kind: crate::serve::changes::ChangeKind) -> bool {
+    state.requires_approval(kind)
+        || kind
+            .governed_by()
+            .is_some_and(|g| state.requires_approval(g))
+}
+
 /// Refuse a lifecycle call whose change kind the server gates behind an
 /// approved change request (`--require-approval`, #703). An approved request
 /// executes through the template store, not these handlers.
@@ -85,7 +94,7 @@ fn approval_gate(
     state: &ServerState,
     kinds: &[crate::serve::changes::ChangeKind],
 ) -> Result<(), ServeError> {
-    match kinds.iter().find(|k| state.requires_approval(**k)) {
+    match kinds.iter().find(|k| gated(state, **k)) {
         Some(k) => Err(ServeError::Conflict(format!(
             "this server requires an approved change request for {k} (--require-approval): \
              propose it with POST /v1/changes (kind `{k}`) and have it approved"
@@ -379,6 +388,7 @@ pub async fn template_matrix(State(state): State<ServerState>) -> Result<Json<Va
         root: std::path::PathBuf::new(),
         sources,
         sinks,
+        incompatible: Vec::new(),
     };
     Ok(Json(crate::hub::catalog::index_json_with(
         &cat,
@@ -642,10 +652,35 @@ pub async fn delete_template(
                 .map_err(map_err)?,
         ),
     };
+    // Deleting a launched version drops its launch-log entries (moving
+    // `stable`), and deleting the `newest` version or a channel's target moves
+    // what those callers resolve to, so each needs an approved
+    // `template_delete` change when deletes are gated.
+    let delete = crate::serve::changes::ChangeKind::TemplateDelete;
+    if gated(&state, delete) {
+        let st = crate::templates::template_state(&s, &id)
+            .await
+            .map_err(map_err)?;
+        let launches = s
+            .template_launches(&id)
+            .await
+            .map_err(|e| ServeError::from_history("reading template launches", e))?;
+        let moves_a_pointer = match target {
+            None => !st.versions.is_empty(),
+            Some(v) => {
+                launches.iter().any(|l| l.version == v)
+                    || st.newest == Some(v)
+                    || st.tags.values().any(|t| *t == v)
+            }
+        };
+        if moves_a_pointer {
+            approval_gate(&state, &[delete])?;
+        }
+    }
     let removed = s
         .template_delete(&id, target)
         .await
-        .map_err(|e| ServeError::Internal(e.to_string()))?;
+        .map_err(|e| ServeError::from_history("deleting template", e))?;
     if removed == 0 {
         return Err(ServeError::NotFound);
     }
@@ -925,6 +960,13 @@ pub async fn deprecate_version(
     Path((id, version)): Path<(String, String)>,
     Json(body): Json<DeprecateBody>,
 ) -> Result<Json<serde_json::Value>, ServeError> {
+    // Retiring (or reviving) a version moves `newest` for every caller that
+    // selects it, so it needs an approved `template_deprecate` change when
+    // that (or a launch) is gated.
+    approval_gate(
+        &state,
+        &[crate::serve::changes::ChangeKind::TemplateDeprecate],
+    )?;
     let s = store(&state);
     let selector = VersionSelector::parse(&version).map_err(map_err)?;
     let version = crate::templates::resolve_version(&s, &id, selector)
@@ -1396,6 +1438,7 @@ pub async fn trigger_template_outcome(
         approved_change: None,
         selection: materialized.selection.clone(),
         trusted_config: true,
+        server_file: false,
     };
     let run = if !gated {
         runner::submit(state.clone(), req, actor.clone()).await?
@@ -1966,6 +2009,80 @@ tests:
         .await
         .expect("trigger");
         assert_eq!(ok.status(), StatusCode::ACCEPTED);
+    }
+
+    /// #862 M-005 + review of #868 (cli F6, F7): under `--require-approval
+    /// template_launch`, deleting a launched version, the `newest` version or
+    /// a channel's target, or retiring any version (each moves what a request
+    /// resolves to) needs a change request; any other version can still be
+    /// deleted.
+    #[tokio::test]
+    async fn deleting_a_launched_version_or_retiring_one_is_gated_like_a_launch() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut cfg = crate::serve::test_support::test_config();
+        cfg.require_approval = vec![crate::serve::changes::ChangeKind::TemplateLaunch];
+        let state = crate::serve::test_support::state_from(&cfg);
+        for _ in 0..5 {
+            register_demo_opts(&state, &dir.path().join("o.jsonl"), false).await;
+        }
+        let s = store(&state);
+        for v in [1, 2] {
+            crate::templates::launch(&s, "tpl-demo", VersionSelector::Pinned(v), None)
+                .await
+                .unwrap();
+        }
+        let delete = |version: Option<VersionSelector>| {
+            delete_template(
+                State(state.clone()),
+                Extension(actor()),
+                Path("tpl-demo".into()),
+                Query(VersionQuery {
+                    version,
+                    clean: false,
+                }),
+            )
+        };
+        for v in [
+            Some(VersionSelector::Channel(VersionChannel::Stable)),
+            Some(VersionSelector::Pinned(1)),
+            None,
+        ] {
+            let err = delete(v).await.unwrap_err();
+            assert!(matches!(err, ServeError::Conflict(_)), "{err:?}");
+        }
+        let err = deprecate_version(
+            State(state.clone()),
+            Extension(actor()),
+            Path(("tpl-demo".into(), "3".into())),
+            Json(DeprecateBody {
+                reason: None,
+                undo: false,
+            }),
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(err, ServeError::Conflict(_)), "{err:?}");
+        assert!(err.to_string().contains("template_deprecate"), "{err}");
+        crate::templates::promote(
+            &s,
+            "tpl-demo",
+            VersionChannel::Canary,
+            VersionSelector::Pinned(4),
+        )
+        .await
+        .unwrap();
+        for v in [4, 5] {
+            let err = delete(Some(VersionSelector::Pinned(v))).await.unwrap_err();
+            assert!(matches!(err, ServeError::Conflict(_)), "v{v}: {err:?}");
+            assert!(err.to_string().contains("template_delete"), "{err}");
+        }
+        assert_eq!(
+            delete(Some(VersionSelector::Pinned(3))).await.unwrap(),
+            StatusCode::NO_CONTENT
+        );
+        let st = s.template_state("tpl-demo").await.unwrap();
+        assert_eq!(st.stable, Some(2), "stable never moved");
+        assert_eq!(st.newest, Some(5), "newest never moved");
     }
 
     async fn test_state_with(dir: &tempfile::TempDir) -> ServerState {

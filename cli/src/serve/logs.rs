@@ -147,6 +147,9 @@ pub struct LogHub {
     persist: Arc<OnceLock<mpsc::Sender<PersistMsg>>>,
     /// The persistence writer task, awaited by [`LogHub::shutdown_persistence`].
     writer: Arc<std::sync::Mutex<Option<tokio::task::JoinHandle<()>>>>,
+    /// Lines per run the full persistence queue turned away, not yet counted
+    /// on the run's delivery row (the writer folds them in).
+    queue_dropped: Arc<DashMap<String, u64>>,
 }
 
 impl LogHub {
@@ -176,7 +179,12 @@ impl LogHub {
         if self.persist.set(tx).is_err() {
             return; // already enabled
         }
-        let handle = tokio::spawn(persist_writer(rx, history, max_lines_per_run.max(1)));
+        let handle = tokio::spawn(persist_writer(
+            rx,
+            history,
+            max_lines_per_run.max(1),
+            Arc::clone(&self.queue_dropped),
+        ));
         *self.writer.lock().expect("log writer lock poisoned") = Some(handle);
     }
 
@@ -230,6 +238,7 @@ impl LogHub {
         {
             metrics::counter!("faucet_serve_run_logs_dropped_total", "reason" => "queue_full")
                 .increment(1);
+            *self.queue_dropped.entry(run_id.to_string()).or_default() += 1;
         }
     }
 
@@ -298,11 +307,24 @@ struct RunPersistState {
     truncated: bool,
     /// Lines dropped by the per-run cap, not yet counted on the run's delivery row.
     capped: u64,
+    /// When this instance last advanced its persisted watermark while quiet.
+    marked_at: Option<std::time::Instant>,
 }
 
 /// How often the writer flushes every run's pending lines, so a long run's
 /// lines reach the durable store (and the log shipper) while it runs.
 const PERSIST_FLUSH_EVERY: std::time::Duration = std::time::Duration::from_secs(1);
+
+/// How often a quiet run's persisted watermark is advanced (#862 M-099).
+const WRITER_MARK_EVERY: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// The watermark an idle writer may claim at `now`: every line captured a
+/// second or more before it has reached the store (the queue is empty), and a
+/// line being enqueued right now carries a later key.
+fn idle_watermark(now: chrono::DateTime<chrono::Utc>) -> u64 {
+    let at = now - chrono::Duration::seconds(1);
+    ((at.timestamp_micros().max(0) as u64) << 12) | 0xFFF
+}
 
 /// Background task draining the persistence channel (#529): batches captured
 /// lines per run into `history`, enforces the per-run cap, and flushes at run
@@ -312,6 +334,7 @@ async fn persist_writer(
     mut rx: mpsc::Receiver<PersistMsg>,
     history: Arc<dyn RunHistory>,
     max_lines_per_run: usize,
+    queue_dropped: Arc<DashMap<String, u64>>,
 ) {
     let cap = max_lines_per_run as u64;
     let mut runs: HashMap<String, RunPersistState> = HashMap::new();
@@ -326,8 +349,49 @@ async fn persist_writer(
             tracing::warn!(run_id, error = %e, "persisting run logs failed");
             metrics::counter!("faucet_serve_run_logs_dropped_total", "reason" => "backend_error")
                 .increment(n);
+            count_dropped(history, run_id, n).await;
         } else {
             metrics::counter!("faucet_serve_run_log_lines_total").increment(n);
+        }
+    }
+
+    /// Count lines lost before they reached the store on the run's delivery
+    /// row, so its export status never claims they were shipped.
+    async fn count_dropped(history: &Arc<dyn RunHistory>, run_id: &str, n: u64) {
+        if let Err(e) = history.log_ship_add_dropped(run_id, n).await {
+            tracing::warn!(run_id, error = %e, "recording dropped run-log lines failed");
+        }
+    }
+
+    async fn fold_queue_drops(history: &Arc<dyn RunHistory>, drops: &DashMap<String, u64>) {
+        let runs: Vec<String> = drops.iter().map(|e| e.key().clone()).collect();
+        for run_id in runs {
+            if let Some((run_id, n)) = drops.remove(&run_id)
+                && n > 0
+            {
+                count_dropped(history, &run_id, n).await;
+            }
+        }
+    }
+
+    /// Advance the watermark of each run this instance writes, so peers'
+    /// lines keep shipping while it has nothing to log.
+    async fn mark_quiet(
+        history: &Arc<dyn RunHistory>,
+        runs: &mut HashMap<String, RunPersistState>,
+    ) {
+        let through = idle_watermark(chrono::Utc::now());
+        for (run_id, st) in runs.iter_mut() {
+            if st
+                .marked_at
+                .is_some_and(|t| t.elapsed() < WRITER_MARK_EVERY)
+            {
+                continue;
+            }
+            st.marked_at = Some(std::time::Instant::now());
+            if let Err(e) = history.log_ship_writer_mark(run_id, through).await {
+                tracing::warn!(run_id, error = %e, "advancing the run-log watermark failed");
+            }
         }
     }
 
@@ -343,6 +407,10 @@ async fn persist_writer(
                 for (run_id, st) in runs.iter_mut() {
                     flush(&history, run_id, st).await;
                 }
+                if rx.is_empty() {
+                    mark_quiet(&history, &mut runs).await;
+                }
+                fold_queue_drops(&history, &queue_dropped).await;
                 continue;
             }
         };
@@ -355,6 +423,13 @@ async fn persist_writer(
                 line,
                 attrs,
             } => {
+                if !runs.contains_key(&run_id)
+                    && let Err(e) = history
+                        .log_ship_writer_mark(&run_id, seq.saturating_sub(1))
+                        .await
+                {
+                    tracing::warn!(run_id, error = %e, "registering the run-log writer failed");
+                }
                 let st = runs.entry(run_id.clone()).or_default();
                 if st.persisted >= cap {
                     if !st.truncated {
@@ -387,11 +462,13 @@ async fn persist_writer(
                 if let Some(mut st) = runs.remove(&run_id) {
                     close(&history, &run_id, &mut st).await;
                 }
+                fold_queue_drops(&history, &queue_dropped).await;
             }
             PersistMsg::Shutdown => {
                 for (run_id, mut st) in runs.drain() {
                     close(&history, &run_id, &mut st).await;
                 }
+                fold_queue_drops(&history, &queue_dropped).await;
                 break;
             }
         }
@@ -417,6 +494,9 @@ async fn persist_writer(
                 tracing::warn!(run_id, error = %e, "recording capped run-log lines failed");
             }
             st.capped = 0;
+        }
+        if let Err(e) = history.log_ship_writer_done(run_id).await {
+            tracing::warn!(run_id, error = %e, "releasing the run-log watermark failed");
         }
     }
 }
@@ -589,6 +669,212 @@ mod tests {
         let (lines, _rx, _ended) = hub.reader("run-rec").unwrap();
         assert_eq!(lines.len(), 1);
         assert!(lines[0].line.ends_with(": kept"));
+    }
+
+    /// Records drop counts and fails every log insert.
+    #[derive(Default)]
+    struct DropCounter {
+        fail_inserts: bool,
+        dropped: std::sync::Mutex<HashMap<String, u64>>,
+        marks: std::sync::Mutex<Vec<(String, u64)>>,
+    }
+
+    #[async_trait::async_trait]
+    impl RunHistory for DropCounter {
+        async fn claim_idempotency(
+            &self,
+            _key: &str,
+            _fingerprint: &str,
+            _run_id: &str,
+            _window: std::time::Duration,
+        ) -> Result<crate::serve::history::Claim, crate::serve::history::HistoryError> {
+            Ok(crate::serve::history::Claim::Fresh)
+        }
+        async fn upsert(
+            &self,
+            _rec: &crate::serve::history::RunRecord,
+        ) -> Result<(), crate::serve::history::HistoryError> {
+            Ok(())
+        }
+        async fn get(
+            &self,
+            _id: &str,
+        ) -> Result<Option<crate::serve::history::RunRecord>, crate::serve::history::HistoryError>
+        {
+            Ok(None)
+        }
+        async fn list(
+            &self,
+            _filter: &crate::serve::history::ListFilter,
+        ) -> Result<crate::serve::history::ListPage, crate::serve::history::HistoryError> {
+            Ok(crate::serve::history::ListPage {
+                runs: Vec::new(),
+                next_cursor: None,
+            })
+        }
+        async fn delete(
+            &self,
+            _id: &str,
+        ) -> Result<crate::serve::history::DeleteOutcome, crate::serve::history::HistoryError>
+        {
+            Ok(crate::serve::history::DeleteOutcome::NotFound)
+        }
+        async fn purge_expired(
+            &self,
+            _retain_for: std::time::Duration,
+        ) -> Result<usize, crate::serve::history::HistoryError> {
+            Ok(0)
+        }
+        async fn recover_orphans(&self) -> Result<usize, crate::serve::history::HistoryError> {
+            Ok(0)
+        }
+        async fn record_run_logs(
+            &self,
+            _run_id: &str,
+            _lines: &[RunLogLine],
+        ) -> Result<(), crate::serve::history::HistoryError> {
+            if self.fail_inserts {
+                return Err(crate::serve::history::HistoryError::Backend("down".into()));
+            }
+            Ok(())
+        }
+        async fn log_ship_add_dropped(
+            &self,
+            run_id: &str,
+            n: u64,
+        ) -> Result<(), crate::serve::history::HistoryError> {
+            *self
+                .dropped
+                .lock()
+                .unwrap()
+                .entry(run_id.into())
+                .or_default() += n;
+            Ok(())
+        }
+        async fn log_ship_writer_mark(
+            &self,
+            run_id: &str,
+            through: u64,
+        ) -> Result<(), crate::serve::history::HistoryError> {
+            self.marks.lock().unwrap().push((run_id.into(), through));
+            Ok(())
+        }
+        fn degraded(&self) -> bool {
+            false
+        }
+    }
+
+    /// Review of #868 (cli F5): a writer registers its watermark when it first
+    /// sees a run, before its first batch reaches the store, so a first batch
+    /// that lands late is still ahead of what the shipper acknowledges.
+    #[tokio::test]
+    async fn a_writer_registers_its_watermark_before_its_first_batch() {
+        let history = Arc::new(DropCounter {
+            fail_inserts: true,
+            ..Default::default()
+        });
+        let hub = LogHub::new();
+        hub.enable_persistence(history.clone(), 100);
+        let before = (chrono::Utc::now().timestamp_micros() as u64) << 12;
+        hub.capture("r1", "INFO", "t".into(), "first".into());
+        let mut first = None;
+        for _ in 0..100 {
+            first = history.marks.lock().unwrap().first().cloned();
+            if first.is_some() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        let (run, through) = first.expect("the writer registered the run");
+        assert_eq!(run, "r1");
+        assert!(
+            through + 1 >= before,
+            "registered just below the first line"
+        );
+        hub.shutdown_persistence(std::time::Duration::from_secs(5))
+            .await;
+    }
+
+    #[test]
+    fn the_idle_watermark_trails_now_by_a_second() {
+        let now = chrono::Utc::now();
+        let w = idle_watermark(now);
+        let behind = ((now - chrono::Duration::seconds(1)).timestamp_micros() as u64) << 12;
+        assert_eq!(w & !0xFFF, behind);
+        assert!(w < (now.timestamp_micros() as u64) << 12);
+    }
+
+    /// #862 M-099: the writer advances a quiet run's watermark and releases it
+    /// when the run ends here, so the shipper is held back only while this
+    /// instance may still persist a line.
+    #[tokio::test]
+    async fn the_writer_advances_a_quiet_runs_watermark_and_releases_it_at_the_end() {
+        let history = Arc::new(crate::serve::history::memory::MemoryHistory::new(
+            std::time::Duration::from_secs(60),
+        ));
+        let hub = LogHub::new();
+        hub.enable_persistence(history.clone(), 100);
+        let before = idle_watermark(chrono::Utc::now());
+        hub.capture("r1", "INFO", "t".into(), "a".into());
+        let stale = std::time::Duration::from_secs(60);
+        let mut floor = None;
+        for _ in 0..60 {
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            floor = history.log_ship_writer_floor("r1", stale).await.unwrap();
+            if floor.is_some_and(|f| f > before) {
+                break;
+            }
+        }
+        assert!(
+            floor.is_some_and(|f| f > before),
+            "the quiet run's watermark moved past its last line: {floor:?}"
+        );
+        hub.finish("r1");
+        for _ in 0..50 {
+            if history
+                .log_ship_writer_floor("r1", stale)
+                .await
+                .unwrap()
+                .is_none()
+            {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        assert_eq!(
+            history.log_ship_writer_floor("r1", stale).await.unwrap(),
+            None
+        );
+        hub.shutdown_persistence(std::time::Duration::from_secs(5))
+            .await;
+    }
+
+    /// #862 M-099: lines lost before the store — a full persistence queue or
+    /// a failed insert — are counted on the run's delivery row, so its export
+    /// status cannot read "every line acknowledged".
+    #[tokio::test]
+    async fn lines_lost_before_the_store_are_counted_as_dropped() {
+        let failing = Arc::new(DropCounter {
+            fail_inserts: true,
+            ..Default::default()
+        });
+        let hub = LogHub::new();
+        hub.enable_persistence(failing.clone(), 100);
+        hub.capture("r1", "INFO", "t".into(), "a".into());
+        hub.capture("r1", "INFO", "t".into(), "b".into());
+        hub.finish("r1");
+        hub.shutdown_persistence(std::time::Duration::from_secs(5))
+            .await;
+        assert_eq!(failing.dropped.lock().unwrap().get("r1"), Some(&2));
+
+        let ok = Arc::new(DropCounter::default());
+        let hub = LogHub::new();
+        hub.enable_persistence(ok.clone(), 100);
+        *hub.queue_dropped.entry("r2".into()).or_default() += 3;
+        hub.shutdown_persistence(std::time::Duration::from_secs(5))
+            .await;
+        assert_eq!(ok.dropped.lock().unwrap().get("r2"), Some(&3));
+        assert!(hub.queue_dropped.is_empty());
     }
 
     #[test]

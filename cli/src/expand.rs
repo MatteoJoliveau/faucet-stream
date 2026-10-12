@@ -122,6 +122,10 @@ pub struct ExpandedNode {
     /// executor runs it through the normal pipeline path. `None` for every
     /// config-driven node (the executor builds the source from `source.kind`).
     pub source_override: Option<crate::dlq_replay::reader::SourceOverride>,
+    /// Node ids an earlier release keyed this node's state under — a
+    /// partition chunk's zero-padded id before #840 (#862 M-025). The executor
+    /// moves a bookmark found under one of them to the current key.
+    pub legacy_state_ids: Vec<String>,
     /// Scoped-cleanup claim (#478): the source's `complete_for` scope, still
     /// carrying any `${parent.*}` / `${now.*}` tokens — the executor resolves
     /// them per invocation, like the connector configs. `Some` only when the
@@ -797,6 +801,7 @@ pub fn expand(cfg: &PipelineConfig) -> CliResult<Vec<ExpandedNode>> {
                 tags: Vec::new(),
                 deferred_refs: Vec::new(),
                 source_override: None,
+                legacy_state_ids: Vec::new(),
                 cleanup_scope: None,
                 metadata_columns: None,
                 #[cfg(feature = "catalog")]
@@ -876,6 +881,7 @@ pub fn expand(cfg: &PipelineConfig) -> CliResult<Vec<ExpandedNode>> {
             &mut transforms,
             row_id,
         )?;
+        apply_cdc_unwrap_key(&merged_sink.config, &mut transforms);
         let state = row.state.clone().or_else(|| cfg.pipeline.state.clone());
         // Row override wins; fall back to the top-level delivery mode.
         let delivery = row.delivery.unwrap_or(cfg.delivery);
@@ -1559,6 +1565,7 @@ pub fn expand(cfg: &PipelineConfig) -> CliResult<Vec<ExpandedNode>> {
             tags,
             deferred_refs: deferred,
             source_override: None,
+            legacy_state_ids: Vec::new(),
             cleanup_scope,
             metadata_columns: effective_metadata_columns(cfg),
             #[cfg(feature = "catalog")]
@@ -1572,9 +1579,13 @@ pub fn expand(cfg: &PipelineConfig) -> CliResult<Vec<ExpandedNode>> {
             // (`{name}::{row}::partition::{chunk}`) and log lines stay distinct,
             // and `row_index` is kept identical so partitions of one row sort
             // together ahead of the next row.
+            let width = chunks.len().saturating_sub(1).to_string().len();
             for chunk in &chunks {
                 let mut n = base.clone();
                 n.id = format!("{}::partition::{}", base.id, chunk.id);
+                n.legacy_state_ids = legacy_partition_id(&base.id, &chunk.id, width)
+                    .into_iter()
+                    .collect();
                 crate::partition::substitute(&mut n.source.config, chunk)
                     .map_err(|e| CliError::Config(format!("row '{}': {e}", ids[i])))?;
                 crate::partition::substitute(&mut n.sink.config, chunk)
@@ -1584,6 +1595,12 @@ pub fn expand(cfg: &PipelineConfig) -> CliResult<Vec<ExpandedNode>> {
         }
     }
     check_file_sink_paths(&out)?;
+    if let Err(e) = check_sharding(cfg, &out) {
+        tracing::warn!(
+            "{e} (`shard:` takes effect only under `faucet serve --cluster`, which refuses \
+             this config; elsewhere it runs unsharded)"
+        );
+    }
     for warning in out.iter().filter_map(rewritten_file_warning) {
         tracing::warn!("{warning}");
     }
@@ -1650,6 +1667,40 @@ fn apply_cdc_image_policy(
         }
     }
     Ok(())
+}
+
+/// A primary-key-range sharded SQL source that resumes from a cursor
+/// bookmark (#862 M-040).
+fn pk_range_bookmarked(kind: &str, config: &Value) -> bool {
+    matches!(kind, "postgres" | "mysql" | "mssql" | "sqlite")
+        && crate::registry::source_resumes_from_bookmark(kind, config)
+}
+
+/// Give a `cdc_unwrap` with no `key` the keyed sink's `key` (#862 M-033), so an
+/// update that changes the primary key also deletes the row under the old key.
+/// A mirror's per-table sink config carries that table's key, so each table
+/// gets its own.
+fn apply_cdc_unwrap_key(sink_config: &Value, transforms: &mut [TransformSpec]) {
+    let keyed = matches!(
+        sink_config.get("write_mode").and_then(Value::as_str),
+        Some("upsert" | "delete")
+    );
+    let Some(Value::Array(key)) = sink_config.get("key") else {
+        return;
+    };
+    if !keyed || key.is_empty() || !key.iter().all(Value::is_string) {
+        return;
+    }
+    for t in transforms.iter_mut().filter(|t| t.kind == "cdc_unwrap") {
+        if t.config.is_null() {
+            t.config = Value::Object(serde_json::Map::new());
+        }
+        if let Value::Object(map) = &mut t.config
+            && !map.contains_key("key")
+        {
+            map.insert("key".into(), Value::Array(key.clone()));
+        }
+    }
 }
 
 /// The single top-level `reconcile:` count describes one dataset, and each
@@ -1736,9 +1787,10 @@ fn check_truncating_fan_out(nodes: &[ExpandedNode]) -> CliResult<()> {
 /// A local file sink writing one unnumbered file in a format that can only be
 /// rewritten whole to continue it, under a source that bookmarks — so the
 /// pipeline flushes — every page: each flush rewrites the file, so the run's
-/// time and I/O grow with the square of its size (#789 FILE-19). JSON Lines
-/// and raw text extend in place unless the whole file is sealed (encrypted
-/// and compressed). The sink warns again, per file, when it happens.
+/// time and I/O grow with the square of its size (#789 FILE-19). Uncompressed
+/// JSON Lines and raw text extend in place; a compressed file is rewritten so a
+/// crash never leaves a torn member in it (#862 M-088). The sink warns again,
+/// per file, when it happens.
 fn rewritten_file_warning(n: &ExpandedNode) -> Option<String> {
     if matches!(n.role, NodeRole::Discovery { .. })
         || !source_flushes_every_page(&n.source.kind, &n.source.config)
@@ -1784,13 +1836,13 @@ fn rewritten_file_warning(n: &ExpandedNode) -> Option<String> {
             .any(|ext| path.to_ascii_lowercase().ends_with(ext)),
         other => other != "none",
     };
-    let sealed_whole = cfg.get("encryption").is_some_and(|v| !v.is_null()) && compressed;
-    if line && !sealed_whole {
+    if line && !compressed {
         return None;
     }
     Some(format!(
         "row '{}': the {} source bookmarks every page, so the {} sink flushes '{path}' once per \
-         page and must rewrite it whole each time (its format can not be appended to) — the \
+         page and must rewrite it whole each time (a compressed or non-line file can not be \
+         appended to in place) — the \
          run's time and I/O grow with the square of the file's size; add `{{part}}` to the path \
          or set max_records_per_file / max_bytes_per_file",
         n.id, n.source.kind, n.sink.kind
@@ -1810,6 +1862,65 @@ fn source_flushes_every_page(kind: &str, cfg: &Value) -> bool {
         "file" => cfg.get("incremental").is_some_and(|v| !v.is_null()),
         _ => false,
     }
+}
+
+/// Refuse rows that `shard:` would break, where `shard:` takes effect (a
+/// `faucet serve --cluster` run with `shard.count >= 2`; `faucet run`,
+/// `validate` and `schedule` ignore it and only warn).
+///
+/// - An incrementally replicated, key-range sharded SQL source (#862 M-040):
+///   key ranges are re-planned every run while each shard keeps its own
+///   cursor, so a late row can land in a range whose shard is already past it.
+/// - A file or object destination (#862 M-096): every shard runs at once with
+///   the same sink config and the writers clobber each other's files.
+pub fn check_sharding(cfg: &PipelineConfig, nodes: &[ExpandedNode]) -> CliResult<()> {
+    if cfg.shard.as_ref().is_none_or(|s| s.count < 2) {
+        return Ok(());
+    }
+    for n in nodes
+        .iter()
+        .filter(|n| !matches!(n.role, NodeRole::Discovery { .. }))
+    {
+        if n.state.is_some() && pk_range_bookmarked(&n.source.kind, &n.source.config) {
+            return Err(CliError::Config(format!(
+                "row '{}': `shard:` cannot be combined with incremental replication on source \
+                 '{}' — key ranges are re-planned every run while each shard keeps its own \
+                 cursor, so a key range can move to a shard whose cursor is already past a \
+                 late row and that row is never read. Remove `shard:` or the incremental \
+                 replication setting",
+                n.id, n.source.kind
+            )));
+        }
+    }
+    check_sharded_file_sinks(nodes)
+}
+
+/// `shard:` runs every shard of a row at once with the same sink config, so a
+/// file or object destination would be written by several writers that
+/// clobber each other's scratch files and published objects (#862 M-096).
+fn check_sharded_file_sinks(nodes: &[ExpandedNode]) -> CliResult<()> {
+    for n in nodes
+        .iter()
+        .filter(|n| !matches!(n.role, NodeRole::Discovery { .. }))
+    {
+        if let Some(dest) = crate::registry::sink_shared_destination(&n.sink.kind, &n.sink.config) {
+            return Err(CliError::Config(format!(
+                "row '{}': `shard:` runs several shards of this row at once, all writing the {} \
+                 sink destination '{dest}' — they would overwrite each other's files. Write to a \
+                 database or keyed sink, or remove `shard:`",
+                n.id, n.sink.kind
+            )));
+        }
+    }
+    Ok(())
+}
+
+/// The id a partition chunk had before #840 zero-padded chunk ids to the
+/// width of the largest one, or `None` when it is the same as today's.
+fn legacy_partition_id(base: &str, chunk_id: &str, width: usize) -> Option<String> {
+    let index: usize = chunk_id.parse().ok()?;
+    let padded = format!("{index:0width$}");
+    (padded != chunk_id).then(|| format!("{base}::partition::{padded}"))
 }
 
 /// File-writing sinks must not share a destination (#743, #789 FILE-05): two
@@ -2191,6 +2302,14 @@ fn check_cleanup_completeness(
              rows the other chunks wrote"
         )));
     }
+    if crate::registry::source_reads_a_delta(&source.kind, &source.config) {
+        return Err(CliError::Config(format!(
+            "row '{row_id}': `complete_for.on_missing: delete` needs a complete fetch every run, \
+             but source '{}' reads only the messages that arrived since its last run, so its \
+             cleanup would delete every row in scope that did not arrive again",
+            source.kind
+        )));
+    }
     if has_state && crate::registry::source_resumes_from_bookmark(&source.kind, &source.config) {
         return Err(CliError::Config(format!(
             "row '{row_id}': `complete_for.on_missing: delete` needs a complete fetch every run, \
@@ -2383,6 +2502,99 @@ mod tests {
             kind: "cdc_unwrap".into(),
             config,
         }]
+    }
+
+    #[test]
+    fn sharding_an_incrementally_replicated_sql_source_is_refused() {
+        let yaml = |source: &str, shard: &str| {
+            format!(
+                r#"
+version: 1
+name: s
+{shard}
+pipeline:
+  source: {{ type: {source}, config: {{ connection_url: "postgres://u@h/db", query: "SELECT * FROM t WHERE ts >= ${{bookmark}} ORDER BY ts", shard: {{ key: id }}, replication: {{ type: incremental, column: ts, initial_value: 0 }} }} }}
+  sink: {{ type: postgres, config: {{ connection_url: "postgres://u@h/db", table_name: t2, column_mapping: auto_map, write_mode: upsert, key: [id] }} }}
+  state: {{ type: file, config: {{ path: ./state }} }}
+"#
+            )
+        };
+        let cfg = PipelineConfig::from_text(
+            &yaml("postgres", "shard: { count: 2 }"),
+            std::path::Path::new("t.yaml"),
+        )
+        .unwrap();
+        let nodes = expand(&cfg).expect("`faucet run` ignores `shard:`, so it only warns");
+        let err = check_sharding(&cfg, &nodes).unwrap_err().to_string();
+        assert!(err.contains("`shard:` cannot be combined"), "{err}");
+        let cfg = PipelineConfig::from_text(&yaml("postgres", ""), std::path::Path::new("t.yaml"))
+            .unwrap();
+        assert!(check_sharding(&cfg, &expand(&cfg).unwrap()).is_ok());
+        let one = PipelineConfig::from_text(
+            &yaml("postgres", "shard: { count: 1 }"),
+            std::path::Path::new("t.yaml"),
+        )
+        .unwrap();
+        assert!(check_sharding(&one, &expand(&one).unwrap()).is_ok());
+        assert!(pk_range_bookmarked(
+            "mysql",
+            &serde_json::json!({"replication": {"type": "incremental"}})
+        ));
+        assert!(!pk_range_bookmarked("mysql", &serde_json::json!({})));
+        assert!(!pk_range_bookmarked(
+            "s3",
+            &serde_json::json!({"replication_method": "incremental"})
+        ));
+    }
+
+    #[test]
+    fn cdc_unwrap_takes_the_keyed_sink_key_unless_it_sets_one() {
+        let sink = serde_json::json!({"write_mode": "upsert", "key": ["id", "region"]});
+        let mut ts = cdc_unwrap(serde_json::json!({}));
+        apply_cdc_unwrap_key(&sink, &mut ts);
+        assert_eq!(ts[0].config["key"], serde_json::json!(["id", "region"]));
+
+        let mut ts = cdc_unwrap(serde_json::Value::Null);
+        apply_cdc_unwrap_key(&sink, &mut ts);
+        assert_eq!(ts[0].config["key"], serde_json::json!(["id", "region"]));
+
+        let mut ts = cdc_unwrap(serde_json::json!({"key": ["other"]}));
+        apply_cdc_unwrap_key(&sink, &mut ts);
+        assert_eq!(ts[0].config["key"], serde_json::json!(["other"]));
+
+        for sink in [
+            serde_json::json!({"write_mode": "append", "key": ["id"]}),
+            serde_json::json!({"key": ["id"]}),
+            serde_json::json!({"write_mode": "upsert", "key": []}),
+            serde_json::json!({"write_mode": "upsert"}),
+            serde_json::json!({"write_mode": "delete", "key": [1]}),
+        ] {
+            let mut ts = cdc_unwrap(serde_json::json!({}));
+            apply_cdc_unwrap_key(&sink, &mut ts);
+            assert!(ts[0].config.get("key").is_none(), "{sink}");
+        }
+    }
+
+    #[test]
+    fn expand_derives_the_cdc_unwrap_key_from_the_sink() {
+        let cfg = PipelineConfig::from_text(
+            r#"
+version: 1
+name: m
+pipeline:
+  source: { type: postgres-cdc, config: { connection_url: "postgres://u@h/db", slot_name: s, publication_name: p } }
+  transforms: [ { type: cdc_unwrap } ]
+  sink: { type: postgres, config: { connection_url: "postgres://u@h/db", table_name: t, column_mapping: auto_map, write_mode: upsert, key: [id], delete_marker: { field: __op, values: [d] } } }
+  state: { type: file, config: { path: ./state } }
+"#,
+            std::path::Path::new("test.yaml"),
+        )
+        .unwrap();
+        let nodes = expand(&cfg).unwrap();
+        assert_eq!(
+            nodes[0].transforms[0].config["key"],
+            serde_json::json!(["id"])
+        );
     }
 
     #[test]
@@ -4228,6 +4440,30 @@ pipeline:
         );
     }
 
+    /// #862 M-096: shards run at once with one sink config, so a file or
+    /// object destination is refused where `shard:` takes effect.
+    #[test]
+    fn sharded_rows_may_not_share_a_file_destination() {
+        let run = |sink: &str| {
+            let yaml = format!(
+                "version: 1\nshard: {{ count: 2 }}\npipeline:\n  source: {{ type: sqlite, config: \
+                 {{ database_url: \"sqlite:/tmp/s.db\", query: \"SELECT 1\", shard: {{ key: id }} }} }}\n  \
+                 sink: {sink}\n"
+            );
+            let cfg = parse_with_extension(&yaml, "yaml").unwrap();
+            let nodes = expand(&cfg).expect("`faucet run` ignores `shard:`");
+            check_sharding(&cfg, &nodes)
+        };
+        let err = run(r#"{ type: file, config: { path: /tmp/m096/out.jsonl } }"#)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("`shard:`") && err.contains("out.jsonl"),
+            "{err}"
+        );
+        assert!(run(r#"{ type: stdout, config: {} }"#).is_ok());
+    }
+
     /// #789 FILE-19: a per-page-bookmarking source writing one unnumbered
     /// file in a format that is rewritten whole on every flush is warned
     /// about at load time; line formats, numbered templates, rollover caps
@@ -4250,7 +4486,6 @@ pipeline:
 
         for quiet in [
             r#"{ type: file, config: { path: /tmp/f19/out.jsonl } }"#,
-            r#"{ type: file, config: { path: /tmp/f19/out.jsonl.gz } }"#,
             r#"{ type: file, config: { path: "/tmp/f19/out-{part}.csv" } }"#,
             r#"{ type: file, config: { path: /tmp/f19/out.csv, max_records_per_file: 1000 } }"#,
             r#"{ type: file, config: { path: /tmp/f19/dir/, format: csv } }"#,
@@ -4279,6 +4514,14 @@ pipeline:
             )
             .is_some(),
             "a compressed line file sealed whole is rewritten"
+        );
+        assert!(
+            warn(
+                kafka,
+                r#"{ type: file, config: { path: /tmp/f19/out.jsonl.gz } }"#
+            )
+            .is_some(),
+            "a compressed line file is rewritten, never appended to in place"
         );
         assert_eq!(
             warn(
@@ -4330,6 +4573,20 @@ pipeline:
             &incremental
         ));
         assert!(!crate::registry::source_resumes_from_bookmark(
+            "postgres",
+            &serde_json::json!({})
+        ));
+        assert!(crate::registry::source_resumes_from_bookmark(
+            "singer",
+            &serde_json::json!({})
+        ));
+        for kind in ["sqs", "pubsub", "rabbitmq", "nats"] {
+            assert!(
+                crate::registry::source_reads_a_delta(kind, &serde_json::json!({})),
+                "{kind}"
+            );
+        }
+        assert!(!crate::registry::source_reads_a_delta(
             "postgres",
             &serde_json::json!({})
         ));
@@ -5022,6 +5279,17 @@ mod partition_tests {
         assert!(urls[0].contains("id_from=0&id_to=9"), "{:?}", urls[0]);
         assert!(urls[1].contains("id_from=10&id_to=19"), "{:?}", urls[1]);
         assert!(urls[2].contains("id_from=20&id_to=24"), "{:?}", urls[2]);
+    }
+
+    #[test]
+    fn legacy_partition_ids_restore_the_padding() {
+        assert_eq!(
+            legacy_partition_id("a", "3", 2).as_deref(),
+            Some("a::partition::03")
+        );
+        assert_eq!(legacy_partition_id("a", "12", 2), None);
+        assert_eq!(legacy_partition_id("a", "3", 1), None);
+        assert_eq!(legacy_partition_id("a", "2026-01", 2), None);
     }
 
     #[test]

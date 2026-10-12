@@ -103,7 +103,7 @@ The `tls` block governs encryption for both connection forms:
 
 | `type` | Fields | Behavior |
 |--------|--------|----------|
-| `auto_columns` | `on_unknown_field: warn \| drop \| error` | Top-level JSON keys map to same-named table columns. The column set is the **union** of keys across the batch (a field present only in a later record is still written; rows missing a column → SQL `NULL`). `IDENTITY` columns are skipped automatically. Keys with no matching column are handled by `on_unknown_field` (default `warn`). |
+| `auto_columns` | `on_unknown_field: warn \| drop \| error` | Top-level JSON keys map to same-named table columns. The column set is the **union** of keys across the batch (a field present only in a later record is still written; rows missing a column → SQL `NULL`). `IDENTITY` columns are skipped automatically. Fields match columns exactly, else ignoring case (SQL Server's default collation compares identifiers that way). Keys with no matching column are handled by `on_unknown_field` (default `warn`); a record matching **no** column is an error under every setting — `write_batch` fails, and `write_batch_partial` reports that row as failed so it reaches the DLQ. |
 | `json_column` | `column: <name>` | Each record is serialized to a JSON string inserted into a single `NVARCHAR(MAX)` (or native Azure SQL `JSON`) column. Schema-agnostic. Pair with `create_table: true` to create the table if absent. |
 
 ```yaml
@@ -255,7 +255,7 @@ With `isolate_row_failures: true` (default), a batch that fails is rolled back a
 
 `MssqlSink` implements `Sink::supports_idempotent_writes` (returns `true`) and the two companion hooks:
 
-- `write_batch_idempotent(records, scope, token)` — writes `records` and UPSERTs the `token` into a `_faucet_commit_token(scope NVARCHAR, token NVARCHAR)` watermark table inside the **same transaction** (respecting `transaction_per_batch`), so both commit together or neither does.
+- `write_batch_idempotent(records, scope, token)` — writes `records` and UPSERTs the `token` into a `_faucet_commit_token(scope NVARCHAR, token NVARCHAR)` watermark table inside the **same transaction** (respecting `transaction_per_batch`), so both commit together or neither does. A scope too long for the key column is stored as a shortened digest form; a watermark written under the form releases before faucet-core 1.13 used is still read, and the next commit moves it to the current form.
 - `last_committed_token(scope)` — reads the current watermark so the pipeline can skip already-committed pages on resume.
 
 To use effectively-once delivery, set `delivery: exactly_once` in the pipeline config and pair this sink with one of the CDC sources (`postgres-cdc`, `mysql-cdc`, `mongodb-cdc`) plus a `state:` block. A DLQ is not permitted in effectively-once mode. All four requirements are validated at config-load time (`faucet validate`) before any run starts. Effectively-once composes with `write_mode: upsert`.
@@ -288,12 +288,12 @@ See the [effectively-once delivery cookbook](https://faucet-hq.github.io/faucet-
 
 ## Schema evolution
 
-`MssqlSink` reports its live destination schema via `current_schema()` (read from `sys.columns`, including nullability), so the pipeline-level `schema:` policy can detect drift between an incoming page's top-level shape and the real table. All five `on_drift` modes (`warn` / `ignore` / `quarantine` / `fail` / `evolve`) work against this sink in `auto_columns` mode. In `json_column` mode the table's columns are not the record's fields, so the sink reports no schema and a `schema:` policy is inert.
+`MssqlSink` reports its live destination schema via `current_schema()` (read from `sys.columns`, including nullability), so the pipeline-level `schema:` policy can detect drift between an incoming page's top-level shape and the real table. All five `on_drift` modes (`warn` / `ignore` / `quarantine` / `fail` / `evolve`) work against this sink in `auto_columns` mode. An `NVARCHAR(MAX)` / `VARCHAR(MAX)` / `TEXT` / `NTEXT` column — where nested objects and arrays land as JSON text — also accepts object and array fields, so they are not reported as drift. In `json_column` mode the table's columns are not the record's fields, so the sink reports no schema and a `schema:` policy is inert.
 
 Under `on_drift: evolve`, `MssqlSink::evolve_schema()` applies additive DDL:
 
 - **New columns** → `ALTER TABLE … ADD`, guarded with `IF NOT EXISTS (SELECT 1 FROM sys.columns …)` (idempotent).
-- **Lossless widenings** (e.g. integer → number) → `ALTER COLUMN` to the wider type — gated on `allow_type_widening`.
+- **Lossless widenings** (e.g. integer → number) → `ALTER COLUMN` to the wider type — gated on `allow_type_widening`. An integer column that starts receiving fractions becomes `DECIMAL(38,10)` (exact for every `BIGINT`; `FLOAT` would round stored values above 2^53), and the statement re-states the column's current `NULL` / `NOT NULL` so the session's `ANSI_NULL_DFLT` setting cannot flip it.
 - **Nullability relaxations** → `ALTER COLUMN … NULL`. MSSQL's `ALTER COLUMN` requires the full type spec, so the column's exact declared type is re-stated from `sys.columns` — length, precision, scale and collation (`DECIMAL(38,10)`, `DATETIME2(3)`, `VARCHAR(20) COLLATE …`) — and only its nullability changes. A column whose type cannot be re-stated (CLR types) fails the evolution instead of being rewritten.
 
 After an evolution the cached AutoColumns set is dropped so the next write re-discovers any newly-added column. Incompatible changes (narrowing / type swaps) are never auto-applied — they are routed by `on_incompatible` (`fail` or `quarantine`). See the [schema-drift cookbook](https://faucet-hq.github.io/faucet-stream/cookbook/schema-drift.html).

@@ -89,7 +89,7 @@ Flags:
 | `--param-env <NAME[=VALUE]>` | Override an environment variable for this run's `${env:VAR}` resolution only. Bare `NAME` takes the value from the caller's environment (so a secret stays out of the process arguments). The process environment is not modified. Repeatable. |
 | `--source <id\|path> --sink <id\|path>` | Template Hub: compose a `source-template` with a `sink-template` and run the result instead of loading a config file. Ids resolve under `--hub` / `$FAUCET_HUB` / `./hub`. See [`hub`](#hub). |
 | `--source-hub` / `--sink-hub` / `--overlay-hub <hub>` | Look that side up in its own hub (e.g. a private source catalog next to the public sinks). See [`hub`](#hub). |
-| `--trust <owner\|id>` | Let hub templates from that owner (or that template id) use `${env:}` / `${file:}` / secret directives. A template outside `faucet-hq` that reads this machine's environment, files or secrets is refused otherwise — pass credentials to it with `--param` / `--param-env`. Repeatable; `'*'` trusts all. |
+| `--trust <owner\|id>` | Let hub templates from that owner (or that template id) use `${env:}` / `${file:}` / secret directives. A template outside `faucet-hq` (or from any hub other than `faucet-hq/template-hub`) that reads this machine's environment, files or secrets is refused otherwise — pass credentials to it with `--param` / `--param-env`. Repeatable; `'*'` trusts all. |
 | `--overlay <id\|path>` | With `--source` / `--sink`: apply a `kind: deployment` overlay — state, DLQ, notifications, SLA and other operational blocks — over the composition. A path, or an id under `<hub>/deployments/`. See [Deployment overlays](../cookbook/template-hub.md#deployment-overlays). |
 | `--tui` | Show a live full-screen terminal UI while the pipeline runs: per-invocation source→sink route, records in/out, records/s, errors, DLQ counts, bookmark age, and a scrolling log pane. Press `q` (or `Ctrl-C`) to cancel cooperatively — in-flight invocations stop at their next page boundary and flush their sinks, and the command exits 130. Requires a binary built with the `cli-tui` feature (`cargo install faucet-cli --features cli-tui`); on a non-TTY stdout (CI, pipes) the flag logs a notice and runs normally. When the config has an `observability.prometheus` block, the `/metrics` endpoint stays up alongside the TUI; OTLP *metrics* export is skipped under `--tui` (traces are unaffected). |
 | `--quiet` | Suppress the inline live progress line. |
@@ -612,6 +612,11 @@ panics is reported as a failed probe.
   `PING`, `tables.get`, cluster health, `fetch_metadata`, or a directory-writable
   check for file sinks. Never a real write.
 - **State stores** do a sentinel `put`/`get`/`delete` that leaves no residue.
+- **Auth** (one `persist` probe per `oauth2_refresh` provider with a `persist:`
+  block) fails when the provider's rotated refresh token is stored only under
+  the key earlier releases used, which this version does not read; the message
+  names the key to set as `persist.key`. `faucet validate` prints the same as an
+  `auth: WARNING` (and `auth_warnings` under `--json`).
 - **SLA** (when a top-level [`sla:` block](config.md#sla) is configured) reads the
   persisted run history and reports staleness of the last successful run vs
   `max_staleness_secs` and volume-baseline warm-up state — read-only.
@@ -698,15 +703,16 @@ fail again go to a *fresh* DLQ, never back to the source.
 | `--env-file <path>` / `--no-env-file` / `--profile <name>` | Same config-load handling as `run`. |
 
 **`faucet dlq discard <location>`** — remove processed envelopes from the
-backlog. The DLQ file is never rewritten (a running pipeline may be appending
+backlog. The DLQ file is not rewritten (a running pipeline may be appending
 to it): discarded envelopes are listed in a `<file>.discarded` sidecar that
-every reader skips.
+every reader skips, and their payloads stay on disk until `--purge`.
 
 | Flag | Effect |
 |------|--------|
 | `--reason <r>` | Only discard envelopes with this reason. |
 | `--before <when>` | Only discard envelopes older than an RFC 3339 timestamp or a relative age (`7d` / `24h` / `30m`). |
 | `--delete` | Only record the discard, without copying the envelopes to a `<file>.archived` sibling. |
+| `--purge` | Physically remove every discarded envelope from the DLQ files (implies `--delete`). Without it a discarded envelope's payload stays on disk, hidden from readers — use `--purge` to remove data that must not be kept. Rewrites each file atomically and refuses a file that changes meanwhile, so run it while nothing writes the DLQ. An encrypted file is re-sealed (fresh header and integrity trailer, current key), which needs `--encryption-key`. |
 | `--encryption-key <k>` | Key for a sealed DLQ (repeatable). Kept/archived lines stay sealed verbatim; decryption happens only in memory for filtering. |
 | `--encryption-key-file <path>` | Read a DLQ key from a file (repeatable). `FAUCET_DLQ_ENCRYPTION_KEY` also supplies `--encryption-key`; both keep the key out of `ps` and shell history. Keys are redacted from faucet's output. |
 | `--json` | Emit a JSON result. |
@@ -1167,7 +1173,7 @@ the generated [source × sink matrix](./template-hub-matrix.md).
 | `--source <id\|path>` / `--sink <id\|path>` | The pairing. A path is used as-is; an id resolves to `<hub>/source-templates/<id>.yaml` / `<hub>/sink-templates/<id>.yaml`, where `id` is `owner/name` (a community template under `source-templates/<owner>/`) or a bare `name` (shorthand for the official `faucet-hq/name`). An optional `@stable` (default) / `@newest` / `@N` selects a catalog version when the hub's `index.json` records history. |
 | `--hub <dir\|github:owner/repo[@ref][/path]\|URL>` | Where ids resolve. A directory, or a GitHub repository laid out like `hub/` (`github:faucet-hq/template-hub`, `github:acme/catalog@v2/hub`, `https://github.com/acme/catalog/tree/main/hub`), fetched through the GitHub contents API and cached under `~/.cache/faucet/hub/` pinned to the ref's commit — one request per run when unchanged, the cached snapshot with a warning when offline (`FAUCET_HUB_OFFLINE=1` skips the network). `GITHUB_TOKEN` is used when set, and `FAUCET_GITHUB_TOKEN_<OWNER>` (owner upper-cased, `-` → `_`) takes precedence for that owner's repositories. Repeat `--hub` (or separate with commas, also in `$FAUCET_HUB`) to search several hubs in order: a bare id resolves in the first hub that has it, and a miss names every hub searched. Default: `$FAUCET_HUB`, else `./hub` when it exists, else the public hub `github:faucet-hq/template-hub`. |
 | `--source-hub` / `--sink-hub` / `--overlay-hub <hub>` | *(run / validate / compose / check)* Look up that side in its own hub instead of the `--hub` list. A single locator can also name its hub inline: `--source github:acme/private-hub:acme/erp` (hub, colon, id). The composed config's header comment records which hub each side came from. |
-| `--trust <owner\|id>` | *(run / validate / compose / check)* Allow a community template (owner outside `faucet-hq`) to use `${env:}` / `${file:}` / secret directives; without it such a template is refused. Repeatable; `'*'` trusts all. |
+| `--trust <owner\|id>` | *(run / validate / compose / check)* Allow a community template (owner outside `faucet-hq`, or any template from a hub other than `faucet-hq/template-hub`) to use `${env:}` / `${file:}` / secret directives; without it such a template is refused. Repeatable; `'*'` trusts all. |
 | `--sort name\|stars\|updated` | *(list)* Order by id, by stars (most starred first), or by the newest version's date. Stars, dates and open issues come from the catalog's `index.json` (`trust`) and are shown as columns; `--json` includes each entry's `trust` block. |
 | `--overlay <id\|path>` | *(compose / check, and `run` / `validate`)* A `kind: deployment` overlay applied over the pairing: a path, or an id under `<hub>/deployments/`. `check` also verifies every stream it names exists; `lint` accepts deployment files and flags literal credentials. |
 | `--out <file>` | *(compose / matrix)* Write to a file instead of stdout. |
@@ -1386,7 +1392,7 @@ Selected flags (`faucet serve --help` for the full list):
 | `--log-link-template <url>` | Link to a run's logs in the log service, shown in the console and returned by the log endpoint once the local copy aged out. Placeholders `{run_id} {pipeline} {row} {tenant} {started_at} {ended_at}` (env `FAUCET_SERVE_LOG_LINK_TEMPLATE`). |
 | `--log-export-notify-after-secs <n>` | Emit `log_export_failed` once a run's log export has been failing this long (default `300`). |
 | `--triggers <path>` | Path to a YAML triggers file that defines event-driven watchers (object-arrival / webhook / queue-depth). Requires the `triggers` Cargo feature. See [Triggers reference](./triggers.md). |
-| `--require-approval <kind>` | Require an approved [change request](../cookbook/approvals.md) before these actions happen: `run` (`POST /v1/runs` and template triggers answer with a pending request; backfills are refused), `template_register`, `template_launch`. Repeatable or comma-separated. Who may approve is the `approvals:` block of `--auth-config`. The template kinds gate the lifecycle routes and MCP tools (`409`) and cannot be combined with `--templates-sync`. |
+| `--require-approval <kind>` | Require an approved [change request](../cookbook/approvals.md) before these actions happen: `run` (`POST /v1/runs` and template triggers answer with a pending request; backfills are refused), `template_register`, `template_launch`, `template_delete`, `template_deprecate` (the last two are also gated by `template_launch`). Repeatable or comma-separated. Who may approve is the `approvals:` block of `--auth-config`. The template kinds gate the lifecycle routes and MCP tools (`409`); `template_register`, `template_launch` and `template_deprecate` cannot be combined with `--templates-sync`. |
 | `--approval-expiry-secs <n>` | How long a pending change request stays approvable when `approvals.expire_secs` does not say. Default `86400`. |
 | `--vault-key <key>` | Key that seals tenant connection credentials at rest (AES-256-GCM; env `FAUCET_VAULT_KEY`). At least 32 bytes of random key material (`openssl rand -hex 32`); a shorter key is refused at startup. Each sealed value is bound to its owner (tenant + connection), so a row copied onto another record does not open. Without it the server refuses to store or open [tenant connections](../cookbook/embedded-integrations.md). Requires the `tenants` feature. |
 | `--vault-previous-key <key>` | A previous vault key, tried when opening credentials sealed before a rotation; never used to seal. Repeatable. Env: `FAUCET_VAULT_PREVIOUS_KEYS`, a comma-separated list, which keeps the keys out of the process arguments. |

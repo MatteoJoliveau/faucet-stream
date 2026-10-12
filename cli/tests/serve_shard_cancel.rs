@@ -148,7 +148,7 @@ async fn cancel_stops_unstarted_shards_and_the_run_ends_cancelled() {
 
 /// A source-sharded run submitted to a cluster runs every shard and ends
 /// `completed`, its log stream closing once the last local shard finishes.
-#[cfg(all(feature = "source-sqlite", feature = "sink-jsonl"))]
+#[cfg(all(feature = "source-sqlite", feature = "sink-stdout"))]
 #[tokio::test]
 async fn a_sharded_run_completes_across_its_shards() {
     let dir = tempfile::tempdir().unwrap();
@@ -192,13 +192,11 @@ async fn a_sharded_run_completes_across_its_shards() {
         }
         tokio::time::sleep(Duration::from_millis(25)).await;
     }
-    let out = dir.path().join("out-{shard}.jsonl");
     let yaml = format!(
         "version: 1\nname: sharded\nshard: {{ count: 2 }}\npipeline:\n  \
          source: {{ type: sqlite, config: {{ database_url: \"sqlite:{}\", query: \"SELECT id, v FROM t\", shard: {{ key: id }} }} }}\n  \
-         sink: {{ type: jsonl, config: {{ path: \"{}\" }} }}\n",
+         sink: {{ type: stdout, config: {{}} }}\n",
         db.display(),
-        out.display()
     );
     let resp: serde_json::Value = client
         .post(format!("{base}/v1/runs"))
@@ -227,4 +225,56 @@ async fn a_sharded_run_completes_across_its_shards() {
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
     assert_eq!(status, "completed");
+}
+
+/// Review of #868 (cli F9): `shard:` takes effect only in a cluster, so the
+/// sharding refusals (a shared file destination here) apply at a cluster
+/// submission, while `faucet run` loads the same config and runs it whole.
+#[cfg(all(feature = "source-sqlite", feature = "sink-file"))]
+#[tokio::test]
+async fn a_cluster_refuses_a_sharded_run_that_sharding_would_break() {
+    let dir = tempfile::tempdir().unwrap();
+    let yaml = format!(
+        "version: 1\nname: shared\nshard: {{ count: 2 }}\npipeline:\n  \
+         source: {{ type: sqlite, config: {{ database_url: \"sqlite:{}\", query: \"SELECT 1 AS id\", shard: {{ key: id }} }} }}\n  \
+         sink: {{ type: file, config: {{ path: \"{}\" }} }}\n",
+        dir.path().join("src.db").display(),
+        dir.path().join("out.jsonl").display(),
+    );
+    let cfg = faucet_cli::config::PipelineConfig::from_text(&yaml, std::path::Path::new("s.yaml"))
+        .unwrap();
+    let nodes = faucet_cli::expand::expand(&cfg).expect("outside a cluster `shard:` only warns");
+    assert!(faucet_cli::expand::check_sharding(&cfg, &nodes).is_err());
+
+    let url = format!("sqlite:{}", dir.path().join("h.db").display());
+    let port = free_port();
+    let mut config = faucet_cli::serve::ServeConfig::from_args(args(port, url)).unwrap();
+    config.log_level = "warn".into();
+    tokio::spawn(async move {
+        let _ = faucet_cli::serve::run_server(config, Default::default()).await;
+    });
+    let client = reqwest::Client::new();
+    let base = format!("http://127.0.0.1:{port}");
+    for _ in 0..1200 {
+        if client
+            .get(format!("{base}/healthz"))
+            .send()
+            .await
+            .map(|r| r.status().is_success())
+            .unwrap_or(false)
+        {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    let r = client
+        .post(format!("{base}/v1/runs"))
+        .json(&serde_json::json!({ "config": yaml }))
+        .send()
+        .await
+        .unwrap();
+    let status = r.status().as_u16();
+    let body: serde_json::Value = r.json().await.unwrap();
+    assert_eq!(status, 422, "{body}");
+    assert!(body.to_string().contains("`shard:`"), "{body}");
 }

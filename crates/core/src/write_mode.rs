@@ -252,7 +252,54 @@ enum Action {
 /// Partition `page` into upserts + deletes per `spec`. The single place all six
 /// sinks share. `WriteMode::Append` should never reach here (callers route
 /// append separately); if it does, every row is treated as an upsert.
+///
+/// Keys deduplicate the way a typed SQL key column compares them: `7`, `7.0`
+/// and `"7"` are one key. A sink that keeps those apart (a document store
+/// matching on the JSON value) uses [`plan_writes_exact`].
 pub fn plan_writes(page: &[Value], spec: &WriteSpec) -> WritePlan {
+    plan_writes_by(page, spec, canonical)
+}
+
+/// [`plan_writes`] deduplicating only keys a document store treats as equal:
+/// `7` and `"7"` stay two rows, while numbers compare by value, so `7` and
+/// `7.0` are one — as a document store's `_id` match does (#862 M-018).
+pub fn plan_writes_exact(page: &[Value], spec: &WriteSpec) -> WritePlan {
+    plan_writes_by(page, spec, |k| {
+        let values: Vec<Value> = k.0.iter().map(|(_, v)| numeric_value(v)).collect();
+        crate::util::canonical_json(&Value::Array(values))
+    })
+}
+
+/// `v` with every whole float written as the integer it equals, so numbers
+/// compare by value; other values are unchanged.
+fn numeric_value(v: &Value) -> Value {
+    match v {
+        Value::Number(n) if n.is_f64() => {
+            let f = n.as_f64().unwrap_or(f64::NAN);
+            let whole = f.is_finite() && f.fract() == 0.0;
+            if whole && f >= i64::MIN as f64 && f < i64::MAX as f64 {
+                Value::from(f as i64)
+            } else if whole && f >= 0.0 && f < u64::MAX as f64 {
+                Value::from(f as u64)
+            } else {
+                v.clone()
+            }
+        }
+        Value::Array(items) => Value::Array(items.iter().map(numeric_value).collect()),
+        Value::Object(map) => Value::Object(
+            map.iter()
+                .map(|(k, v)| (k.clone(), numeric_value(v)))
+                .collect(),
+        ),
+        _ => v.clone(),
+    }
+}
+
+fn plan_writes_by(
+    page: &[Value],
+    spec: &WriteSpec,
+    canonical: impl Fn(&KeyTuple) -> String,
+) -> WritePlan {
     debug_assert!(
         matches!(spec.write_mode, WriteMode::Upsert | WriteMode::Delete),
         "plan_writes is only for Upsert/Delete — Append and Overwrite are routed separately"
@@ -301,6 +348,35 @@ pub fn plan_writes(page: &[Value], spec: &WriteSpec) -> WritePlan {
     plan
 }
 
+/// Split a keyed page into runs of consecutive upserts or deletes and plan
+/// each run, so the runs apply in page order. One [`plan_writes`] over the
+/// whole page applies every upsert before every delete; when a delete and a
+/// later upsert address keys that differ in JSON but are equal under the
+/// destination's collation (`"Bob"` / `"bob"`), that order deletes the row the
+/// page re-inserted. Rows with no usable key are left out — the caller reports
+/// them from its own [`plan_writes`] over the page.
+pub fn plan_writes_ordered(page: &[Value], spec: &WriteSpec) -> Vec<WritePlan> {
+    let mut plans = Vec::new();
+    let mut run: Vec<Value> = Vec::new();
+    let mut run_is_delete = None;
+    for rec in page {
+        let single = plan_writes(std::slice::from_ref(rec), spec);
+        if !single.failed.is_empty() {
+            continue;
+        }
+        let is_delete = !single.deletes.is_empty();
+        if run_is_delete.is_some_and(|d| d != is_delete) {
+            plans.push(plan_writes(&std::mem::take(&mut run), spec));
+        }
+        run_is_delete = Some(is_delete);
+        run.push(rec.clone());
+    }
+    if !run.is_empty() {
+        plans.push(plan_writes(&run, spec));
+    }
+    plans
+}
+
 /// The key tuple of a record in `key` order, or `None` when a key column is
 /// missing or null — the same rule [`plan_writes`] applies.
 pub fn record_key(rec: &Value, key: &[String]) -> Option<KeyTuple> {
@@ -342,14 +418,13 @@ fn strip_marker(mut rec: Value, marker: Option<&DeleteMarker>) -> Value {
 
 /// Stable canonical string for a key tuple, for dedup. Scalars compare by
 /// their text, as a database compares a key column, so `7`, `7.0` and `"7"`
-/// are one key (the rule `rollback::canonical_key` applies, plus integral
-/// floats).
+/// are one key — the rule `rollback::canonical_key` applies too.
 fn canonical(k: &KeyTuple) -> String {
     let arr: Vec<String> = k.0.iter().map(|(_, v)| key_scalar_text(v)).collect();
     serde_json::to_string(&arr).expect("a Vec<String> always serializes")
 }
 
-fn key_scalar_text(v: &Value) -> String {
+pub(crate) fn key_scalar_text(v: &Value) -> String {
     match v {
         Value::String(s) => s.clone(),
         Value::Number(n) => match n.as_f64() {
@@ -403,6 +478,66 @@ mod tests {
     use super::*;
     use serde_json::json;
 
+    #[test]
+    fn exact_planning_keeps_keys_of_different_json_types_apart() {
+        let spec = WriteSpec {
+            write_mode: WriteMode::Upsert,
+            key: vec!["id".into()],
+            ..Default::default()
+        };
+        let page = vec![
+            json!({"id": 7, "v": "a"}),
+            json!({"id": "7", "v": "b"}),
+            json!({"id": 7, "v": "c"}),
+        ];
+        let exact = plan_writes_exact(&page, &spec);
+        assert_eq!(
+            exact.upserts,
+            vec![json!({"id": 7, "v": "c"}), json!({"id": "7", "v": "b"})]
+        );
+        assert_eq!(
+            plan_writes(&page, &spec).upserts,
+            vec![json!({"id": 7, "v": "c"})]
+        );
+    }
+
+    #[test]
+    fn exact_planning_compares_numbers_by_value() {
+        let spec = WriteSpec {
+            write_mode: WriteMode::Upsert,
+            key: vec!["id".into()],
+            ..Default::default()
+        };
+        let page = vec![
+            json!({"id": 7, "v": 1}),
+            json!({"id": 7.0, "v": 2}),
+            json!({"id": 7.5, "v": 3}),
+            json!({"id": {"a": [1.0]}, "v": 4}),
+            json!({"id": {"a": [1]}, "v": 5}),
+            json!({"id": 9_007_199_254_740_993_u64, "v": 6}),
+            json!({"id": 9_007_199_254_740_992.0, "v": 7}),
+            json!({"id": 1.8e19, "v": 8}),
+            json!({"id": 1e300, "v": 9}),
+        ];
+        let v: Vec<Value> = plan_writes_exact(&page, &spec)
+            .upserts
+            .iter()
+            .map(|r| r["v"].clone())
+            .collect();
+        assert_eq!(
+            v,
+            vec![
+                json!(2),
+                json!(3),
+                json!(5),
+                json!(6),
+                json!(7),
+                json!(8),
+                json!(9)
+            ]
+        );
+    }
+
     /// An object inserted in reverse-sorted key order (#817).
     fn login_then_id() -> Value {
         let mut m = serde_json::Map::new();
@@ -425,6 +560,34 @@ mod tests {
             delete_marker: None,
             rollback: None,
         }
+    }
+
+    #[test]
+    fn ordered_plans_keep_page_order_across_upsert_delete_runs() {
+        let spec = WriteSpec {
+            write_mode: WriteMode::Upsert,
+            key: vec!["name".into()],
+            delete_marker: Some(DeleteMarker {
+                field: "op".into(),
+                values: vec!["d".into()],
+            }),
+            rollback: None,
+        };
+        let page = vec![
+            json!({"name": "Bob", "op": "d"}),
+            json!({"name": "bob", "v": 1}),
+            json!({"name": "carl", "v": 2}),
+            json!({"v": 3}),
+            json!({"name": "dee", "op": "d"}),
+        ];
+        let plans = plan_writes_ordered(&page, &spec);
+        let shape: Vec<(usize, usize)> = plans
+            .iter()
+            .map(|p| (p.upserts.len(), p.deletes.len()))
+            .collect();
+        assert_eq!(shape, vec![(0, 1), (2, 0), (0, 1)]);
+        assert!(plans.iter().all(|p| p.failed.is_empty()));
+        assert!(plan_writes_ordered(&[], &spec).is_empty());
     }
 
     #[test]

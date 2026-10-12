@@ -298,7 +298,7 @@ When a `StateStore` is wired in (via `state:` in YAML, or `Pipeline::with_state_
 
 The bookmark records an offset for **every assigned partition**, not just those that produced a message this run. An empty-this-run partition is recorded at the consumer's current position; if it were omitted, the next resume would fall back to `auto_offset_reset` (default `latest`) and silently **skip** records that arrived meanwhile. A partition that has *never* been assigned (e.g. added to the topic after the last run) honours `auto_offset_reset` on first encounter. A bookmarked partition that has not delivered yet in this run keeps its bookmarked offset — the watermark the assignment resolved only seeds partitions nothing else knows about.
 
-**A bookmark that fell out of retention.** When a bookmarked offset is below the partition's log start (retention deleted those records while the pipeline was down), the source resumes at the log start and logs a `WARN` naming how many bookmarked records were deleted — it never lets librdkafka reset the partition to `auto_offset_reset` (default `latest`), which would also skip the still-retained backlog.
+**A bookmark that fell out of retention.** When a bookmarked offset is below the partition's log start (retention deleted those records while the pipeline was down), the source resumes at the log start and logs a `WARN` naming how many bookmarked records were deleted — it never lets librdkafka reset the partition to `auto_offset_reset` (default `latest`), which would also skip the still-retained backlog. In group-member mode (`shard:`) the same applies to the group's committed offset: a partition whose committed offset is below the log start resumes at the log start, with the same `WARN`.
 
 **Rebalances during a run.** Outside cluster member mode nothing is committed to the consumer group, so a rebalance after the first one (another consumer joining the same `group_id`, a session-timeout rejoin) re-seeks each re-assigned partition from the start bookmark advanced by what this run already delivered, instead of restarting it at `auto_offset_reset`.
 
@@ -328,6 +328,23 @@ so counting pages is not enough. The commit token an idempotent sink stores
 embeds the page's offsets bookmark; on resume the pipeline recovers that exact
 position from the sink's watermark and re-anchors the consumer there — nothing
 is re-written, nothing is skipped.
+
+In a [topology](https://faucet-hq.github.io/faucet-stream/cookbook/topology.html#exactly-once-delivery)
+with several sinks, the source orders its bookmarks per partition (a bookmark
+is at or before another when every partition's offset is), so sinks that
+committed different positions resume by position: the source restarts from the
+per-partition minimum and each sink ahead drops, record by record, what its own
+position already covers (by the record's `topic` / `partition` / `offset`). Two
+bookmarks over different partition sets cannot be ordered, and such a resume
+fails rather than guess.
+
+The drop happens at each sink node, after every transform node, so the records
+must still carry `topic`, `partition` and `offset` when they reach the sink.
+`faucet validate` refuses an exactly-once graph whose transform nodes can remove
+or change those fields (a `select` that omits them, a `drop`, `cdc_unwrap`,
+`sql`, …) unless every sink writes with `write_mode: upsert` + `key`; a replayed
+record that reaches an append sink without them fails the run rather than being
+written twice.
 
 Pair with any idempotent sink (`postgres`, `mysql`, `mssql`, `sqlite`,
 `bigquery`, `iceberg`, `kafka`, `snowflake`, `redis`, `mongodb`) and a durable

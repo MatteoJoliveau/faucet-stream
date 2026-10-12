@@ -7,6 +7,13 @@
 
 PostgreSQL **sink** connector for the [faucet-stream](https://github.com/faucet-hq/faucet-stream) ecosystem. Writes JSON records to a Postgres table over a pooled `sqlx` connection, batching them into multi-row `INSERT` statements for high throughput.
 
+> **Upgrading from 1.8.1 or earlier — `binary_encoding` now defaults to `base64`.**
+> A string written to a `bytea` column is decoded from base64 (how every faucet
+> source emits binary). Plain text written there used to be stored as is; it now
+> fails its row — routed to the DLQ when a `dlq:` block is configured, otherwise
+> failing the write. Set `binary_encoding: text` for columns fed plain text, or
+> `binary_encoding: auto` for the previous per-value behaviour.
+
 Reach for it whenever you want to land a faucet-stream source — a REST API, a CDC stream, a file, a queue — into Postgres with one declarative config and no glue code. Store records verbatim as a single `jsonb` column for schemaless ingestion, or map JSON keys straight onto typed table columns. With `write_mode: upsert` and a CDC source it becomes a live mirror; with `delivery: exactly_once` it commits records and a watermark in one transaction.
 
 ## Feature highlights
@@ -75,6 +82,7 @@ faucet run pipeline.yaml
 | `batch_size` | int | `1000` | Maximum rows per multi-row `INSERT` (or per `COPY` under `write_method: copy`). **`0` = no batching** — the whole page is sent in one statement. See [Streaming & batching](#streaming--batching). |
 | `max_connections` | int | `5` | Maximum connections in the `sqlx` pool. |
 | `write_method` | `"insert" \| "copy"` | `"insert"` | How append-mode rows are shipped. `copy` uses the `COPY … FROM STDIN` bulk-load fast-path — see [Bulk load](#bulk-load-write_method-copy). |
+| `binary_encoding` | `"base64"` \| `"text"` \| `"auto"` | `"base64"` | How a string written to a `bytea` column becomes bytes. `base64` decodes every value — how every faucet source emits binary — and fails the row when one is not base64; `text` stores every string's own bytes; `auto` decodes canonical base64, passes `\x…` hex through and stores any other string as text, so a text value that happens to be valid base64 (`"user"`, a hex digest) is decoded. Applies to the insert, `COPY` and key paths. **Upgrading:** before this default changed (it was `auto`), plain text or `\x…` hex written into `bytea` was stored as is; such pipelines now fail those rows — set `binary_encoding: text` (plain text) or `auto` (the old behaviour). |
 | `write_timeout_secs` | int | `3600` | Longest one page write may wait on the server before it fails. A server that vanishes without closing the connection (failover, NAT or load-balancer idle eviction) would otherwise hang the run forever. `0` waits forever. |
 
 ### Write mode
@@ -125,7 +133,7 @@ sink:
 
 Discovers column names and types from the table schema and maps matching JSON keys. A field present only in some records is still written; on an append, rows missing a column bind SQL `NULL`. An **upsert** writes each row's own columns only, so a column a row omits keeps its stored value (a postgres-cdc event leaves an unchanged TOAST column out of `after`, and the mirror keeps it).
 
-A `bytea` column takes a **base64** string — how every faucet source emits binary — as its decoded bytes. A string already in Postgres's `\x…` hex form, or one that is not valid base64, is bound as before.
+A `bytea` column takes a **base64** string — how every faucet source emits binary — as its decoded bytes; a value that is not base64 fails its row (DLQ-routable). Set `binary_encoding: text` for a column fed plain text, or `auto` to decode only values that look like base64 and pass `\x…` hex and other strings through.
 
 ```sql
 CREATE TABLE events (
@@ -423,6 +431,7 @@ This crate has no optional features of its own; enable it in the CLI/umbrella vi
 | Wrong table picked up | A same-named table exists in another schema on the `search_path`. Set `schema:` explicitly to disambiguate. |
 | Statement rejected with too many parameters | Hit the 65 535 bind-parameter ceiling. AutoMap auto-splits to stay under it; if you still see this, lower `batch_size` (very wide tables). |
 | Missing/null key rows fail the whole batch | Without a `dlq:` block, a row missing a key column aborts the batch. Configure a DLQ to route just the bad rows, or ensure keys are present and non-null. |
+| `binary_encoding: base64 — value is not base64` | A `bytea` column received plain text or `\x…` hex. Since `base64` became the default, set `binary_encoding: text` for plain text or `auto` for the previous per-value behaviour. |
 | Effectively-once config rejected at validate | Effectively-once requires a CDC source + idempotent sink + `state:` block + no `dlq:`. `faucet validate` names the missing requirement. |
 
 ## See also
@@ -489,7 +498,11 @@ carry (`OVERRIDING SYSTEM VALUE`), and records that omit them get values from
 the table's own sequence. A target other tables reference by foreign key is
 emptied with `DELETE` under deferred constraints instead of `TRUNCATE` (which
 PostgreSQL refuses): children that reference a key the run brings back stay
-valid, any other reference fails the swap. A reference with `ON DELETE CASCADE`,
+valid, any other reference fails the swap. Deferring only reaches a foreign key
+declared `DEFERRABLE` (with `ON DELETE NO ACTION`); a default (`NOT DEFERRABLE`)
+or `ON DELETE RESTRICT` key is checked the moment the rows are deleted, so a
+target referenced by one whose table holds references is refused before the run
+loads anything — declare the key `DEFERRABLE`, or use `write_mode: upsert`. A reference with `ON DELETE CASCADE`,
 `SET NULL` or `SET DEFAULT` is refused before the run loads anything, because
 replacing the rows would change the referencing table.
 

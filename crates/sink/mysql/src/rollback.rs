@@ -7,7 +7,7 @@
 //! cannot span it — the rename itself is the atomic unit, as in the swap).
 
 use crate::config::MysqlColumnMapping;
-use crate::sink::{MysqlSink, bind_value, quote_ident_mysql, scope_key};
+use crate::sink::{MysqlSink, bind_value, legacy_scope_key, quote_ident_mysql, scope_key};
 use faucet_core::FaucetError;
 use faucet_core::rollback::{
     JournalEntry, JournalSql, RollbackMode, RollbackOptions, RollbackOutcome, key_json, plan_keys,
@@ -59,7 +59,8 @@ impl JournalColumn {
     }
 
     /// The value as it goes into the before-image, typed so the restore binds
-    /// it back exactly: binary as base64 (the form every faucet source emits,
+    /// it back exactly: binary as unwrapped base64 (`TO_BASE64` breaks lines
+    /// every 76 characters; the form every faucet source emits,
     /// decoded by the insert path for binary columns), BIT as its unsigned
     /// integer, DECIMAL as its exact text — `JSON_OBJECT` alone renders binary
     /// as `"base64:typeNN:…"` text and DECIMAL as a JSON number that is parsed
@@ -68,7 +69,7 @@ impl JournalColumn {
         let q = quote_ident_mysql(&self.name);
         match self.data_type.as_str() {
             "binary" | "varbinary" | "tinyblob" | "blob" | "mediumblob" | "longblob" => {
-                format!("TO_BASE64({q})")
+                format!("REPLACE(TO_BASE64({q}), CHAR(10 USING ascii), '')")
             }
             "bit" => format!("CAST({q} AS UNSIGNED)"),
             "decimal" => format!("CAST({q} AS CHAR)"),
@@ -457,8 +458,13 @@ impl MysqlSink {
         let restored = if restores.is_empty() {
             0
         } else {
-            self.insert_auto_map_with_conflict(&mut *conn, &restores, Some(key))
-                .await? as u64
+            self.insert_auto_map_with_conflict(
+                &mut *conn,
+                &restores,
+                Some(key),
+                crate::config::BinaryEncoding::Base64,
+            )
+            .await? as u64
         };
         sqlx::query(&journal_sql().delete_table())
             .bind(run_id)
@@ -478,7 +484,7 @@ impl MysqlSink {
     /// Swap the kept previous table back with one atomic `RENAME TABLE`.
     async fn rollback_overwrite(
         &self,
-        conn: &mut MySqlConnection,
+        conn: &mut sqlx::pool::PoolConnection<sqlx::MySql>,
         run_id: &str,
         opts: &RollbackOptions,
     ) -> Result<RollbackOutcome, FaucetError> {
@@ -494,7 +500,7 @@ impl MysqlSink {
         let prev = quote_ident_mysql(&self.previous_table_name());
         let old = quote_ident_mysql(&self.old_table_name());
         let col = &opts.run_id_column;
-        let columns = self.columns_of(&mut *conn, &self.config.table_name).await?;
+        let columns = self.columns_of(conn, &self.config.table_name).await?;
         // The kept table is the image before the *latest* overwrite; if the
         // target no longer holds this run's rows, a later run replaced them.
         let conflicts: i64 = if columns.iter().any(|c| c == col) {
@@ -503,7 +509,7 @@ impl MysqlSink {
                 c = quote_ident_mysql(col)
             ))
             .bind(run_id)
-            .fetch_one(&mut *conn)
+            .fetch_one(&mut **conn)
             .await
             .map_err(|e| sink_err("count conflicts", e))?
         } else {
@@ -513,7 +519,7 @@ impl MysqlSink {
             return Ok(RollbackOutcome::blocked(conflicts as u64));
         }
         let restored: i64 = sqlx::query_scalar(&format!("SELECT count(*) FROM {prev}"))
-            .fetch_one(&mut *conn)
+            .fetch_one(&mut **conn)
             .await
             .map_err(|e| sink_err("count previous rows", e))?;
         if opts.dry_run {
@@ -527,16 +533,16 @@ impl MysqlSink {
         }
         // A target with foreign keys or triggers gets its rows back in place,
         // keeping its definition (#789 SQL-108).
-        let deps = crate::sink::table_dependents(&mut *conn, &self.config.table_name).await?;
+        let deps = crate::sink::table_dependents(conn, &self.config.table_name).await?;
         if !deps.pinned.is_empty() || !deps.referenced_by.is_empty() {
             crate::sink::replace_rows_in_place(
-                &mut *conn,
+                conn,
                 &self.config.table_name,
                 &self.previous_table_name(),
             )
             .await?;
             sqlx::query(&format!("DROP TABLE IF EXISTS {prev}"))
-                .execute(&mut *conn)
+                .execute(&mut **conn)
                 .await
                 .map_err(|e| sink_err("drop previous table", e))?;
             return Ok(RollbackOutcome {
@@ -552,7 +558,7 @@ impl MysqlSink {
             format!("DROP TABLE IF EXISTS {old}"),
         ] {
             sqlx::query(&stmt)
-                .execute(&mut *conn)
+                .execute(&mut **conn)
                 .await
                 .map_err(|e| sink_err("restore previous table", e))?;
         }
@@ -607,6 +613,13 @@ impl MysqlSink {
             }
         }
         .map_err(|e| sink_err("rewind commit token", e))?;
+        if let Some(legacy) = legacy_scope_key(scope) {
+            sqlx::query(&format!("DELETE FROM {t} WHERE {s} = ?"))
+                .bind(legacy)
+                .execute(&self.pool)
+                .await
+                .map_err(|e| sink_err("rewind commit token", e))?;
+        }
         Ok(())
     }
 
@@ -674,7 +687,8 @@ mod tests {
                 col("g", "int", "STORED GENERATED"),
                 col("ts", "timestamp", "DEFAULT_GENERATED"),
             ]),
-            "CAST(JSON_OBJECT('b', TO_BASE64(`b`), 'f', CAST(`f` AS UNSIGNED), \
+            "CAST(JSON_OBJECT('b', REPLACE(TO_BASE64(`b`), CHAR(10 USING ascii), ''), \
+             'f', CAST(`f` AS UNSIGNED), \
              'd', CAST(`d` AS CHAR), 'ts', `ts`) AS CHAR)"
         );
     }

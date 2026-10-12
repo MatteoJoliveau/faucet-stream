@@ -202,6 +202,8 @@ pipeline:
 
 - a row committed late at the boundary value is emitted;
 - a boundary row updated in place without its cursor moving is emitted again (its fingerprint changed);
+- identical rows at that value are counted (the fingerprint repeats once per copy), so a late copy of a row already emitted is still delivered;
+- every row the server returns past the bookmark is kept — the server compared and ordered it by the column's own type and collation (a text column holding numbers or mixed-offset timestamps included);
 - nothing already written is emitted twice.
 
 The fingerprint covers the whole row, so no key column is needed. When more than 10,000 rows share one cursor value the set is dropped (`"boundary": null`) and the next read re-emits every row at that value — duplicates, never loss (a warning names the column). A bare value written with `faucet state set` reads as that value with an empty boundary.
@@ -237,7 +239,8 @@ Columns are converted to JSON values by probing the row's value with each candid
 
 Types without an exact native decode are read through their text output: the
 source describes the query first and wraps it, casting only those columns. A
-query with duplicate column names cannot be wrapped; there, a non-NULL value of
+trailing `;` or `--` comment is fine (the source strips the semicolon and ends the comment before wrapping); a
+query with duplicate column names, or a data-modifying `WITH` (legal only at top level), cannot be wrapped; there, a non-NULL value of
 such a type fails the run with an error naming the column instead of turning
 into `null` — alias the columns or cast the value in SQL.
 
@@ -361,6 +364,8 @@ This crate has no optional features of its own. Enable it in the CLI or umbrella
 - [`faucet-source-mysql`](https://crates.io/crates/faucet-source-mysql) · [`faucet-source-sqlite`](https://crates.io/crates/faucet-source-sqlite) · [`faucet-source-mssql`](https://crates.io/crates/faucet-source-mssql)
 
 ## Sharded execution (cluster Mode B)
+
+Key ranges are re-planned every run, so `shard:` cannot be combined with incremental replication (`faucet validate` refuses it when a `state:` block is set): a range could move to a shard whose cursor is already past a late row.
 
 Under [`faucet serve --cluster`](https://faucet-hq.github.io/faucet-stream/cookbook/cluster.html),
 a top-level `shard: { count: N }` block splits this source into contiguous

@@ -311,3 +311,189 @@ async fn keyed_and_jsonb_paths_of_every_write_entry_point() {
         vec!["2"]
     );
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn review_862_regressions() {
+    let (_c, url) = start_postgres().await;
+
+    // M-041: a non-deferrable reference with child rows is refused before the
+    // load; a deferrable one is replaced in place.
+    exec(
+        &url,
+        "CREATE TABLE parent (id INT PRIMARY KEY); \
+         CREATE TABLE child (pid INT REFERENCES parent(id)); \
+         INSERT INTO parent VALUES (1); INSERT INTO child VALUES (1);",
+    )
+    .await;
+    let sink = PostgresSink::new(config(&url, "parent", WriteMode::Overwrite, &[]))
+        .await
+        .unwrap();
+    let err = sink.begin_overwrite().await.unwrap_err().to_string();
+    assert!(err.contains("DEFERRABLE"), "{err}");
+    exec(
+        &url,
+        "CREATE TABLE dparent (id INT PRIMARY KEY); \
+         CREATE TABLE dchild (pid INT REFERENCES dparent(id) DEFERRABLE); \
+         INSERT INTO dparent VALUES (1); INSERT INTO dchild VALUES (1);",
+    )
+    .await;
+    let ovw = || config(&url, "dparent", WriteMode::Overwrite, &[]);
+    let sink = PostgresSink::new(ovw()).await.unwrap();
+    sink.begin_overwrite().await.unwrap();
+    sink.write_batch(&[json!({"id": 1}), json!({"id": 2})])
+        .await
+        .unwrap();
+    PostgresSink::new(ovw())
+        .await
+        .unwrap()
+        .commit_overwrite()
+        .await
+        .unwrap();
+    assert_eq!(
+        text_rows(&url, "SELECT id::text FROM dparent ORDER BY id").await,
+        vec!["1", "2"]
+    );
+
+    // M-064: `binary_encoding: text` stores a base64-looking string as text,
+    // on the insert and the COPY paths; `base64` refuses a non-base64 value.
+    exec(&url, "CREATE TABLE tok (id INT PRIMARY KEY, t BYTEA)").await;
+    let text = PostgresSink::new(
+        config(&url, "tok", WriteMode::Append, &[])
+            .with_binary_encoding(faucet_sink_postgres::BinaryEncoding::Text),
+    )
+    .await
+    .unwrap();
+    text.write_batch(&[json!({"id": 1, "t": "abcd"})])
+        .await
+        .unwrap();
+    let mut copy = config(&url, "tok", WriteMode::Append, &[])
+        .with_binary_encoding(faucet_sink_postgres::BinaryEncoding::Text);
+    copy.write_method = PostgresWriteMethod::Copy;
+    PostgresSink::new(copy)
+        .await
+        .unwrap()
+        .write_batch(&[json!({"id": 2, "t": "user"})])
+        .await
+        .unwrap();
+    let strict = PostgresSink::new(
+        config(&url, "tok", WriteMode::Append, &[])
+            .with_binary_encoding(faucet_sink_postgres::BinaryEncoding::Base64),
+    )
+    .await
+    .unwrap();
+    let err = strict
+        .write_batch(&[json!({"id": 3, "t": "abc"})])
+        .await
+        .unwrap_err();
+    assert!(err.to_string().contains("not base64"), "{err}");
+    let keyed = PostgresSink::new(
+        config(&url, "tok", WriteMode::Delete, &["t"])
+            .with_binary_encoding(faucet_sink_postgres::BinaryEncoding::Text),
+    )
+    .await
+    .unwrap();
+    keyed.write_batch(&[json!({"t": "user"})]).await.unwrap();
+    assert_eq!(
+        text_rows(&url, "SELECT encode(t, 'escape') FROM tok ORDER BY id").await,
+        vec!["abcd"]
+    );
+
+    // review 868 sql 2: under `base64` a non-base64 value fails only its row
+    // on the DLQ path (INSERT, COPY and upsert), so the DLQ can route it.
+    exec(&url, "CREATE TABLE tok2 (id INT PRIMARY KEY, t BYTEA)").await;
+    let page = [
+        json!({"id": 1, "t": "SGVsbG8="}),
+        json!({"id": 2, "t": "plain token!"}),
+    ];
+    let strict = || {
+        config(&url, "tok2", WriteMode::Append, &[])
+            .with_binary_encoding(faucet_sink_postgres::BinaryEncoding::Base64)
+    };
+    let out = PostgresSink::new(strict())
+        .await
+        .unwrap()
+        .write_batch_partial(&page)
+        .await
+        .unwrap();
+    assert!(out[0].is_ok());
+    assert!(
+        out[1]
+            .as_ref()
+            .unwrap_err()
+            .to_string()
+            .contains("not base64")
+    );
+    let mut copy = strict();
+    copy.write_method = PostgresWriteMethod::Copy;
+    let out = PostgresSink::new(copy)
+        .await
+        .unwrap()
+        .write_batch_partial(&[json!({"id": 3, "t": "AQI="}), json!({"id": 4, "t": "x"})])
+        .await
+        .unwrap();
+    assert!(out[0].is_ok() && out[1].is_err());
+    let upsert = config(&url, "tok2", WriteMode::Upsert, &["id"])
+        .with_binary_encoding(faucet_sink_postgres::BinaryEncoding::Base64);
+    let out = PostgresSink::new(upsert)
+        .await
+        .unwrap()
+        .write_batch_partial(&[
+            json!({"id": 5, "t": "nope!"}),
+            json!({"id": 6, "t": "AQI="}),
+            json!({"t": "AQI="}),
+        ])
+        .await
+        .unwrap();
+    assert!(out[0].is_err() && out[1].is_ok());
+    assert!(
+        out[2].as_ref().unwrap_err().to_string().contains("upsert"),
+        "a keyless row still fails at its own position"
+    );
+    assert_eq!(
+        text_rows(&url, "SELECT id::text FROM tok2 ORDER BY id").await,
+        vec!["1", "3", "6"]
+    );
+
+    // M-047: page order holds under a case-insensitive key collation.
+    exec(
+        &url,
+        "CREATE COLLATION ci (provider = icu, locale = 'und-u-ks-level2', deterministic = false); \
+         CREATE TABLE people (email TEXT COLLATE ci PRIMARY KEY, name TEXT); \
+         INSERT INTO people VALUES ('Bob@x.com', 'old');",
+    )
+    .await;
+    let mut c = config(&url, "people", WriteMode::Upsert, &["email"]);
+    c.write.delete_marker = Some(faucet_core::DeleteMarker {
+        field: "__op".into(),
+        values: vec!["d".into()],
+    });
+    let sink = PostgresSink::new(c).await.unwrap();
+    sink.write_batch(&[
+        json!({"email": "Bob@x.com", "__op": "d"}),
+        json!({"email": "bob@x.com", "name": "B"}),
+    ])
+    .await
+    .unwrap();
+    let out = sink
+        .write_batch_partial(&[
+            json!({"email": "bob@x.com", "__op": "d"}),
+            json!({"email": "BOB@x.com", "name": "C"}),
+        ])
+        .await
+        .unwrap();
+    assert!(out.iter().all(Result::is_ok));
+    sink.write_batch_idempotent(
+        &[
+            json!({"email": "BOB@x.com", "__op": "d"}),
+            json!({"email": "bob@X.com", "name": "D"}),
+        ],
+        "people",
+        &faucet_core::format_token(1),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        text_rows(&url, "SELECT email || '/' || name FROM people").await,
+        vec!["bob@X.com/D"]
+    );
+}

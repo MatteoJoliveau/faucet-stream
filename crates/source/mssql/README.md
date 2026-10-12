@@ -255,6 +255,8 @@ Discovery reads catalog metadata only — it never scans table data.
 | BINARY / VARBINARY / IMAGE | base64 string |
 | SQL NULL | `null` |
 
+Each record is keyed by column name, so a query returning two columns with the same name — a join's `id`, or two unaliased expressions (SQL Server names both `""`) — fails with a `FaucetError::Source` asking you to alias them, instead of one silently replacing the other.
+
 ## Config loading & schema
 
 Load from YAML/JSON or environment. Inspect the full JSON Schema with:
@@ -325,6 +327,8 @@ This crate has no optional features of its own; enable it in the CLI/umbrella vi
 - [`faucet-sink-mssql`](https://crates.io/crates/faucet-sink-mssql) — the matching SQL Server sink.
 
 ## Sharded execution (cluster Mode B)
+
+Key ranges are re-planned every run, so `shard:` cannot be combined with incremental replication (`faucet validate` refuses it when a `state:` block is set): a range could move to a shard whose cursor is already past a late row.
 
 Under [`faucet serve --cluster`](https://faucet-hq.github.io/faucet-stream/cookbook/cluster.html),
 a top-level `shard: { count: N }` block splits this source into contiguous

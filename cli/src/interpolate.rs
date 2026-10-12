@@ -146,6 +146,44 @@ pub fn interpolate_record(input: &str, ctx: &HashMap<String, Value>) -> CliResul
     })
 }
 
+/// [`interpolate_record`] for a field holding XML text: every substituted
+/// value is XML-escaped, so a value such as `A&B` or one carrying markup
+/// cannot break or change the document (#862 M-071).
+pub fn interpolate_record_xml(input: &str, ctx: &HashMap<String, Value>) -> CliResult<String> {
+    rewrite(input, |body| match classify_directive(body) {
+        Directive::LoadTime { .. } => Ok(None),
+        Directive::Deferred { id, path } => {
+            let record = ctx
+                .get(id)
+                .ok_or_else(|| CliError::UnknownInterpolationId {
+                    id: id.to_owned(),
+                    token: format!("${{{body}}}"),
+                })?;
+            let resolved =
+                resolve_dotted(record, path).ok_or_else(|| CliError::MissingRecordField {
+                    id: id.to_owned(),
+                    path: path.to_owned(),
+                })?;
+            Ok(Some(escape_xml_text(&value_to_string_record(&resolved))))
+        }
+    })
+}
+
+fn escape_xml_text(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for c in s.chars() {
+        match c {
+            '&' => out.push_str("&amp;"),
+            '<' => out.push_str("&lt;"),
+            '>' => out.push_str("&gt;"),
+            '"' => out.push_str("&quot;"),
+            '\'' => out.push_str("&apos;"),
+            c => out.push(c),
+        }
+    }
+    out
+}
+
 /// Render a resolved runtime value for substitution into a config field.
 ///
 /// Like [`value_to_string`], but a JSON **array** renders as its scalar elements
@@ -302,12 +340,21 @@ pub fn contains_unescaped(s: &str, prefix: &str) -> bool {
 
 /// Unescape a raw config document everywhere except the connector, transform,
 /// state and DLQ configs — those are interpolated again at run time and are
-/// unescaped when built instead.
+/// unescaped when built instead — and the blocks later load passes still
+/// interpolate: `vars:` (substituted into those configs) and the typed blocks
+/// the secrets pass walks, which [`crate::secrets::unescape_typed_blocks`]
+/// unescapes once that pass is done (#862 M-023).
 pub(crate) fn unescape_document(doc: &mut Value) {
     fn deferred(path: &[&str]) -> bool {
         matches!(
             path,
-            ["pipeline", "source" | "sink", "config"]
+            ["vars"]
+                | ["observability" | "verify" | "reconcile" | "lineage" | "catalog"]
+                | ["notifications" | "notify"]
+                | ["pipeline", "masking"]
+                | ["pipeline", "nodes", _, "config"]
+                | ["pipeline", "nodes", _, "transforms", _, "config"]
+                | ["pipeline", "source" | "sink", "config"]
                 | ["pipeline", "sources" | "sinks", _, "config"]
                 | ["pipeline", "source", "transforms", _, "config"]
                 | ["pipeline", "sources", _, "transforms", _, "config"]
@@ -1146,11 +1193,25 @@ mod tests {
                 "state": { "type": "file", "config": { "path": "$${d}" } }
             },
             "matrix": [{ "id": "r", "source": { "config": { "q": "$${e}" } } }],
-            "notifications": [{ "text": "$${f}" }]
+            "notifications": [{ "text": "$${f}" }],
+            "vars": { "v": "$${g}" },
+            "execution": { "note": "$${h}" }
+        });
+        doc["pipeline"]["nodes"] = serde_json::json!({
+            "n": { "kind": "source", "config": { "q": "$${i}" } },
+            "t": { "kind": "transform", "transforms": [{ "type": "set", "config": { "v": "$${j}" } }] }
         });
         unescape_document(&mut doc);
         assert_eq!(doc["name"], "${x}");
-        assert_eq!(doc["notifications"][0]["text"], "${f}");
+        assert_eq!(doc["execution"]["note"], "${h}");
+        // Later load passes still read these; they are unescaped after them (#862 M-023).
+        assert_eq!(doc["notifications"][0]["text"], "$${f}");
+        assert_eq!(doc["vars"]["v"], "$${g}");
+        assert_eq!(doc["pipeline"]["nodes"]["n"]["config"]["q"], "$${i}");
+        assert_eq!(
+            doc["pipeline"]["nodes"]["t"]["transforms"][0]["config"]["v"],
+            "$${j}"
+        );
         assert_eq!(doc["pipeline"]["source"]["config"]["q"], "$${a}");
         assert_eq!(doc["pipeline"]["sinks"]["s"]["config"]["p"], "$${b}");
         assert_eq!(doc["pipeline"]["transforms"][0]["config"]["v"], "$${c}");

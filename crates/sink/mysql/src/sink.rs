@@ -1,6 +1,6 @@
 //! MySQL sink implementation.
 
-use crate::config::{MysqlColumnMapping, MysqlSinkConfig};
+use crate::config::{BinaryEncoding, BinaryValue, MysqlColumnMapping, MysqlSinkConfig};
 use async_trait::async_trait;
 use faucet_core::{FaucetError, SchemaEvolution, SqlBaseType, json_schema_base_type};
 use serde_json::Value;
@@ -16,6 +16,11 @@ const SCOPE_COL_WIDTH: usize = 255;
 /// Fit a pipeline scope into [`SCOPE_COL_WIDTH`].
 pub(crate) fn scope_key(scope: &str) -> String {
     faucet_core::idempotency::scope_key(scope, SCOPE_COL_WIDTH)
+}
+
+/// The pre-1.13 shortened form of a long scope, read once and retired (#862 M-017).
+pub(crate) fn legacy_scope_key(scope: &str) -> Option<String> {
+    faucet_core::idempotency::legacy_scope_key(scope, SCOPE_COL_WIDTH)
 }
 
 /// A sink that writes JSON records to a MySQL table.
@@ -329,33 +334,163 @@ pub(crate) async fn insertable_columns(
         .collect())
 }
 
+/// One of a table's foreign keys: its name, referenced table, and
+/// `(column, referenced column)` pairs in key order.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct ForeignKey {
+    pub(crate) name: String,
+    pub(crate) referenced_schema: String,
+    pub(crate) referenced_table: String,
+    /// The referenced table lives in the current database.
+    pub(crate) local: bool,
+    pub(crate) columns: Vec<(String, String)>,
+}
+
+impl ForeignKey {
+    /// Whether the key references `table` itself, not a same-named table in
+    /// another database.
+    pub(crate) fn references(&self, table: &str) -> bool {
+        self.local && self.referenced_table == table
+    }
+}
+
+pub(crate) async fn table_foreign_keys(
+    conn: &mut MySqlConnection,
+    table: &str,
+) -> Result<Vec<ForeignKey>, FaucetError> {
+    let rows = sqlx::query(
+        "SELECT CAST(CONSTRAINT_NAME AS CHAR) AS N, CAST(COLUMN_NAME AS CHAR) AS C, \
+                CAST(REFERENCED_TABLE_SCHEMA AS CHAR) AS RS, \
+                CAST(REFERENCED_TABLE_NAME AS CHAR) AS RT, \
+                CAST(REFERENCED_COLUMN_NAME AS CHAR) AS RC, \
+                CAST(REFERENCED_TABLE_SCHEMA = DATABASE() AS SIGNED) AS L \
+         FROM INFORMATION_SCHEMA.KEY_COLUMN_USAGE \
+         WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = ? \
+           AND REFERENCED_TABLE_NAME IS NOT NULL \
+         ORDER BY CONSTRAINT_NAME, ORDINAL_POSITION",
+    )
+    .bind(table)
+    .fetch_all(&mut *conn)
+    .await
+    .map_err(|e| FaucetError::Sink(format!("mysql: read foreign keys of {table}: {e}")))?;
+    let mut fks: Vec<ForeignKey> = Vec::new();
+    for r in &rows {
+        let name: String = r.get("N");
+        let pair = (r.get::<String, _>("C"), r.get::<String, _>("RC"));
+        match fks.last_mut() {
+            Some(fk) if fk.name == name => fk.columns.push(pair),
+            _ => fks.push(ForeignKey {
+                name,
+                referenced_schema: r.get("RS"),
+                referenced_table: r.get("RT"),
+                local: r.get::<Option<i64>, _>("L") == Some(1),
+                columns: vec![pair],
+            }),
+        }
+    }
+    Ok(fks)
+}
+
+/// `SELECT COUNT(*)` of `table`'s rows that break `fk` — every key column set
+/// (MATCH SIMPLE) and no referenced row carrying those values.
+fn fk_violation_sql(table: &str, fk: &ForeignKey) -> String {
+    let set = fk
+        .columns
+        .iter()
+        .map(|(c, _)| format!("c.{} IS NOT NULL", quote_ident_mysql(c)))
+        .collect::<Vec<_>>()
+        .join(" AND ");
+    let join = fk
+        .columns
+        .iter()
+        .map(|(c, r)| format!("p.{} = c.{}", quote_ident_mysql(r), quote_ident_mysql(c)))
+        .collect::<Vec<_>>()
+        .join(" AND ");
+    format!(
+        "SELECT COUNT(*) FROM {} c WHERE {set} AND NOT EXISTS (SELECT 1 FROM {}.{} p WHERE {join})",
+        quote_ident_mysql(table),
+        quote_ident_mysql(&fk.referenced_schema),
+        quote_ident_mysql(&fk.referenced_table)
+    )
+}
+
 /// Replace every row of `target` with the rows of `source` in one transaction
 /// (`DELETE` + `INSERT … SELECT` over the shared non-generated columns), so the
 /// target keeps its foreign keys and triggers — which fire for these rows.
+///
+/// InnoDB checks foreign keys row by row, so a self-referencing key fails the
+/// `DELETE` at a parent whose children are still there and the unordered
+/// `INSERT … SELECT` at a child that arrives before its parent (#862 M-042).
+/// For such a table the replace runs with `FOREIGN_KEY_CHECKS = 0` and every
+/// one of the target's foreign keys is re-validated before the commit.
 pub(crate) async fn replace_rows_in_place(
-    conn: &mut MySqlConnection,
+    conn: &mut sqlx::pool::PoolConnection<sqlx::MySql>,
     target: &str,
     source: &str,
 ) -> Result<(), FaucetError> {
-    let into = insertable_columns(&mut *conn, target).await?;
-    let from = insertable_columns(&mut *conn, source).await?;
+    let into = insertable_columns(conn, target).await?;
+    let from = insertable_columns(conn, source).await?;
     let cols = into
         .iter()
         .filter(|c| from.contains(c))
         .map(|c| quote_ident_mysql(c))
         .collect::<Vec<_>>()
         .join(", ");
+    let fks = table_foreign_keys(conn, target).await?;
+    let self_referencing = fks.iter().any(|fk| fk.references(target));
     let (t, s) = (quote_ident_mysql(target), quote_ident_mysql(source));
     let err = |e: sqlx::Error| FaucetError::Sink(format!("mysql overwrite: replace rows: {e}"));
-    let mut tx = sqlx::Connection::begin(&mut *conn).await.map_err(err)?;
-    for stmt in [
-        format!("DELETE FROM {t}"),
-        format!("INSERT INTO {t} ({cols}) SELECT {cols} FROM {s}"),
-    ] {
-        sqlx::query(&stmt).execute(&mut *tx).await.map_err(err)?;
+    if self_referencing {
+        // A dropped future or a failed restore must not return a connection
+        // with foreign-key checks off to the pool.
+        conn.close_on_drop();
+        sqlx::query("SET FOREIGN_KEY_CHECKS = 0")
+            .execute(&mut **conn)
+            .await
+            .map_err(err)?;
     }
-    tx.commit().await.map_err(err)?;
-    Ok(())
+    let result = async {
+        let mut tx = sqlx::Connection::begin(&mut **conn).await.map_err(err)?;
+        for stmt in [
+            format!("DELETE FROM {t}"),
+            format!("INSERT INTO {t} ({cols}) SELECT {cols} FROM {s}"),
+        ] {
+            sqlx::query(&stmt).execute(&mut *tx).await.map_err(err)?;
+        }
+        if self_referencing {
+            for fk in &fks {
+                let broken: i64 = sqlx::query_scalar(&fk_violation_sql(target, fk))
+                    .fetch_one(&mut *tx)
+                    .await
+                    .map_err(err)?;
+                if broken > 0 {
+                    return Err(FaucetError::Sink(format!(
+                        "mysql overwrite: {broken} row(s) of '{target}' break foreign key {} \
+                         (no matching row in '{}'); nothing was replaced",
+                        fk.name, fk.referenced_table
+                    )));
+                }
+            }
+        }
+        tx.commit().await.map_err(err)
+    }
+    .await;
+    if self_referencing {
+        let restored = sqlx::query("SET FOREIGN_KEY_CHECKS = 1")
+            .execute(&mut **conn)
+            .await;
+        result?;
+        if let Err(e) = restored {
+            tracing::warn!(
+                table = target,
+                error = %e,
+                "mysql overwrite: rows replaced, but restoring FOREIGN_KEY_CHECKS failed; the \
+                 connection is closed instead of returned to the pool"
+            );
+        }
+        return Ok(());
+    }
+    result
 }
 
 /// The refusal for an overwrite of a table other tables reference: InnoDB
@@ -405,28 +540,43 @@ fn no_matching_column_message(
     )
 }
 
-/// Split a page into per-row outcomes and the records to write: a record that
-/// matches no column fails on its own row instead of failing the page.
-fn split_unmatched(
+/// Split a page into per-row outcomes, the records to write, and each written
+/// record's position in `records`. A record whose binary-column value
+/// `binary_encoding` refuses — or, with `require_match`, that matches no
+/// column — fails on its own row instead of failing the page.
+fn split_writable(
     records: &[Value],
     columns: &[(String, String)],
-) -> (Vec<faucet_core::RowOutcome>, Vec<Value>) {
+    binary: BinaryEncoding,
+    require_match: bool,
+) -> (Vec<faucet_core::RowOutcome>, Vec<Value>, Vec<usize>) {
     let mut outcomes = Vec::with_capacity(records.len());
     let mut writable = Vec::with_capacity(records.len());
+    let mut positions = Vec::with_capacity(records.len());
     for (idx, record) in records.iter().enumerate() {
-        match record.as_object() {
-            Some(obj) if match_columns(columns, obj).is_empty() => {
-                outcomes.push(Err(FaucetError::Sink(no_matching_column_message(
-                    idx, obj, columns,
-                ))));
+        let failure = record.as_object().and_then(|obj| {
+            let matched = match_columns(columns, obj);
+            if require_match && matched.is_empty() {
+                return Some(no_matching_column_message(idx, obj, columns));
             }
-            _ => {
+            matched.iter().find_map(|(col, ty, v)| match v {
+                Value::String(s) if is_binary_type(ty) => binary
+                    .resolve(s)
+                    .err()
+                    .map(|e| format!("mysql: row {idx}: column {col}: {e}")),
+                _ => None,
+            })
+        });
+        match failure {
+            Some(msg) => outcomes.push(Err(FaucetError::Sink(msg))),
+            None => {
                 outcomes.push(Ok(()));
                 writable.push(record.clone());
+                positions.push(idx);
             }
         }
     }
-    (outcomes, writable)
+    (outcomes, writable, positions)
 }
 
 /// Whether a MySQL `DATA_TYPE` stores raw bytes.
@@ -435,14 +585,6 @@ fn is_binary_type(data_type: &str) -> bool {
         data_type,
         "binary" | "varbinary" | "tinyblob" | "blob" | "mediumblob" | "longblob"
     )
-}
-
-/// The bytes of a base64 string — how every faucet source emits binary — for a
-/// binary column (#789 SQL-02). `None` for text that is not base64, which is
-/// bound as text as before.
-fn binary_from_base64(s: &str) -> Option<Vec<u8>> {
-    use base64::Engine as _;
-    base64::engine::general_purpose::STANDARD.decode(s).ok()
 }
 
 /// `CREATE TABLE IF NOT EXISTS` for an auto-created target (#580).
@@ -520,6 +662,38 @@ struct MysqlColumnDef {
     default: Option<String>,
     extra: String,
     comment: String,
+    /// MariaDB reports `COLUMN_DEFAULT` as an SQL expression (`'abc'`,
+    /// `current_timestamp()`), MySQL as the bare literal.
+    mariadb: bool,
+}
+
+/// The `DEFAULT` clause body for `def`'s reported default (#862 M-065).
+/// MySQL ≥ 8.0.13 marks expression defaults `DEFAULT_GENERATED`; MySQL 5.7
+/// reports `CURRENT_TIMESTAMP` with no marker, and MariaDB quotes literals
+/// itself — re-quoting either would change the default or be rejected.
+fn render_default(d: &str, def: &MysqlColumnDef) -> String {
+    if def.mariadb {
+        return d.to_string();
+    }
+    let upper = d.to_ascii_uppercase();
+    if upper.starts_with("CURRENT_TIMESTAMP")
+        || upper.starts_with("NOW(")
+        || upper.starts_with("LOCALTIMESTAMP")
+    {
+        return d.to_string();
+    }
+    if def.extra.to_ascii_lowercase().contains("default_generated") {
+        return format!("({d})");
+    }
+    let is_bit_literal = def.column_type.to_ascii_lowercase().starts_with("bit")
+        && d.len() > 3
+        && d.starts_with("b'")
+        && d.ends_with('\'')
+        && d[2..d.len() - 1].chars().all(|c| c == '0' || c == '1');
+    if is_bit_literal {
+        return d.to_string();
+    }
+    format!("'{}'", d.replace('\\', "\\\\").replace('\'', "''"))
 }
 
 /// `ALTER TABLE … MODIFY COLUMN` that keeps `def` exactly and only drops NOT
@@ -559,16 +733,7 @@ fn redefine_column_sql(
     }
     sql.push_str(if nullable { " NULL" } else { " NOT NULL" });
     if let Some(d) = &def.default {
-        if extra.contains("default_generated") {
-            let upper = d.to_ascii_uppercase();
-            if upper.starts_with("CURRENT_TIMESTAMP") || upper.starts_with("NOW(") {
-                sql.push_str(&format!(" DEFAULT {d}"));
-            } else {
-                sql.push_str(&format!(" DEFAULT ({d})"));
-            }
-        } else {
-            sql.push_str(&format!(" DEFAULT {}", quote(d)));
-        }
+        sql.push_str(&format!(" DEFAULT {}", render_default(d, def)));
     }
     if extra.contains("auto_increment") {
         sql.push_str(" AUTO_INCREMENT");
@@ -723,7 +888,8 @@ impl MysqlSink {
                     CAST(COLUMN_DEFAULT AS CHAR) AS COLUMN_DEFAULT, \
                     CAST(EXTRA AS CHAR) AS EXTRA, \
                     CAST(COLUMN_COMMENT AS CHAR) AS COLUMN_COMMENT, \
-                    CAST(IS_NULLABLE AS CHAR) AS IS_NULLABLE \
+                    CAST(IS_NULLABLE AS CHAR) AS IS_NULLABLE, \
+                    CAST(VERSION() AS CHAR) AS SERVER_VERSION \
                FROM INFORMATION_SCHEMA.COLUMNS \
               WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = ? AND COLUMN_NAME = ?",
         )
@@ -742,6 +908,9 @@ impl MysqlSink {
                 comment: row
                     .get::<Option<String>, _>("COLUMN_COMMENT")
                     .unwrap_or_default(),
+                mariadb: row
+                    .get::<Option<String>, _>("SERVER_VERSION")
+                    .is_some_and(|v| v.to_ascii_lowercase().contains("mariadb")),
             };
             let nullable = row
                 .get::<Option<String>, _>("IS_NULLABLE")
@@ -1038,6 +1207,7 @@ impl MysqlSink {
         conn: &mut MySqlConnection,
         records: &[Value],
         conflict_key: Option<&[String]>,
+        binary: BinaryEncoding,
     ) -> Result<usize, FaucetError> {
         if records.is_empty() {
             return Ok(0);
@@ -1097,8 +1267,15 @@ impl MysqlSink {
                 for (present, rows) in groups {
                     let insert_columns: Vec<(String, String)> =
                         present.iter().map(|i| columns[*i].clone()).collect();
-                    self.insert_rows(conn, &effective_table, &insert_columns, &rows, conflict_key)
-                        .await?;
+                    self.insert_rows(
+                        conn,
+                        &effective_table,
+                        &insert_columns,
+                        &rows,
+                        conflict_key,
+                        binary,
+                    )
+                    .await?;
                 }
             }
             None => {
@@ -1112,7 +1289,7 @@ impl MysqlSink {
                     .cloned()
                     .collect();
                 let rows: Vec<&Vec<(&String, &String, &Value)>> = matched_rows.iter().collect();
-                self.insert_rows(conn, &effective_table, &insert_columns, &rows, None)
+                self.insert_rows(conn, &effective_table, &insert_columns, &rows, None, binary)
                     .await?;
             }
         }
@@ -1128,6 +1305,7 @@ impl MysqlSink {
         insert_columns: &[(String, String)],
         rows: &[&Vec<(&String, &String, &Value)>],
         conflict_key: Option<&[String]>,
+        binary: BinaryEncoding,
     ) -> Result<(), FaucetError> {
         let num_cols = insert_columns.len();
         let col_names: Vec<String> = insert_columns
@@ -1174,9 +1352,14 @@ impl MysqlSink {
                     q = match val {
                         None | Some(Value::Null) => q.bind(None::<String>),
                         Some(Value::String(s)) if is_binary_type(data_type) => {
-                            match binary_from_base64(s) {
-                                Some(bytes) => q.bind(bytes),
-                                None => q.bind(s.clone()),
+                            match binary.resolve(s) {
+                                Ok(BinaryValue::Bytes(bytes)) => q.bind(bytes),
+                                Ok(BinaryValue::Text(t)) => q.bind(t.to_string()),
+                                Err(e) => {
+                                    return Err(FaucetError::Sink(format!(
+                                        "MySQL insert failed: column {col}: {e}"
+                                    )));
+                                }
                             }
                         }
                         Some(v) => bind_value(q, v),
@@ -1201,7 +1384,7 @@ impl MysqlSink {
         conn: &mut MySqlConnection,
         records: &[Value],
     ) -> Result<usize, FaucetError> {
-        self.insert_auto_map_with_conflict(conn, records, None)
+        self.insert_auto_map_with_conflict(conn, records, None, self.config.binary_encoding)
             .await
     }
 
@@ -1256,7 +1439,7 @@ impl MysqlSink {
     /// Apply a planned upsert/delete batch inside one `BEGIN`/`COMMIT`
     /// transaction. Upserts and deletes are wrapped together so they commit
     /// atomically.
-    async fn apply_plan(&self, plan: &faucet_core::WritePlan) -> Result<usize, FaucetError> {
+    async fn apply_plans(&self, plans: &[faucet_core::WritePlan]) -> Result<usize, FaucetError> {
         if self.config.write.journals() {
             self.ensure_journal().await?;
         }
@@ -1265,26 +1448,44 @@ impl MysqlSink {
             .begin()
             .await
             .map_err(|e| FaucetError::Sink(format!("MySQL transaction begin failed: {e}")))?;
-
-        // `rollback.journal`: before-images commit with the writes (#706).
-        if self.config.write.journals()
-            && let Some(run_id) = self.config.write.rollback_run_id()
-        {
-            self.journal_plan(&mut tx, plan, run_id).await?;
-        }
-        let mut affected = 0usize;
-        if !plan.upserts.is_empty() {
-            affected += self
-                .insert_auto_map_with_conflict(&mut tx, &plan.upserts, Some(&self.config.write.key))
-                .await?;
-        }
-        if !plan.deletes.is_empty() {
-            affected += self.delete_by_keys(&mut tx, &plan.deletes).await?;
-        }
-
+        let affected = self.apply_plans_in(&mut tx, plans).await?;
         tx.commit()
             .await
             .map_err(|e| FaucetError::Sink(format!("MySQL transaction commit failed: {e}")))?;
+        Ok(affected)
+    }
+
+    /// Each plan's upserts then deletes, in page order, on the caller's
+    /// transaction. Plans come from [`faucet_core::plan_writes_ordered`], so a
+    /// delete of `"Bob"` that precedes an upsert of `"bob"` (equal under the
+    /// default `_ci` collation) runs before it rather than after.
+    async fn apply_plans_in(
+        &self,
+        tx: &mut MySqlConnection,
+        plans: &[faucet_core::WritePlan],
+    ) -> Result<usize, FaucetError> {
+        let mut affected = 0usize;
+        for plan in plans {
+            // `rollback.journal`: before-images commit with the writes (#706).
+            if self.config.write.journals()
+                && let Some(run_id) = self.config.write.rollback_run_id()
+            {
+                self.journal_plan(tx, plan, run_id).await?;
+            }
+            if !plan.upserts.is_empty() {
+                affected += self
+                    .insert_auto_map_with_conflict(
+                        tx,
+                        &plan.upserts,
+                        Some(&self.config.write.key),
+                        self.config.binary_encoding,
+                    )
+                    .await?;
+            }
+            if !plan.deletes.is_empty() {
+                affected += self.delete_by_keys(tx, &plan.deletes).await?;
+            }
+        }
         Ok(affected)
     }
 
@@ -1525,7 +1726,12 @@ impl MysqlSink {
                     self.config.write.write_mode.as_str()
                 )));
             }
-            return self.apply_plan(&plan).await;
+            return self
+                .apply_plans(&faucet_core::plan_writes_ordered(
+                    records,
+                    &self.config.write,
+                ))
+                .await;
         }
 
         let mut conn = self
@@ -1583,17 +1789,30 @@ impl MysqlSink {
                 })?;
             let columns = table_columns(&mut conn, &self.effective_table_name()).await?;
             drop(conn);
-            let (outcomes, writable) = split_unmatched(records, &columns);
+            let (outcomes, writable, _) =
+                split_writable(records, &columns, self.config.binary_encoding, true);
             self.write_batch_unbounded(&writable).await?;
             return Ok(outcomes);
         }
 
-        let plan = faucet_core::plan_writes(records, &self.config.write);
-        self.apply_plan(&plan).await?;
+        let mut conn = self
+            .pool
+            .acquire()
+            .await
+            .map_err(|e| FaucetError::Sink(format!("MySQL connection acquire failed: {e}")))?;
+        let columns = table_columns(&mut conn, &self.effective_table_name()).await?;
+        drop(conn);
+        let (mut outcomes, writable, positions) =
+            split_writable(records, &columns, self.config.binary_encoding, false);
+        let plan = faucet_core::plan_writes(&writable, &self.config.write);
+        self.apply_plans(&faucet_core::plan_writes_ordered(
+            &writable,
+            &self.config.write,
+        ))
+        .await?;
 
-        let mut outcomes: Vec<faucet_core::RowOutcome> = records.iter().map(|_| Ok(())).collect();
         for (idx, msg) in &plan.failed {
-            outcomes[*idx] = Err(FaucetError::Sink(format!(
+            outcomes[positions[*idx]] = Err(FaucetError::Sink(format!(
                 "mysql {}: {msg}",
                 self.config.write.write_mode.as_str()
             )));
@@ -1640,26 +1859,12 @@ impl MysqlSink {
         // planned upserts/deletes commit together with the watermark in this same
         // tx (no nested tx — the helpers run on this transaction's connection).
         let written = match &plan {
-            Some(plan) => {
-                if self.config.write.journals()
-                    && let Some(run_id) = self.config.write.rollback_run_id()
-                {
-                    self.journal_plan(&mut tx, plan, run_id).await?;
-                }
-                let mut affected = 0usize;
-                if !plan.upserts.is_empty() {
-                    affected += self
-                        .insert_auto_map_with_conflict(
-                            &mut tx,
-                            &plan.upserts,
-                            Some(&self.config.write.key),
-                        )
-                        .await?;
-                }
-                if !plan.deletes.is_empty() {
-                    affected += self.delete_by_keys(&mut tx, &plan.deletes).await?;
-                }
-                affected
+            Some(_) => {
+                self.apply_plans_in(
+                    &mut tx,
+                    &faucet_core::plan_writes_ordered(records, &self.config.write),
+                )
+                .await?
             }
             None => match &self.config.column_mapping {
                 MysqlColumnMapping::Json { column } => {
@@ -1681,6 +1886,17 @@ impl MysqlSink {
             .execute(&mut *tx)
             .await
             .map_err(|e| FaucetError::Sink(format!("MySQL token upsert failed: {e}")))?;
+        if let Some(legacy) = legacy_scope_key(scope) {
+            sqlx::query(&format!(
+                "DELETE FROM {t} WHERE {s} = ?",
+                t = quote_ident_mysql(faucet_core::idempotency::COMMIT_TOKEN_TABLE),
+                s = quote_ident_mysql(faucet_core::idempotency::COMMIT_TOKEN_SCOPE_COL),
+            ))
+            .bind(legacy)
+            .execute(&mut *tx)
+            .await
+            .map_err(|e| FaucetError::Sink(format!("MySQL legacy token delete failed: {e}")))?;
+        }
 
         tx.commit()
             .await
@@ -2154,12 +2370,17 @@ impl faucet_core::Sink for MysqlSink {
             k = quote_ident_mysql(faucet_core::idempotency::COMMIT_TOKEN_TOKEN_COL),
             s = quote_ident_mysql(faucet_core::idempotency::COMMIT_TOKEN_SCOPE_COL),
         );
-        let row = sqlx::query(&sql)
-            .bind(scope_key(scope))
-            .fetch_optional(&self.pool)
-            .await
-            .map_err(|e| FaucetError::Sink(format!("MySQL token read failed: {e}")))?;
-        Ok(row.map(|r| r.get::<String, _>(0)))
+        for key in std::iter::once(scope_key(scope)).chain(legacy_scope_key(scope)) {
+            let row = sqlx::query(&sql)
+                .bind(key)
+                .fetch_optional(&self.pool)
+                .await
+                .map_err(|e| FaucetError::Sink(format!("MySQL token read failed: {e}")))?;
+            if let Some(r) = row {
+                return Ok(Some(r.get::<String, _>(0)));
+            }
+        }
+        Ok(None)
     }
 
     async fn write_batch_idempotent(
@@ -2201,6 +2422,69 @@ mod tests {
     }
 
     #[test]
+    fn fk_violation_sql_checks_every_key_column() {
+        let fk = ForeignKey {
+            name: "fk_parent".into(),
+            referenced_schema: "app".into(),
+            referenced_table: "cat".into(),
+            local: true,
+            columns: vec![
+                ("parent_id".into(), "id".into()),
+                ("org".into(), "org".into()),
+            ],
+        };
+        assert_eq!(
+            fk_violation_sql("cat", &fk),
+            "SELECT COUNT(*) FROM `cat` c WHERE c.`parent_id` IS NOT NULL AND c.`org` IS NOT NULL \
+             AND NOT EXISTS (SELECT 1 FROM `app`.`cat` p WHERE p.`id` = c.`parent_id` AND p.`org` = c.`org`)"
+        );
+        assert!(fk.references("cat"));
+        let elsewhere = ForeignKey {
+            local: false,
+            ..fk.clone()
+        };
+        assert!(
+            !elsewhere.references("cat"),
+            "a same-named table in another database"
+        );
+        assert!(!fk.references("dog"));
+    }
+
+    #[test]
+    fn defaults_render_per_server_flavour() {
+        let mysql57 = MysqlColumnDef {
+            column_type: "timestamp".into(),
+            ..Default::default()
+        };
+        assert_eq!(
+            render_default("CURRENT_TIMESTAMP", &mysql57),
+            "CURRENT_TIMESTAMP"
+        );
+        let maria = MysqlColumnDef {
+            column_type: "varchar(10)".into(),
+            mariadb: true,
+            ..Default::default()
+        };
+        assert_eq!(render_default("'n/a'", &maria), "'n/a'");
+        assert_eq!(
+            render_default("current_timestamp()", &maria),
+            "current_timestamp()"
+        );
+        let bit = MysqlColumnDef {
+            column_type: "bit(1)".into(),
+            ..Default::default()
+        };
+        assert_eq!(render_default("b'0'", &bit), "b'0'");
+        assert_eq!(render_default("b'2'", &bit), "'b''2'''");
+        let text = MysqlColumnDef {
+            column_type: "varchar(10)".into(),
+            ..Default::default()
+        };
+        assert_eq!(render_default("b'0'", &text), "'b''0'''");
+        assert_eq!(render_default(r"a\b", &text), r"'a\\b'");
+    }
+
+    #[test]
     fn relax_column_sql_keeps_the_definition() {
         let def = MysqlColumnDef {
             column_type: "decimal(12,2)".into(),
@@ -2209,6 +2493,7 @@ mod tests {
             default: Some("0.00".into()),
             extra: String::new(),
             comment: "it's".into(),
+            mariadb: false,
         };
         assert_eq!(
             relax_column_sql("`t`", "amount", &def).as_deref(),
@@ -2223,6 +2508,7 @@ mod tests {
             default: Some("uuid()".into()),
             extra: "DEFAULT_GENERATED".into(),
             comment: String::new(),
+            mariadb: false,
         };
         assert_eq!(
             relax_column_sql("`t`", "c", &def).as_deref(),
@@ -2273,8 +2559,6 @@ mod tests {
         assert!(is_binary_type("varbinary"));
         assert!(is_binary_type("longblob"));
         assert!(!is_binary_type("text"));
-        assert_eq!(binary_from_base64("SGVsbG8="), Some(b"Hello".to_vec()));
-        assert_eq!(binary_from_base64("not base64!"), None);
     }
 
     // dataset_uri test is skipped: MysqlSink::new() requires a live pool
@@ -2392,18 +2676,42 @@ mod tests {
         let obj = serde_json::json!({"USERID": 1, "Kind": "a"});
         let matched = match_columns(&cols, obj.as_object().unwrap());
         assert_eq!(matched.len(), 2);
-        let (outcomes, writable) = split_unmatched(
+        let (outcomes, writable, _) = split_writable(
             &[
                 obj.clone(),
                 serde_json::json!({"other": 1}),
                 serde_json::json!(1),
             ],
             &cols,
+            BinaryEncoding::Auto,
+            true,
         );
         assert!(outcomes[0].is_ok() && outcomes[2].is_ok());
         let err = outcomes[1].as_ref().unwrap_err().to_string();
         assert!(err.contains("record 1 has no field matching"), "{err}");
         assert_eq!(writable.len(), 2);
+    }
+
+    #[test]
+    fn a_binary_value_the_encoding_refuses_fails_only_its_row() {
+        let cols = vec![
+            ("id".to_string(), "int".to_string()),
+            ("Blob".to_string(), "varbinary".to_string()),
+        ];
+        let page = [
+            serde_json::json!({"id": 1, "blob": "SGVsbG8="}),
+            serde_json::json!({"id": 2, "blob": "plain token!"}),
+            serde_json::json!({"id": 3, "blob": 7}),
+        ];
+        let (outcomes, writable, positions) =
+            split_writable(&page, &cols, BinaryEncoding::Base64, false);
+        assert!(outcomes[0].is_ok() && outcomes[2].is_ok());
+        let err = outcomes[1].as_ref().unwrap_err().to_string();
+        assert!(err.contains("row 1: column Blob"), "{err}");
+        assert_eq!(writable.len(), 2);
+        assert_eq!(positions, vec![0, 2]);
+        let (outcomes, _, _) = split_writable(&page, &cols, BinaryEncoding::Text, false);
+        assert!(outcomes.iter().all(Result::is_ok));
     }
 
     #[test]

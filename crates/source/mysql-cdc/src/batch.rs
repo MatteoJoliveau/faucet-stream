@@ -31,6 +31,8 @@ pub(crate) struct PageBuilder {
     oldest: Option<Instant>,
     /// Prepared XA transactions: their rows and the txid they were given.
     prepared: BTreeMap<XaId, Vec<Value>>,
+    /// When each prepared XA transaction was seen.
+    prepared_at: BTreeMap<XaId, Instant>,
     /// Transactions committed while an XA transaction was undecided.
     held: Vec<(Vec<Value>, Bookmark)>,
     max_records: Option<usize>,
@@ -48,23 +50,36 @@ impl PageBuilder {
             bookmark: None,
             oldest: None,
             prepared: BTreeMap::new(),
+            prepared_at: BTreeMap::new(),
             held: Vec::new(),
             max_records,
             error: None,
         }
     }
 
+    /// Rows held behind the oldest undecided XA transaction: transactions
+    /// committed after it and other prepared ones. Its own rows are not held
+    /// behind anything (the in-progress buffer cap bounds them).
     fn held_len(&self) -> usize {
+        let blocker = self.oldest_undecided();
         self.held.iter().map(|(r, _)| r.len()).sum::<usize>()
-            + self.prepared.values().map(Vec::len).sum::<usize>()
+            + self
+                .prepared
+                .iter()
+                .filter(|(x, _)| Some(*x) != blocker)
+                .map(|(_, r)| r.len())
+                .sum::<usize>()
     }
 
     fn check_capacity(&self, extra: usize) -> Result<(), String> {
         match self.max_records {
             Some(max) if self.held_len() + extra > max => Err(format!(
-                "mysql-cdc: transactions held behind an undecided XA transaction exceed \
-                 max_staged_records ({max}); decide the XA transaction (XA COMMIT / XA \
-                 ROLLBACK) or raise max_staged_records"
+                "mysql-cdc: rows of transactions held behind the undecided XA transaction ({}) \
+                 exceed {max} (max_staged_records, 1,000,000 when unset); its own rows do not \
+                 count. Find it with XA RECOVER and decide it (XA COMMIT / XA ROLLBACK), or \
+                 raise max_staged_records",
+                self.oldest_undecided()
+                    .map_or_else(|| "?".to_string(), |x| x.to_string())
             )),
             _ => Ok(()),
         }
@@ -107,11 +122,34 @@ impl PageBuilder {
         }
     }
 
-    /// An XA transaction was prepared: its rows wait for the outcome.
-    pub(crate) fn prepare(&mut self, xid: XaId, rows: Vec<Value>) -> Result<(), String> {
-        self.check_capacity(rows.len())?;
+    /// An XA transaction was prepared at `now`: its rows wait for the outcome.
+    pub(crate) fn prepare(
+        &mut self,
+        xid: XaId,
+        rows: Vec<Value>,
+        now: Instant,
+    ) -> Result<(), String> {
+        let behind = self.oldest_undecided().is_some_and(|b| *b != xid);
+        self.check_capacity(if behind { rows.len() } else { 0 })?;
+        self.prepared_at.entry(xid.clone()).or_insert(now);
         self.prepared.entry(xid).or_default().extend(rows);
         Ok(())
+    }
+
+    fn oldest_undecided(&self) -> Option<&XaId> {
+        self.prepared_at
+            .iter()
+            .min_by_key(|(_, at)| **at)
+            .map(|(x, _)| x)
+    }
+
+    /// The longest-undecided prepared XA transaction and how long it has
+    /// held every later transaction back.
+    pub(crate) fn undecided(&self, now: Instant) -> Option<(&XaId, Duration)> {
+        self.prepared_at
+            .iter()
+            .min_by_key(|(_, at)| **at)
+            .map(|(x, at)| (x, now.saturating_duration_since(*at)))
     }
 
     /// The outcome of a prepared XA transaction, decided at `bookmark`.
@@ -125,6 +163,7 @@ impl PageBuilder {
         now: Instant,
     ) -> (bool, Vec<ReadyPage>) {
         let rows = self.prepared.remove(xid);
+        self.prepared_at.remove(xid);
         let known = rows.is_some();
         let rows = if commit {
             rows.unwrap_or_default()
@@ -253,7 +292,7 @@ mod tests {
     fn undecided_xa_holds_later_commits_in_order() {
         let now = Instant::now();
         let mut b = PageBuilder::new(1, Duration::from_secs(1), None);
-        b.prepare(xid("a"), vec![json!("xa")]).unwrap();
+        b.prepare(xid("a"), vec![json!("xa")], now).unwrap();
         assert!(b.commit(vec![json!("t1")], bm(30), now).is_empty());
         let (known, pages) = b.decide(&xid("a"), true, bm(40), now);
         assert!(known);
@@ -266,8 +305,8 @@ mod tests {
     fn rollback_drops_rows_and_nested_xa_waits_for_the_last() {
         let now = Instant::now();
         let mut b = PageBuilder::new(10, Duration::from_secs(1), None);
-        b.prepare(xid("a"), vec![json!("a")]).unwrap();
-        b.prepare(xid("b"), vec![json!("b")]).unwrap();
+        b.prepare(xid("a"), vec![json!("a")], now).unwrap();
+        b.prepare(xid("b"), vec![json!("b")], now).unwrap();
         let (known, pages) = b.decide(&xid("a"), false, bm(50), now);
         assert!(known && pages.is_empty());
         let (_, pages) = b.decide(&xid("b"), true, bm(60), now);
@@ -280,14 +319,35 @@ mod tests {
     }
 
     #[test]
+    fn the_oldest_undecided_xa_is_reported_with_its_age() {
+        let t0 = Instant::now();
+        let mut b = PageBuilder::new(10, Duration::from_secs(1), None);
+        assert!(b.undecided(t0).is_none());
+        b.prepare(xid("a"), vec![], t0).unwrap();
+        b.prepare(xid("b"), vec![], t0 + Duration::from_secs(5))
+            .unwrap();
+        let (x, age) = b.undecided(t0 + Duration::from_secs(10)).unwrap();
+        assert_eq!(x, &xid("a"));
+        assert_eq!(age, Duration::from_secs(10));
+        let _ = b.decide(&xid("a"), true, bm(1), t0);
+        assert_eq!(b.undecided(t0).unwrap().0, &xid("b"));
+        let _ = b.decide(&xid("b"), false, bm(2), t0);
+        assert!(b.undecided(t0).is_none());
+    }
+
+    #[test]
     fn held_rows_are_bounded() {
         let now = Instant::now();
         let mut b = PageBuilder::new(10, Duration::from_secs(1), Some(2));
-        b.prepare(xid("a"), vec![json!(1), json!(2)]).unwrap();
+        b.prepare(xid("a"), vec![json!(1), json!(2), json!(3)], now)
+            .expect("the blocking XA transaction's own rows are not held behind it");
+        assert!(b.commit(vec![json!(4), json!(5)], bm(1), now).is_empty());
         assert!(b.take_error().is_none());
-        assert!(b.commit(vec![json!(3)], bm(1), now).is_empty());
+        assert!(b.commit(vec![json!(6)], bm(2), now).is_empty());
         let err = b.take_error().expect("capacity error");
         assert!(err.contains("max_staged_records"), "{err}");
-        assert!(b.prepare(xid("b"), vec![json!(4)]).is_err());
+        assert!(err.contains("X'61',X'',1"), "{err}");
+        assert!(err.contains("XA RECOVER"), "{err}");
+        assert!(b.prepare(xid("b"), vec![json!(4)], now).is_err());
     }
 }

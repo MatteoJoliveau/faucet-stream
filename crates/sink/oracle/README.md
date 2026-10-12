@@ -62,15 +62,15 @@ Oracle stores `''` as `NULL`; an empty string is written as `NULL`.
 
 ## Overwrite (`write_mode: overwrite`)
 
-The run writes into `{table}__faucet_ovw`, created as `CREATE TABLE … AS SELECT * FROM target WHERE 1 = 0`; what that clone drops is put back — a writable identity column becomes nullable and every column `DEFAULT` is copied, so a record that omits a column gets the target's default. Only after a fully successful run is the target replaced, in one transaction (`DELETE` + `INSERT … SELECT` over the target's insertable columns; rows whose identity value is `NULL` in staging are inserted without it so the target generates it), so readers see the old rows until the commit and a failure leaves them untouched; staging is then dropped. On a first run (no target) staging is created from the first page and renamed into place. The target keeps its constraints, indexes and grants.
+The run writes into `{table}__faucet_ovw`, created as `CREATE TABLE … AS SELECT * FROM target WHERE 1 = 0`; what that clone drops is put back — every identity column (`BY DEFAULT` and `GENERATED ALWAYS`) and every other column the writer cannot supply becomes nullable, and every column `DEFAULT` is copied, so a record that omits a column gets the target's default. Only after a fully successful run is the target replaced, in one transaction (`DELETE` + `INSERT … SELECT` over the target's insertable columns; rows whose identity value is `NULL` in staging are inserted without it so the target generates it), so readers see the old rows until the commit and a failure leaves them untouched; staging is then dropped. On a first run (no target) staging is created from the first page and renamed into place. The target keeps its constraints, indexes and grants.
 
 ## Exactly-once delivery
 
-`write_batch_idempotent` writes the page and upserts `(scope, token)` into `_faucet_commit_token` (created beside the target, `scope VARCHAR2(1000 CHAR) PRIMARY KEY, token CLOB`) in the same transaction; `last_committed_token` reads it back. Composes with `write_mode: upsert`. Requires the CLI's exactly-once gate (a replayable source, durable state, no DLQ).
+`write_batch_idempotent` writes the page and upserts `(scope, token)` into `_faucet_commit_token` (created beside the target, `scope VARCHAR2(1000 CHAR) PRIMARY KEY, token CLOB`) in the same transaction; `last_committed_token` reads it back. A scope too long for the key column is stored as a shortened digest form; a watermark written under the form releases before faucet-core 1.13 used is still read, and the next commit moves it to the current form. Composes with `write_mode: upsert`. Requires the CLI's exactly-once gate (a replayable source, durable state, no DLQ).
 
 ## Schema evolution
 
-`current_schema()` reads `ALL_TAB_COLS` (`NUMBER(p,0)` → integer, `NUMBER(1,0)` → boolean-or-integer, other numerics → number, everything else → string). `evolve_schema` adds columns (`ALTER TABLE … ADD`), widens integer columns to `NUMBER`, and relaxes `NOT NULL`; each step is idempotent. Oracle cannot change a text column's type in place, so other widenings are reported as errors.
+`current_schema()` reads `ALL_TAB_COLS` (`NUMBER(p,0)` → integer, `NUMBER(1,0)` → boolean-or-integer, other numerics → number, everything else → string; text, `CLOB` and `JSON` columns — where objects and arrays land as JSON text — also accept object and array fields, so nested data is not reported as drift). `evolve_schema` adds columns (`ALTER TABLE … ADD`), widens integer columns to `NUMBER`, and relaxes `NOT NULL`; each step is idempotent. Oracle cannot change a text column's type in place, so other widenings are reported as errors.
 
 ## Dead-letter queue
 

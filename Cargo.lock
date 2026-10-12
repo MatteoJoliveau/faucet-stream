@@ -4841,6 +4841,7 @@ dependencies = [
  "dashmap",
  "dotenvy",
  "faucet-auth",
+ "faucet-common-file",
  "faucet-common-nats",
  "faucet-common-rabbitmq",
  "faucet-common-sftp",
@@ -5038,6 +5039,7 @@ name = "faucet-common-delta"
 version = "1.2.1"
 dependencies = [
  "arrow 58.3.0",
+ "arrow 59.3.0",
  "arrow-json 58.3.0",
  "chrono",
  "deltalake",
@@ -5824,6 +5826,7 @@ dependencies = [
  "thiserror 2.0.18",
  "tokio",
  "tracing",
+ "wiremock",
 ]
 
 [[package]]
@@ -6729,6 +6732,7 @@ dependencies = [
  "testcontainers-modules",
  "tokio",
  "tracing",
+ "tracing-subscriber",
 ]
 
 [[package]]
@@ -6798,6 +6802,8 @@ dependencies = [
  "arrow-json 58.3.0",
  "async-stream",
  "async-trait",
+ "aws-config",
+ "aws-sdk-s3",
  "bytes",
  "faucet-conformance",
  "faucet-core",
@@ -6809,6 +6815,8 @@ dependencies = [
  "serde",
  "serde_json",
  "tempfile",
+ "testcontainers",
+ "testcontainers-modules",
  "tokio",
  "tracing",
  "url",
@@ -7106,6 +7114,7 @@ dependencies = [
  "faucet-conformance",
  "faucet-core",
  "futures",
+ "libsqlite3-sys",
  "schemars 1.2.1",
  "serde",
  "serde_json",

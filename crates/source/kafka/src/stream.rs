@@ -538,7 +538,9 @@ fn build_sr_client(
 ) -> Result<Option<SchemaRegistryClient>, FaucetError> {
     fn extract_cfg(f: &KafkaValueFormat) -> Option<&faucet_common_kafka::SchemaRegistryConfig> {
         match f {
-            KafkaValueFormat::ConfluentAvro { schema_registry }
+            KafkaValueFormat::ConfluentAvro {
+                schema_registry, ..
+            }
             | KafkaValueFormat::ConfluentProtobuf { schema_registry } => Some(schema_registry),
             KafkaValueFormat::ConfluentJsonSchema {
                 schema_registry, ..
@@ -958,6 +960,18 @@ impl Source for KafkaSource {
         true
     }
 
+    fn position_le(&self, a: &Value, b: &Value) -> Option<bool> {
+        crate::state::position_le(a, b)
+    }
+
+    fn position_min(&self, positions: &[Value]) -> Option<Value> {
+        crate::state::position_min(positions)
+    }
+
+    fn record_covered(&self, record: &Value, position: &Value) -> Option<bool> {
+        crate::state::record_covered(record, position)
+    }
+
     fn connector_name(&self) -> &'static str {
         "kafka"
     }
@@ -1297,6 +1311,7 @@ mod tests {
         fn build_sr_client_some_for_confluent_avro_value() {
             let format = KafkaValueFormat::ConfluentAvro {
                 schema_registry: SchemaRegistryConfig::new("http://localhost:8081"),
+                bytes_encoding: Default::default(),
             };
             assert!(build_sr_client(&format, None).unwrap().is_some());
         }
@@ -1322,6 +1337,7 @@ mod tests {
         fn build_sr_client_falls_back_to_key_format() {
             let key = KafkaValueFormat::ConfluentAvro {
                 schema_registry: SchemaRegistryConfig::new("http://localhost:8081"),
+                bytes_encoding: Default::default(),
             };
             assert!(
                 build_sr_client(&KafkaValueFormat::Json, Some(&key))
@@ -1334,6 +1350,7 @@ mod tests {
         fn build_sr_client_propagates_invalid_url() {
             let format = KafkaValueFormat::ConfluentAvro {
                 schema_registry: SchemaRegistryConfig::new("not-a-url"),
+                bytes_encoding: Default::default(),
             };
             assert!(build_sr_client(&format, None).is_err());
         }

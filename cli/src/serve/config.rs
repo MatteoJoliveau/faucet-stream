@@ -239,12 +239,13 @@ impl ServeConfig {
                     k,
                     crate::serve::changes::ChangeKind::TemplateRegister
                         | crate::serve::changes::ChangeKind::TemplateLaunch
+                        | crate::serve::changes::ChangeKind::TemplateDeprecate
                 )
             })
         {
             return Err(CliError::Serve(format!(
-                "--templates-sync registers and launches templates on its own schedule, which \
-                 would bypass --require-approval {kind}; drop one of the two"
+                "--templates-sync registers, launches and retires templates on its own \
+                 schedule, which would bypass --require-approval {kind}; drop one of the two"
             )));
         }
         if args.approval_expiry_secs == 0 {
@@ -483,6 +484,7 @@ pub fn load_otel_config(path: &std::path::Path) -> CliResult<faucet_core::OtelCo
     let bad = |e: String| CliError::Config(format!("--otel-config {}: {e}", path.display()));
     let text = std::fs::read_to_string(path).map_err(|e| bad(e.to_string()))?;
     let mut doc: serde_json::Value = serde_yaml::from_str(&text).map_err(|e| bad(e.to_string()))?;
+    crate::serve::load::protect_input(path, &doc);
     crate::interpolate::interpolate_value(&mut doc)?;
     crate::interpolate::unescape_value(&mut doc);
     let spec: crate::config::OtelSpec =

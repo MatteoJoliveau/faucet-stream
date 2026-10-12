@@ -1607,6 +1607,11 @@
           "description": "IPv4 dotted-quad address.",
           "type": "string",
           "const": "ipv4"
+        },
+        {
+          "description": "Any 10–15 digit number, `+` and separators allowed, as a string or a\nJSON integer: the broad `phone` matcher of releases before faucet-core\n1.13. Catches bare and national formats `phone` skips, at the cost of\nmatching ids and epoch timestamps.",
+          "type": "string",
+          "const": "phone_loose"
         }
       ]
     },
@@ -9036,6 +9041,11 @@
           "description": "Confluent-wire-format Avro: magic byte + schema_id + Avro binary.",
           "type": "object",
           "properties": {
+            "bytes_encoding": {
+              "description": "How the sink reads a JSON string for an Avro `bytes` / `fixed`\nfield: `hex` (default — the shape the Kafka source decodes those\nfields to, so records round-trip) or `utf8` (the string's UTF-8\nbytes, the reading before faucet-common-kafka 1.1.1). A JSON array of byte\nnumbers is accepted either way. Ignored by the source.",
+              "$ref": "#/$defs/source_kafka__BytesText",
+              "default": "hex"
+            },
             "schema_registry": {
               "$ref": "#/$defs/source_kafka__SchemaRegistryConfig"
             },
@@ -9077,6 +9087,21 @@
               "const": "confluent_json_schema"
             }
           }
+        }
+      ]
+    },
+    "source_kafka__BytesText": {
+      "description": "How a JSON string is read for an Avro `bytes` / `fixed` value on encode.",
+      "oneOf": [
+        {
+          "description": "The string is lowercase hex, the shape [`datum_to_json`] produces.",
+          "type": "string",
+          "const": "hex"
+        },
+        {
+          "description": "The string's UTF-8 bytes are the value.",
+          "type": "string",
+          "const": "utf8"
         }
       ]
     },
@@ -12658,6 +12683,11 @@
           "description": "Confluent-wire-format Avro: magic byte + schema_id + Avro binary.",
           "type": "object",
           "properties": {
+            "bytes_encoding": {
+              "description": "How the sink reads a JSON string for an Avro `bytes` / `fixed`\nfield: `hex` (default — the shape the Kafka source decodes those\nfields to, so records round-trip) or `utf8` (the string's UTF-8\nbytes, the reading before faucet-common-kafka 1.1.1). A JSON array of byte\nnumbers is accepted either way. Ignored by the source.",
+              "$ref": "#/$defs/sink_kafka__BytesText",
+              "default": "hex"
+            },
             "schema_registry": {
               "$ref": "#/$defs/sink_kafka__SchemaRegistryConfig"
             },
@@ -12699,6 +12729,21 @@
               "const": "confluent_json_schema"
             }
           }
+        }
+      ]
+    },
+    "sink_kafka__BytesText": {
+      "description": "How a JSON string is read for an Avro `bytes` / `fixed` value on encode.",
+      "oneOf": [
+        {
+          "description": "The string is lowercase hex, the shape [`datum_to_json`] produces.",
+          "type": "string",
+          "const": "hex"
+        },
+        {
+          "description": "The string's UTF-8 bytes are the value.",
+          "type": "string",
+          "const": "utf8"
         }
       ]
     },
@@ -14642,7 +14687,7 @@
                       }
                     },
                     "trusted_hosts": {
-                      "description": "Extra hosts that may receive this source's credentials when a\nserver-given URL (a next-page link, an async-job URL) points at them.\nCredentials — the `auth` block, a shared provider's placements and any\n`Authorization` / `Cookie` header — are otherwise sent only to the\nscheme, host and port of `base_url`; a link elsewhere is fetched without\nthem. An entry is a host (`files.example.com`) or a `*.example.com`\nwildcard. An `https` base never follows a link to plain `http`.",
+                      "description": "Extra hosts that may receive this source's credentials when a\nserver-given URL (a next-page link, an async-job URL, a discovery\nlisting's next link) points at them. Credentials — the `auth` block and\na shared provider's placements — are otherwise sent only to the scheme,\nhost and port of `base_url`; a link elsewhere is fetched without them\nand with only non-credential static headers (`Accept`, `User-Agent`, …).\nAn entry is a host (`files.example.com`) or a `*.example.com` wildcard.\nAn `https` base never follows a link to plain `http`.",
                       "items": {
                         "type": "string"
                       },
@@ -14685,7 +14730,7 @@
                       "default": null
                     },
                     "max_pages": {
-                      "description": "Optional cap on pages fetched per pass, across every pagination style.\nUnset by default: each pagination style already stops on its own end\nsignal and loop guards. When the cap cuts a pass short, only a persisted\ncursor bookmark (`persist_cursor`) is kept — a record-derived or window\nbookmark would skip the unread pages, so none is written.",
+                      "description": "Optional cap on pages fetched per pass, across every pagination style.\nUnset by default: each pagination style already stops on its own end\nsignal and loop guards. When the cap cuts a pass short, only a persisted\ncursor bookmark (`persist_cursor`) is kept. An incremental or windowed\npass the cap cuts short fails the run instead — its record-derived or\nwindow bookmark would skip the unread pages, and keeping none would\nre-read the same pages forever — unless `assume_ordered` is set.",
                       "type": [
                         "integer",
                         "null",
@@ -14694,6 +14739,13 @@
                       "format": "uint",
                       "minimum": 0,
                       "default": null
+                    },
+                    "assume_ordered": {
+                      "description": "The feed returns records in ascending `replication_key` order, so an\nincremental pass that `max_pages` cuts short may persist the largest key\nit read and resume after it next run. Without it such a pass fails the\nrun. Ignored for windowed passes, with `persist_cursor`, and across\n`requests:` entries (a truncated entry fails the run).",
+                      "type": [
+                        "boolean",
+                        "string"
+                      ]
                     },
                     "request_delay": {
                       "description": "Fixed delay between page requests, in seconds — a politeness knob for\nAPIs that rate-limit by request frequency. Applied *in addition* to any\n`Retry-After` honoured by the retry path.",
@@ -16515,6 +16567,14 @@
                           "type": "null"
                         }
                       ]
+                    },
+                    "sandbox": {
+                      "description": "Confine the query to the opened database: every connection refuses\n`ATTACH` (and `VACUUM INTO`, which attaches its target). Extension\nloading is always off. Defaults to `false`. `faucet serve` forces it\non for every config it did not load from its own triggers file.",
+                      "type": [
+                        "boolean",
+                        "string"
+                      ],
+                      "default": false
                     }
                   }
                 },
@@ -16619,6 +16679,14 @@
                       "format": "uint",
                       "minimum": 0,
                       "default": 1000
+                    },
+                    "sandbox": {
+                      "description": "Confine the query to the opened database: no file or network access\n(`read_text`, `read_csv`, `ATTACH`, `COPY`, httpfs), no extension\ninstall/autoload, and the configuration locked so the query cannot\n`SET` it back. Defaults to `false`. `faucet serve` forces it on for\nevery config it did not load from its own triggers file.",
+                      "type": [
+                        "boolean",
+                        "string"
+                      ],
+                      "default": false
                     }
                   }
                 },
@@ -18135,7 +18203,7 @@
                       "default": 30
                     },
                     "max_staged_records": {
-                      "description": "Max records buffered for a single in-progress transaction before abort.\n`None` = unbounded.",
+                      "description": "Max records buffered for a single in-progress transaction before abort.\n`None` = unbounded. Also caps the rows held behind an undecided XA\ntransaction, which default to 1,000,000 when this is unset.",
                       "type": [
                         "integer",
                         "null",
@@ -19243,9 +19311,9 @@
                       "default": 1000
                     },
                     "parse_json": {
-                      "description": "Which values are parsed as JSON. `containers` (default) parses a value\nonly when it is a JSON object or array, so `\"1.10\"`, `\"true\"` and long\nnumeric ids stay the strings Redis holds; `all` also parses scalars;\n`none` keeps every value a string.",
+                      "description": "Which values are parsed as JSON. `all` (default) parses any value that\nis valid JSON, so `\"42\"` becomes `42` and `\"true\"` becomes `true`;\n`containers` parses only objects and arrays, so `\"1.10\"`, `\"true\"` and\nlong numeric ids stay the strings Redis holds; `none` keeps every value\na string.",
                       "$ref": "#/$defs/source_redis__RedisJsonParsing",
-                      "default": "containers"
+                      "default": "all"
                     },
                     "binary": {
                       "description": "What to do with a value that is not valid UTF-8 (msgpack, gzip, …):\n`base64` (default) emits it base64-encoded, `lossy` replaces invalid\nsequences with U+FFFD, `error` fails the run naming the key.",
@@ -21590,14 +21658,14 @@
                       "default": 0
                     },
                     "poll_timeout": {
-                      "description": "Maximum wall-clock time the source will spend polling an asynchronous\nstatement (one for which the initial `POST /api/v2/statements`\nreturns HTTP 202) before giving up with\n[`FaucetError::Source`](faucet_core::FaucetError::Source).\nWithout this cap a statement that never finishes would loop forever.\nDefaults to 300 seconds. Set to `0` to disable the cap and poll\nindefinitely.",
+                      "description": "Maximum wall-clock time the source will spend polling an asynchronous\nstatement (one for which the initial `POST /api/v2/statements`\nreturns HTTP 202) before giving up with\n[`FaucetError::Source`](faucet_core::FaucetError::Source).\nWithout this cap a statement that never finishes would loop forever.\nThe statement is cancelled server-side when the cap is reached.\nDefaults to 172800 seconds (48 hours, Snowflake's own maximum statement\ntime), so a long extract is never cut short by the client. Set to `0`\nto disable the cap and poll indefinitely.",
                       "type": [
                         "integer",
                         "string"
                       ],
                       "format": "uint64",
                       "minimum": 0,
-                      "default": 300
+                      "default": 172800
                     },
                     "batch_size": {
                       "description": "Records per emitted [`StreamPage`](faucet_core::StreamPage).\n\nSnowflake's SQL REST API splits large result sets into *partitions* (one\nchunk of rows per HTTP response). The source re-frames partitions into\n`batch_size`-sized pages: rows accumulate in a buffer and are yielded as\nsoon as the buffer reaches `batch_size`. Defaults to\n[`DEFAULT_BATCH_SIZE`].\n\n`batch_size = 0` is the **\"no batching\" sentinel**: the entire result\nset is buffered and emitted in a single page. Useful for small lookup\ntables, or for sinks (e.g. SQL `COPY`, BigQuery load jobs) that prefer\none large request to many small ones.",
@@ -24033,6 +24101,11 @@
                       "format": "uint64",
                       "minimum": 0,
                       "default": 3600
+                    },
+                    "binary_encoding": {
+                      "description": "How a string written to a binary column (`BLOB`/`VARBINARY`/`bytea`)\nbecomes bytes: `base64` (default) decodes every value — the form every\nfaucet source emits — and fails the row when one is not base64; `text`\nstores every string as its text; `auto` decodes canonical base64 and\nstores any other string as text, deciding per value, so a text value\nthat happens to be valid base64 (`\"user\"`, a hex digest) is decoded.\nSet `text` when the column is fed plain text.",
+                      "$ref": "#/$defs/sink_postgres__BinaryEncoding",
+                      "default": "base64"
                     }
                   },
                   "title": "PostgresSinkConfig",
@@ -24315,14 +24388,14 @@
                       "default": 1000
                     },
                     "poll_timeout": {
-                      "description": "Maximum wall-clock time to wait for an asynchronously-executed\nINSERT to finish. Snowflake's SQL REST API answers an accepted but\nnot-yet-finished statement with HTTP 202 and a `statementHandle`;\nthe sink polls `GET /api/v2/statements/{handle}` until the statement\nreports success before counting the rows as written. Without this\nthe sink would report success the moment Snowflake *accepted* the\nstatement, losing durability. Defaults to 300 seconds. Set to `0`\nto poll indefinitely.",
+                      "description": "Maximum wall-clock time to wait for an asynchronously-executed\nINSERT to finish. Snowflake's SQL REST API answers an accepted but\nnot-yet-finished statement with HTTP 202 and a `statementHandle`;\nthe sink polls `GET /api/v2/statements/{handle}` until the statement\nreports success before counting the rows as written. Without this\nthe sink would report success the moment Snowflake *accepted* the\nstatement, losing durability. The statement is cancelled server-side\nwhen the cap is reached. Defaults to 172800 seconds (48 hours,\nSnowflake's own maximum statement time), so a large commit group on a\nsmall warehouse is never cut short by the client. Set to `0` to poll\nindefinitely.",
                       "type": [
                         "integer",
                         "string"
                       ],
                       "format": "uint64",
                       "minimum": 0,
-                      "default": 300
+                      "default": 172800
                     },
                     "bulk_load": {
                       "description": "Arrow columnar **bulk-load** mode (#381): buffer Arrow `RecordBatch`es\nto Parquet, upload to an external cloud stage's backing storage, then\n`COPY INTO <table> FROM @stage FILE_FORMAT=(TYPE=PARQUET)` over the SQL\nREST API. Requires a binary built with this crate's `arrow` feature; a\nconfig that sets it on an `arrow`-off build is rejected at construction.\n\nThis only drives the Arrow fast path the pipeline negotiates when the\nsource *and* sink are both columnar and no `Value`-shaped stage\n(transforms, DLQ, exactly-once, masking, …) is configured. The regular\nrow path (`INSERT … PARSE_JSON`) and the exactly-once watermark MERGE\nare unaffected — bulk-load is append-only.",
@@ -24499,6 +24572,11 @@
                       "format": "uint64",
                       "minimum": 0,
                       "default": 3600
+                    },
+                    "binary_encoding": {
+                      "description": "How a string written to a binary column (`BLOB`/`VARBINARY`/`bytea`)\nbecomes bytes: `base64` (default) decodes every value — the form every\nfaucet source emits — and fails the row when one is not base64; `text`\nstores every string as its text; `auto` decodes canonical base64 and\nstores any other string as text, deciding per value, so a text value\nthat happens to be valid base64 (`\"user\"`, a hex digest) is decoded.\nSet `text` when the column is fed plain text.",
+                      "$ref": "#/$defs/sink_mysql__BinaryEncoding",
+                      "default": "base64"
                     }
                   },
                   "title": "MysqlSinkConfig",
@@ -24939,6 +25017,14 @@
                         "string"
                       ],
                       "default": true
+                    },
+                    "sandbox": {
+                      "description": "Confine the connection to the target database: no file or network\naccess, no extension install/autoload, and the configuration locked.\nThe setting applies to the whole database instance, which sinks on the\nsame file in one process share. Defaults to `false`. `faucet serve`\nforces it on for every config it did not load from its own triggers\nfile.",
+                      "type": [
+                        "boolean",
+                        "string"
+                      ],
+                      "default": false
                     }
                   }
                 },
@@ -26643,7 +26729,7 @@
                       "default": 300
                     },
                     "op_type": {
-                      "description": "The `_bulk` action for `append` writes: `index` (default; overwrites a\ndocument with the same `_id`) or `create` (required by data streams,\nwhich reject `index`; a document whose `_id` already exists is a\nper-row error). `upsert` / `delete` / `overwrite` always use `index`.",
+                      "description": "The `_bulk` action for `append` writes: `index` (default; overwrites a\ndocument with the same `_id`) or `create` (required by data streams,\nwhich reject `index`; a document whose `_id` already exists is left as\nit is and counted as written, so a replayed page stays idempotent).\n`upsert` / `delete` / `overwrite` always use `index`.",
                       "$ref": "#/$defs/sink_elasticsearch__ElasticsearchOpType",
                       "default": "index"
                     }
@@ -35845,6 +35931,46 @@
         "range",
         "release",
         "suite"
+      ]
+    },
+    "sink_mysql__BinaryEncoding": {
+      "description": "How a JSON string bound to a binary column becomes bytes (#862 M-064).\n\nEvery faucet source emits binary values as base64 text, but a string from\na text origin (a CSV token, a hex digest) can also happen to be valid\nbase64. `auto` cannot tell the two apart: it decodes any canonical, padded\nbase64 string and stores anything else as its text. The default, `base64`,\ntreats every value the same way and refuses one that is not base64; pick\n`text` for a column fed plain text.",
+      "oneOf": [
+        {
+          "description": "Decode a string that is canonical padded base64; store any other\nstring as its text.",
+          "type": "string",
+          "const": "auto"
+        },
+        {
+          "description": "Every string is base64 (line breaks ignored); one that is not fails the\nrow instead of being stored as text. The default.",
+          "type": "string",
+          "const": "base64"
+        },
+        {
+          "description": "Every string is stored as its text, never decoded.",
+          "type": "string",
+          "const": "text"
+        }
+      ]
+    },
+    "sink_postgres__BinaryEncoding": {
+      "description": "How a JSON string bound to a binary column becomes bytes (#862 M-064).\n\nEvery faucet source emits binary values as base64 text, but a string from\na text origin (a CSV token, a hex digest) can also happen to be valid\nbase64. `auto` cannot tell the two apart: it decodes any canonical, padded\nbase64 string and stores anything else as its text. The default, `base64`,\ntreats every value the same way and refuses one that is not base64; pick\n`text` for a column fed plain text.",
+      "oneOf": [
+        {
+          "description": "Decode a string that is canonical padded base64; store any other\nstring as its text.",
+          "type": "string",
+          "const": "auto"
+        },
+        {
+          "description": "Every string is base64 (line breaks ignored); one that is not fails the\nrow instead of being stored as text. The default.",
+          "type": "string",
+          "const": "base64"
+        },
+        {
+          "description": "Every string is stored as its text, never decoded.",
+          "type": "string",
+          "const": "text"
+        }
       ]
     }
   }

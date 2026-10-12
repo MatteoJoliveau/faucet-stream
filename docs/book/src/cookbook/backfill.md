@@ -68,6 +68,13 @@ one partition per one-day window with no extra configuration. (`faucet run`
 rejects a config whose source still holds a `${backfill.*}` token, pointing you
 back at `faucet backfill`.)
 
+Units that run at once must not share a file or object destination: a file,
+`s3`, `gcs`, `azure-blob` or `sftp` sink whose path has no `${backfill.*}` or
+`${now.*}` token is refused with `--concurrency` above 1 (and by
+`POST /v1/backfill` for a range of several units), because concurrent writers
+of one file overwrite each other. Put a per-window token in the path, as the
+example above does, or pass `--concurrency 1`.
+
 ## Windows, timezones, DST
 
 `--window` takes `45s`, `30m`, `6h`, `1d`, or `1w`; omitted (and no
@@ -164,7 +171,7 @@ curl -s -X POST http://127.0.0.1:8080/v1/backfill \
         '{config: $cfg, from: "2026-06-01", to: "2026-07-01", window: "1d"}')"
 ```
 
-Unit runs are named `{name}-backfill-{unit}` and labelled
+Unit runs are named `{name}-backfill-{range_hash}-{unit}` and labelled
 `backfill=<range-hash>` + `backfill_unit=<unit>`; the pipeline `name` is
 rewritten per unit so state keys stay namespaced, and delivery is forced to
 at-least-once. Deterministic idempotency keys (`backfill:{hash}:{unit}`) make
