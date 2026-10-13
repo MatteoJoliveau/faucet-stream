@@ -311,6 +311,16 @@ pub trait Source: Send + Sync {
         }
     }
 
+    /// What this source can do (RFC 0013, #876). The default derives every
+    /// field from the per-capability methods above
+    /// ([`Capabilities::of_source`](crate::Capabilities::of_source)); override
+    /// it to declare a capability no method expresses (range digests, lag),
+    /// keeping the connector's [`ConnectorDescriptor`](crate::ConnectorDescriptor)
+    /// in agreement. Decorators must forward this.
+    fn capabilities(&self) -> crate::capabilities::Capabilities {
+        crate::capabilities::Capabilities::of_source(self)
+    }
+
     /// Whether this source can split its work into independent shards for
     /// clustered (Mode B) execution. Default: `false` (single whole-dataset
     /// shard). Sources with a natural partition (object-store prefixes, table
@@ -492,6 +502,16 @@ pub trait Source: Send + Sync {
     /// by storing the instant behind interior mutability.
     fn set_run_clock(&self, _now: chrono::DateTime<chrono::Utc>) {}
 
+    /// Receive the run's [`CallContext`](crate::io::CallContext) (#880): the
+    /// cancel token, the round-trip recorder and any deadline every backend
+    /// call should honour. Called once before streaming.
+    ///
+    /// A connector stores it in a [`CallSlot`](crate::io::CallSlot) and runs
+    /// its backend calls through [`CallSlot::call`](crate::io::CallSlot::call),
+    /// which layers the connector's own timeout and retry settings over it.
+    /// Defaulted to a no-op; a wrapping source forwards it.
+    fn set_call_context(&self, _ctx: crate::io::CallContext) {}
+
     /// Receive the run's cancellation token ([`Pipeline::with_cancel`](crate::Pipeline::with_cancel)),
     /// installed once before streaming.
     ///
@@ -579,9 +599,38 @@ pub trait Sink: Send + Sync {
     /// onto a uniform all-`Ok(())` vector. An outer failure is bubbled up
     /// unchanged so the pipeline's DLQ router can apply its `on_batch_error`
     /// policy at a single decision point.
+    ///
+    /// The default checks the write's [`WriteReport`](crate::WriteReport)
+    /// (#879): rows it neither wrote nor reported as coalesced fail the batch
+    /// with [`FaucetError::RowsUnaccounted`] instead of being reported `Ok`.
     async fn write_batch_partial(&self, records: &[Value]) -> Result<Vec<RowOutcome>, FaucetError> {
-        self.write_batch(records).await?;
+        self.write_batch_reported(records)
+            .await?
+            .check(records.len())?;
         Ok(records.iter().map(|_| Ok(())).collect())
+    }
+
+    /// Write a batch and report what happened to every row offered (#879).
+    ///
+    /// The pipeline calls this instead of [`Self::write_batch`] and checks that
+    /// `accepted + coalesced + skipped` covers the page; a shortfall fails the
+    /// page with [`FaucetError::RowsUnaccounted`]. The default wraps
+    /// `write_batch`'s count; for a sink configured to merge rows by key
+    /// ([`Self::dedups_by_key`] — keyed upsert / delete, last write wins) it
+    /// counts the rows the count falls short by as
+    /// [`coalesced`](crate::WriteReport::coalesced). A sink that declines rows
+    /// by design of its configuration overrides this and reports them as
+    /// [`skipped`](crate::WriteReport::skipped).
+    async fn write_batch_reported(
+        &self,
+        records: &[Value],
+    ) -> Result<crate::accounting::WriteReport, FaucetError> {
+        let n = self.write_batch(records).await?;
+        Ok(if self.dedups_by_key() {
+            crate::accounting::WriteReport::keyed(records.len(), n)
+        } else {
+            crate::accounting::WriteReport::accepted(n)
+        })
     }
 
     /// What a failed batch write leaves behind (#737): nothing
@@ -710,6 +759,17 @@ pub trait Sink: Send + Sync {
         } else {
             crate::idempotency::SinkGuarantee::AtLeastOnce
         }
+    }
+
+    /// What this sink can do (RFC 0013, #876). The default derives every field
+    /// from the per-capability methods
+    /// ([`Capabilities::of_sink`](crate::Capabilities::of_sink)); override it
+    /// to declare a capability no method expresses (how unknown fields are
+    /// treated, scoped overwrite), keeping the connector's
+    /// [`ConnectorDescriptor`](crate::ConnectorDescriptor) in agreement.
+    /// Decorators must forward this.
+    fn capabilities(&self) -> crate::capabilities::Capabilities {
+        crate::capabilities::Capabilities::of_sink(self)
     }
 
     /// Whether a **plain [`write_batch`](Self::write_batch) is safe to replay**
@@ -850,6 +910,31 @@ pub trait Sink: Send + Sync {
     ) -> Result<usize, FaucetError> {
         let _ = (scope, token);
         self.write_batch(records).await
+    }
+
+    /// [`write_batch_idempotent`](Self::write_batch_idempotent) with a
+    /// [`WriteReport`](crate::accounting::WriteReport): the exactly-once path
+    /// calls this, and a page whose report does not account for every row it
+    /// offered fails with [`FaucetError::RowsUnaccounted`] before its bookmark
+    /// is persisted (#879). Override it when the sink declines rows by design
+    /// inside the atomic commit (a record without a key under a skip policy)
+    /// and report them as `skipped`.
+    ///
+    /// The default credits the rows `write_batch_idempotent` returns — as
+    /// coalesced-by-key when [`dedups_by_key`](Self::dedups_by_key) — so a
+    /// sink that silently writes fewer rows than it was offered fails the page.
+    async fn write_batch_idempotent_reported(
+        &self,
+        records: &[Value],
+        scope: &str,
+        token: &str,
+    ) -> Result<crate::accounting::WriteReport, FaucetError> {
+        let n = self.write_batch_idempotent(records, scope, token).await?;
+        Ok(if self.dedups_by_key() {
+            crate::accounting::WriteReport::keyed(records.len(), n)
+        } else {
+            crate::accounting::WriteReport::accepted(n)
+        })
     }
 
     /// The last token durably committed for `scope`, or `None` if this sink has
@@ -1026,6 +1111,13 @@ pub trait Sink: Send + Sync {
         _recorder: std::sync::Arc<crate::observability::RoundtripRecorder>,
     ) {
     }
+
+    /// Receive the run's [`CallContext`](crate::io::CallContext) (#880). See
+    /// [`Source::set_call_context`]. A sink's context never carries the run's
+    /// cancel token — a cancelled run still flushes its sinks — nor a retry
+    /// policy: writes are retried page by page under ADR 0007. Defaulted to a
+    /// no-op; a wrapping sink forwards it.
+    fn set_call_context(&self, _ctx: crate::io::CallContext) {}
 
     /// Logical dataset identity for lineage emission, following OpenLineage
     /// naming conventions (<https://openlineage.io/docs/spec/naming>).

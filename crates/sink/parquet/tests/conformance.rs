@@ -110,3 +110,38 @@ async fn conformance_capabilities_truthful() {
     assert!(!sink.supports_idempotent_writes());
     assert!(!sink.dedups_by_key());
 }
+
+/// The footer is written at flush: a cancelled run must still flush (#878).
+#[tokio::test]
+async fn conformance_cancellation_flushes() {
+    let dir = tempfile::tempdir().unwrap();
+    let sink = ParquetSink::new(ParquetSinkConfig::local(
+        dir.path().to_string_lossy().to_string(),
+    ))
+    .await
+    .unwrap();
+    let dir_path = dir.path().to_path_buf();
+    faucet_conformance::assert_cancellation_flushes(&sink, || {
+        let dir_path = dir_path.clone();
+        async move { count_rows(&dir_path).await }
+    })
+    .await;
+}
+
+// ── Descriptor (RFC 0013): agrees with the built sink ───────────────────────
+#[tokio::test]
+async fn descriptor_matches_built_sink() {
+    let dir = tempfile::tempdir().unwrap();
+    let v = serde_json::to_value(ParquetSinkConfig::local(
+        dir.path().to_string_lossy().to_string(),
+    ))
+    .unwrap();
+    let cfg: ParquetSinkConfig = serde_json::from_value(v.clone()).unwrap();
+    let built = ParquetSink::new(cfg).await.unwrap();
+    faucet_conformance::assert_descriptor_matches_sink(
+        &faucet_sink_parquet::DESCRIPTOR,
+        "parquet",
+        &v,
+        &built,
+    );
+}

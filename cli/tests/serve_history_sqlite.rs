@@ -3,6 +3,7 @@
 //! by the Postgres backend too — against a real database file, no server needed.
 //! Requires the `serve-history-sqlite` feature.
 #![cfg(feature = "serve-history-sqlite")]
+#![allow(clippy::disallowed_methods)] // tests drive time and raw clients directly
 
 use chrono::{Duration as ChronoDuration, Utc};
 use faucet_cli::serve::history::InstanceHeartbeat;
@@ -402,6 +403,7 @@ async fn server_with_sqlite_history_persists_runs() {
         vault_previous_key: Vec::new(),
         connect_providers: None,
         allow_subprocess_connectors: false,
+        references: Default::default(),
     };
     let mut config = ServeConfig::from_args(args).unwrap();
     config.log_level = "warn".into();

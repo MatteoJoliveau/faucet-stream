@@ -78,3 +78,40 @@ async fn conformance_errors_not_panics() {
         .expect("source builds; the query only fails at read time");
     faucet_conformance::assert_errors_not_panics(&source).await;
 }
+
+#[tokio::test]
+async fn descriptor_matches_the_built_source() {
+    for v in [
+        serde_json::json!({"database": ":memory:", "query": "SELECT 1"}),
+        serde_json::json!({"database": ":memory:", "query": "SELECT 1", "batch_size": 0}),
+    ] {
+        let cfg: DuckdbSourceConfig = serde_json::from_value(v.clone()).unwrap();
+        let built = DuckdbSource::new(cfg).await.expect("source");
+        faucet_conformance::assert_descriptor_matches_source(
+            &faucet_source_duckdb::DESCRIPTOR,
+            "duckdb",
+            &v,
+            &built,
+        );
+    }
+}
+
+/// A query that would run for hours stands in for a hung backend (#880): the
+/// call ends at the deadline and on cancel, and interrupts the query.
+#[tokio::test(flavor = "multi_thread")]
+async fn conformance_call_deadline() {
+    let mut built = Vec::new();
+    for _ in 0..2 {
+        built.push(
+            DuckdbSource::new(DuckdbSourceConfig::new(
+                ":memory:",
+                "SELECT count(*) AS n FROM range(1000000000000) a",
+            ))
+            .await
+            .expect("source"),
+        );
+    }
+    let built = std::sync::Mutex::new(built);
+    faucet_conformance::calls::assert_source_call_deadline(|| built.lock().unwrap().pop().unwrap())
+        .await;
+}

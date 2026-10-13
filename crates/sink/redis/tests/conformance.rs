@@ -10,6 +10,7 @@
 //!
 //! Checks 4 and 5 boot a real Redis container (reusing `exactly_once.rs`'s
 //! setup), so they require Docker.
+#![allow(clippy::disallowed_methods)] // tests drive time and raw clients directly
 use faucet_conformance::assert_config_schema_valid_value;
 
 #[test]
@@ -107,6 +108,38 @@ mod idempotent {
             let url = url.clone();
             async move { count_entries(&url).await }
         })
+        .await;
+        // #878: per-row pipeline outcomes are truthful.
+        faucet_conformance::assert_partial_outcomes_truthful(&sink, || {
+            let url = url.clone();
+            async move { count_entries(&url).await }
+        })
+        .await;
+    }
+
+    /// A server whose clients are paused stands in for a hung backend (#880):
+    /// the write waits until the pause ends.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn conformance_call_deadline() {
+        let (_container, url, first) = fresh_sink().await;
+        let second = RedisSink::new(RedisSinkConfig::new(
+            &url,
+            RedisSinkType::List { key: "q".into() },
+        ))
+        .await
+        .expect("sink build");
+        let mut admin = open_conn(&url).await;
+        let _: () = redis::cmd("CLIENT")
+            .arg("PAUSE")
+            .arg(20_000)
+            .query_async(&mut admin)
+            .await
+            .expect("pause clients");
+        let built = std::sync::Mutex::new(vec![first, second]);
+        faucet_conformance::calls::assert_sink_call_deadline(
+            || built.lock().unwrap().pop().unwrap(),
+            &[serde_json::json!({"id": 1})],
+        )
         .await;
     }
 }

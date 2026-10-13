@@ -154,6 +154,19 @@ is refused on a best-effort configuration unless the `dlq:` block sets
 already landed a second time). See
 [batch atomicity](https://faucet-hq.github.io/faucet-stream/cookbook/dlq.html#batch-atomicity-and-dlq_all).
 
+## Capabilities
+
+Append only; a staged load when a `staging:` block is set and the `staging` feature is compiled in. `faucet list --json` prints the declaration.
+
+## Timeouts, cancellation and retries
+
+Every request — `INSERT … FORMAT JSONEachRow`, DDL, the column lookup, the
+staged `INSERT … SELECT` — runs through the pipeline's `CallContext` (#880):
+each is sent once, any caller deadline ends it, and each is metered as a round
+trip (`insert`, `query`). Requests go through `faucet_core::http::Client`, so a
+redirect to another origin drops the credentials. The HTTP client's connect /
+idle-read timeouts are unchanged.
+
 ## License
 
 Licensed under either of Apache License, Version 2.0 or MIT license at your

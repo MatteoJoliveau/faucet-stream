@@ -27,6 +27,8 @@ pub struct SnowflakeSink {
     pending: tokio::sync::Mutex<faucet_core::PageAccumulator>,
     config: SnowflakeSinkConfig,
     client: Client,
+    /// Backend-call context (#880): every request runs through it, once.
+    calls: faucet_core::CallSlot,
     /// Optional explicit endpoint override. When `None`, the URL is derived
     /// from `config.account`. Used by tests to point the sink at a mock
     /// server, and useful for proxies / private-link deployments.
@@ -357,6 +359,11 @@ impl SnowflakeSink {
             columns: std::sync::Mutex::new(None),
             config,
             client: http_client()?,
+            calls: faucet_core::CallSlot::new(
+                faucet_core::CallContext::new()
+                    .without_timeout()
+                    .without_retry(),
+            ),
             endpoint: None,
             auth_provider: None,
             commit_table_ready: OnceCell::new(),
@@ -471,15 +478,20 @@ impl SnowflakeSink {
         }
 
         let resp = self
-            .client
-            .post(&url)
-            .header("Authorization", &auth)
-            .header("Content-Type", "application/json")
-            .header("Accept", "application/json")
-            .header("X-Snowflake-Authorization-Token-Type", token_type)
-            .json(&body)
-            .send()
-            .await
+            .calls
+            .call("submit", || async {
+                Ok(self
+                    .client
+                    .post(&url)
+                    .header("Authorization", &auth)
+                    .header("Content-Type", "application/json")
+                    .header("Accept", "application/json")
+                    .header("X-Snowflake-Authorization-Token-Type", token_type)
+                    .json(&body)
+                    .send()
+                    .await)
+            })
+            .await?
             .map_err(|e| FaucetError::Sink(format!("Snowflake request failed: {e}")))?;
 
         let status = resp.status();
@@ -532,13 +544,18 @@ impl SnowflakeSink {
             let (auth, token_type) = self.auth_header().await?;
             guard.set_auth(auth.clone(), token_type);
             let resp = self
-                .client
-                .get(&url)
-                .header("Authorization", &auth)
-                .header("Accept", "application/json")
-                .header("X-Snowflake-Authorization-Token-Type", token_type)
-                .send()
-                .await
+                .calls
+                .call("poll", || async {
+                    Ok(self
+                        .client
+                        .get(&url)
+                        .header("Authorization", &auth)
+                        .header("Accept", "application/json")
+                        .header("X-Snowflake-Authorization-Token-Type", token_type)
+                        .send()
+                        .await)
+                })
+                .await?
                 .map_err(|e| FaucetError::Sink(format!("Snowflake poll request failed: {e}")))?;
 
             let status = resp.status();
@@ -555,7 +572,9 @@ impl SnowflakeSink {
                         poll_timeout.as_secs()
                     )));
                 }
-                tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+                self.calls
+                    .wait(std::time::Duration::from_millis(500))
+                    .await?;
                 continue;
             }
             if !status.is_success() {
@@ -838,6 +857,17 @@ impl faucet_core::Sink for SnowflakeSink {
 
     fn connector_name(&self) -> &'static str {
         "snowflake"
+    }
+
+    fn set_call_context(&self, ctx: faucet_core::io::CallContext) {
+        self.calls.install(ctx);
+    }
+
+    fn set_roundtrip_recorder(
+        &self,
+        recorder: std::sync::Arc<faucet_core::observability::RoundtripRecorder>,
+    ) {
+        self.calls.install_recorder(recorder);
     }
 
     /// Snowflake bulk-loads via `COPY INTO … FROM @stage` under `bulk_load`
@@ -1124,7 +1154,9 @@ impl faucet_core::Sink for SnowflakeSink {
             .get_or_try_init(|| async { crate::bulk::resolve_store(stage) })
             .await?;
         let file = format!("faucet-{}.parquet", uuid::Uuid::new_v4());
-        crate::bulk::upload(store, &file, bytes).await?;
+        self.calls
+            .call_once("stage", crate::bulk::upload(store, &file, bytes))
+            .await?;
 
         // Load the staged Parquet file into the target table.
         let sql = crate::bulk::build_copy_into(

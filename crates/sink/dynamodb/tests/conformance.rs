@@ -62,7 +62,7 @@ async fn conformance_keyed_battery() {
     let Some((_c, endpoint, client)) = start().await else {
         return;
     };
-    for t in ["caps", "modes", "replay"] {
+    for t in ["caps", "modes", "replay", "declared"] {
         keyed_table(&client, t).await;
     }
 
@@ -77,4 +77,58 @@ async fn conformance_keyed_battery() {
 
     let sink = keyed_sink(&endpoint, "replay").await;
     assert_idempotent_replay(&sink, || count(&client, "replay")).await;
+
+    // #878: per-row BatchWriteItem outcomes are truthful and a replayed keyed
+    // write converges.
+    let sink = keyed_sink(&endpoint, "declared").await;
+    faucet_conformance::assert_partial_outcomes_truthful(&sink, || count(&client, "declared"))
+        .await;
+    faucet_conformance::assert_replay_safe(&sink, || count(&client, "declared")).await;
+}
+
+/// The static descriptor answers exactly what the built sink declares (RFC 0013).
+#[tokio::test(flavor = "multi_thread")]
+async fn conformance_descriptor_matches_built_sink() {
+    #[allow(unused_mut)]
+    let configs = vec![
+        r#"{"table_name": "t", "region": "us-east-1", "endpoint_url": "http://127.0.0.1:1", "credentials": {"type": "access_key", "config": {"access_key_id": "t", "secret_access_key": "t"}}}"#,
+        r#"{"table_name": "t", "write_mode": "upsert", "key": ["pk"], "region": "us-east-1", "endpoint_url": "http://127.0.0.1:1", "credentials": {"type": "access_key", "config": {"access_key_id": "t", "secret_access_key": "t"}}}"#,
+        r#"{"table_name": "t", "write_mode": "delete", "key": ["pk"], "region": "us-east-1", "endpoint_url": "http://127.0.0.1:1", "credentials": {"type": "access_key", "config": {"access_key_id": "t", "secret_access_key": "t"}}}"#,
+    ];
+    for raw in configs {
+        let v: faucet_core::Value = faucet_core::serde_json::from_str(raw).expect("json");
+        let cfg: faucet_sink_dynamodb::DynamoDbSinkConfig =
+            faucet_core::serde_json::from_value(v.clone()).expect("config");
+        let built = faucet_sink_dynamodb::DynamoDbSink::new(cfg)
+            .await
+            .expect("offline build");
+        faucet_conformance::assert_descriptor_matches_sink(
+            &faucet_sink_dynamodb::DESCRIPTOR,
+            "dynamodb",
+            &v,
+            &built,
+        );
+    }
+}
+
+// ── Check: backend calls honour the call deadline and cancel (#880) ──────────
+
+#[tokio::test(flavor = "multi_thread")]
+async fn conformance_call_deadline() {
+    let hung = faucet_conformance::hung::SilentListener::start()
+        .await
+        .expect("listener");
+    let endpoint = hung.http_url();
+    let make = || {
+        let cfg = config(&endpoint, "hung");
+        tokio::task::block_in_place(|| {
+            tokio::runtime::Handle::current().block_on(DynamoDbSink::new(cfg))
+        })
+        .expect("sink builds offline")
+    };
+    faucet_conformance::calls::assert_sink_call_deadline(
+        make,
+        &[faucet_core::serde_json::json!({"id": 1})],
+    )
+    .await;
 }

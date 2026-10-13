@@ -140,3 +140,53 @@ async fn conformance_capabilities_truthful() {
     })
     .await;
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn conformance_call_deadline() {
+    // A table another session holds locked stands in for a hung backend (#880).
+    let (_container, _permit, url, first) = fresh_sink().await;
+    let mut cfg = MysqlSinkConfig::new(&url, "t").column_mapping(MysqlColumnMapping::AutoMap);
+    cfg.write_timeout_secs = 0;
+    let second = MysqlSink::new(cfg).await.expect("sink");
+    let mut lock = <sqlx::MySqlConnection as sqlx::Connection>::connect(&url)
+        .await
+        .expect("lock connection");
+    sqlx::Executor::execute(&mut lock, "LOCK TABLES t WRITE")
+        .await
+        .expect("lock");
+    let built = std::sync::Mutex::new(vec![first, second]);
+    faucet_conformance::calls::assert_sink_call_deadline(
+        || built.lock().unwrap().pop().unwrap(),
+        &[serde_json::json!({"id": 1, "v": "a"})],
+    )
+    .await;
+}
+
+/// The capabilities the sink declares beyond its descriptor (#878): truthful
+/// per-row outcomes, a replay-safe keyed write, an atomic keyed batch (strict
+/// mode rejects a non-numeric `BIGINT`, failing the transaction) and the
+/// overwrite lifecycle.
+#[tokio::test(flavor = "multi_thread")]
+async fn conformance_declared_capabilities() {
+    let (_container, _permit, url, sink) = fresh_sink().await;
+    let count = || {
+        let url = url.clone();
+        async move { count_rows(&url).await }
+    };
+    faucet_conformance::assert_partial_outcomes_truthful(&sink, count).await;
+    faucet_conformance::assert_replay_safe(&sink, count).await;
+    faucet_conformance::assert_batch_atomicity_truthful(
+        &sink,
+        count,
+        &[
+            serde_json::json!({"id": 961, "v": "kept only if the batch is torn"}),
+            serde_json::json!({"id": "not a number", "v": "x"}),
+        ],
+    )
+    .await;
+
+    let mut cfg = MysqlSinkConfig::new(&url, "t").column_mapping(MysqlColumnMapping::AutoMap);
+    cfg.write.write_mode = WriteMode::Overwrite;
+    let overwrite = MysqlSink::new(cfg).await.expect("overwrite sink");
+    faucet_conformance::assert_overwrite_lifecycle(&overwrite, count).await;
+}

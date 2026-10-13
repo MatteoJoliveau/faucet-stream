@@ -11,6 +11,7 @@
 //! list nor the spec would slip through — so a reviewer must update both when
 //! adding an endpoint. Requires the `serve` feature.
 #![cfg(feature = "serve")]
+#![allow(clippy::disallowed_methods)] // tests drive time and raw clients directly
 
 use faucet_cli::cli::ServeArgs;
 use faucet_cli::serve::ServeConfig;
@@ -291,6 +292,7 @@ async fn every_documented_route_is_wired_on_the_live_server() {
         vault_previous_key: Vec::new(),
         connect_providers: None,
         allow_subprocess_connectors: false,
+        references: Default::default(),
     };
     let mut config = ServeConfig::from_args(args).unwrap();
     config.log_level = "warn".into();

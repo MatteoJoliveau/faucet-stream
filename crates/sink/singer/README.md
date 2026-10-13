@@ -169,6 +169,19 @@ Pipeline::new(source, &sink).run().await?;
 to a private temp file. It does not run the target — Singer targets have no
 side-effect-free probe mode.
 
+## Capabilities
+
+The crate exports `DESCRIPTOR` (RFC 0013): write modes `append`, `upsert` and `overwrite`. `upsert` hands `key` to the external target as `key_properties`, which faucet cannot vouch for, so the sink does **not** claim the keyed-upsert guarantee (`delivery: exactly_once` cannot rely on it) and never reports key deduplication. `faucet list --json` prints the declaration.
+
+## Timeouts, cancellation and retries
+
+Every page written to the target and every wait for its confirmation run
+through the pipeline's `CallContext` (#880), once: any caller deadline ends the
+wait, the target is stopped, and — as for any other target failure — a page
+not yet confirmed fails the run. Spawning the target does not block the
+runtime: a transient `Text file busy` retry waits through the same context.
+`flush_timeout_secs` and the stdin write timeout are unchanged.
+
 ## License
 
 Licensed under either of Apache-2.0 or MIT at your option.

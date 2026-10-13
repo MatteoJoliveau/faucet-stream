@@ -146,6 +146,18 @@ let rows = source.fetch_all().await?;
 
 The catalog features forward to [`faucet-common-iceberg`](https://crates.io/crates/faucet-common-iceberg), the same crate the sink uses, so both connectors gate catalogs identically.
 
+## Capabilities
+
+Declares `discover` and `shardable` (hash of data-file path), plus columnar (Arrow) output when built with the `arrow` feature. `faucet list --json` prints these declared capabilities.
+
+## Timeouts, cancellation and retries
+
+Catalog calls, scan planning and every batch read run through the pipeline's
+`CallContext` (#880): the run's cancel token stops a stalled call, any caller
+deadline ends it, and catalog and planning calls are metered as round trips
+(`load`, `plan`, `list`, `catalog`). The catalog client's and file IO's own
+timeouts and retry are unchanged.
+
 ## License
 
 MIT OR Apache-2.0.

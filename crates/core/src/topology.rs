@@ -240,6 +240,10 @@ pub struct TopologyGovernance {
     /// idempotent sinks, durable state, no DLQ) — `run_stream` re-checks the sink
     /// side and downgrades with a warning rather than pretending.
     pub delivery: crate::idempotency::DeliveryMode,
+    /// Each sink node's DLQ as a governed destination (#870), built by the
+    /// caller with [`Governance::dlq_config`](crate::governance::Governance::dlq_config).
+    /// A sink node with no entry writes to [`TopologyOptions::dlq`].
+    pub dlq_by_sink: HashMap<String, DlqConfig>,
 }
 
 impl TopologyGovernance {
@@ -785,6 +789,7 @@ impl Topology {
     /// `run_reported` would have returned. A sink that a failed node feeds is
     /// reported as failed too: its input closing looked like a normal end of
     /// stream, but it never received its complete input.
+    #[allow(clippy::disallowed_methods)] // a runtime timer, not a connector backend call
     pub async fn run_attributed(
         self,
         opts: TopologyOptions,
@@ -1000,7 +1005,11 @@ impl Topology {
                             pipeline_name: pipeline,
                             run_id: opts.run_id.clone(),
                             state_store: opts.state_store.clone(),
-                            dlq: opts.dlq.clone(),
+                            dlq: governance
+                                .dlq_by_sink
+                                .get(&id)
+                                .cloned()
+                                .or_else(|| opts.dlq.clone()),
                             cancel: cancel.clone(),
                             // Masking is destination-scoped, so each sink node
                             // takes the policy compiled for it (if any); the rest
@@ -1053,7 +1062,11 @@ impl Topology {
             .collect();
         let handles: Vec<tokio::task::JoinHandle<Result<NodeOutcome, FaucetError>>> = futs
             .into_iter()
-            .map(|f| tokio::spawn(tracing::Instrument::in_current_span(f)))
+            .map(|f| {
+                tokio::spawn(tracing::Instrument::in_current_span(
+                    crate::http::inherit_reference_policy(f),
+                ))
+            })
             .collect();
         // Dropping a `JoinHandle` detaches the task rather than cancelling it, so
         // every abandon path below aborts explicitly.
@@ -1714,7 +1727,8 @@ async fn compute_resume(
     }
     let mut stored: Vec<(String, Option<Value>)> = Vec::with_capacity(sinks.len());
     for (id, _) in sinks {
-        let key = format!("{}::{}", opts.pipeline_name, id);
+        let key = crate::state_key::StateKey::invocation(opts.pipeline_name.as_str(), id.as_str())
+            .render();
         let value = match store.get(&key).await {
             // Refuse a bookmark the source cannot read; migrate an older one (#736).
             Ok(Some(v)) => Some(match source {
@@ -1746,7 +1760,8 @@ async fn compute_resume(
             .as_ref()
             .map(crate::idempotency::unwrap_state)
             .unwrap_or((None, 0));
-        let key = format!("{}::{}", opts.pipeline_name, id);
+        let key = crate::state_key::StateKey::invocation(opts.pipeline_name.as_str(), id.as_str())
+            .render();
         if let (Some(sink), Some(src)) = (sink, source)
             && sink.supports_idempotent_writes()
             && src.replay_guarantee() == crate::idempotency::ReplayGuarantee::Deterministic
@@ -1847,7 +1862,10 @@ fn plan_exactly_once(
         .collect();
     let keys: Vec<String> = positions
         .iter()
-        .map(|(id, _, _)| format!("'{pipeline}::{id}'"))
+        .map(|(id, _, _)| {
+            let key = crate::state_key::StateKey::invocation(pipeline, id.as_str());
+            format!("'{key}'")
+        })
         .collect();
     Err(FaucetError::State(format!(
         "topology exactly-once: the sink nodes committed different positions ({}), and the \
@@ -2402,7 +2420,9 @@ async fn run_sink_node(
     let overwriting = sink.is_overwrite();
     let mut deferred = None;
     if let Some(store) = opts.state_store {
-        let key = format!("{}::{}", opts.pipeline_name, node_id);
+        let key =
+            crate::state_key::StateKey::invocation(opts.pipeline_name.as_str(), node_id.as_str())
+                .render();
         let store: Arc<dyn StateStore> = Arc::new(crate::state_version::VersionedStateStore::new(
             store,
             key.clone(),
@@ -3092,7 +3112,7 @@ mod tests {
             .lock()
             .unwrap_or_else(|e| e.into_inner());
         let snap = crate::observability::decorator::source_tests::snapshotter();
-        let probe = crate::sink_forwarding::HookSink::default();
+        let probe = crate::forwarding::HookSink::default();
         let topo = Topology::builder()
             .source("src-node", VecSource::boxed(recs(3)))
             .sink("sink-node", Box::new(probe.clone()))
@@ -3944,6 +3964,7 @@ mod delivery_and_report_tests {
 }
 
 #[cfg(test)]
+#[allow(clippy::disallowed_methods)] // tests drive time and raw clients directly
 mod graph_safety_tests {
     use super::tests::{CollectSink, FailingSink, VecSource, recs};
     use super::*;

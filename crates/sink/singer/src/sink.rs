@@ -55,6 +55,9 @@ pub struct SingerSink {
     redactor: Redactor,
     inner: Mutex<Inner>,
     version: OnceLock<i64>,
+    /// Backend-call context (#880): every write to the target and every wait
+    /// for its confirmation run through it, once.
+    calls: faucet_core::CallSlot,
 }
 
 #[derive(Default)]
@@ -96,6 +99,11 @@ impl SingerSink {
             config,
             inner: Mutex::new(Inner::default()),
             version: OnceLock::new(),
+            calls: faucet_core::CallSlot::new(
+                faucet_core::CallContext::new()
+                    .without_timeout()
+                    .without_retry(),
+            ),
         })
     }
 
@@ -139,7 +147,9 @@ impl SingerSink {
 
     async fn write_page(&self, inner: &mut Inner, records: &[Value]) -> Result<(), FaucetError> {
         if inner.process.is_none() {
-            inner.process = Some(TargetProcess::spawn(&self.config, &self.redactor)?);
+            inner.process = Some(
+                TargetProcess::spawn_in(&self.config, &self.redactor, &self.calls.get()).await?,
+            );
             inner.sent_schema = None;
         }
         let stream = self.config.stream_name();
@@ -262,7 +272,10 @@ impl Sink for SingerSink {
         let earlier = inner.unconfirmed_pages;
         inner.interrupted = true;
         inner.unconfirmed_pages += 1;
-        let result = self.write_page(&mut inner, records).await;
+        let result = self
+            .calls
+            .call_once("write", self.write_page(&mut inner, records))
+            .await;
         inner.interrupted = false;
         if let Err(e) = result {
             self.stop(&mut inner).await;
@@ -277,7 +290,10 @@ impl Sink for SingerSink {
     async fn flush(&self) -> Result<(), FaucetError> {
         let mut inner = self.inner.lock().await;
         inner.check_poisoned()?;
-        let result = self.confirm(&mut inner).await;
+        let result = self
+            .calls
+            .call_once("confirm", self.confirm(&mut inner))
+            .await;
         if let Err(e) = &result {
             inner.sent_schema = None;
             inner.poison(e);
@@ -297,6 +313,11 @@ impl Sink for SingerSink {
         false
     }
 
+    /// `key` goes to an external target whose convergence faucet cannot vouch for.
+    fn sink_guarantee(&self) -> faucet_core::SinkGuarantee {
+        faucet_core::SinkGuarantee::AtLeastOnce
+    }
+
     fn is_overwrite(&self) -> bool {
         self.config.write.is_overwrite()
     }
@@ -312,12 +333,17 @@ impl Sink for SingerSink {
     async fn commit_overwrite(&self) -> Result<(), FaucetError> {
         let mut inner = self.inner.lock().await;
         inner.check_poisoned()?;
-        if let Err(e) = self.confirm(&mut inner).await {
+        if let Err(e) = self
+            .calls
+            .call_once("confirm", self.confirm(&mut inner))
+            .await
+        {
             inner.poison(&e);
             return Err(e);
         }
         let stream = self.config.stream_name();
-        let mut process = TargetProcess::spawn(&self.config, &self.redactor)?;
+        let mut process =
+            TargetProcess::spawn_in(&self.config, &self.redactor, &self.calls.get()).await?;
         let mut buf = Vec::new();
         // The committing sink is usually not one of the writers: it sends the
         // schema the run's writers sent. An empty SCHEMA could reset the
@@ -340,9 +366,12 @@ impl Sink for SingerSink {
         write_activate_version(&mut buf, stream, self.activate_version());
         inner.flush_seq += 1;
         write_state(&mut buf, &flush_marker(stream, inner.flush_seq));
-        process.write(&buf).await?;
-        process
-            .finish_confirmed(inner.flush_seq, self.timeout())
+        let seq = inner.flush_seq;
+        self.calls
+            .call_once("confirm", async {
+                process.write(&buf).await?;
+                process.finish_confirmed(seq, self.timeout()).await
+            })
             .await
     }
 
@@ -361,6 +390,17 @@ impl Sink for SingerSink {
 
     fn connector_name(&self) -> &'static str {
         "singer"
+    }
+
+    fn set_call_context(&self, ctx: faucet_core::io::CallContext) {
+        self.calls.install(ctx);
+    }
+
+    fn set_roundtrip_recorder(
+        &self,
+        recorder: std::sync::Arc<faucet_core::observability::RoundtripRecorder>,
+    ) {
+        self.calls.install_recorder(recorder);
     }
 
     fn dataset_uri(&self) -> String {
@@ -404,6 +444,15 @@ mod tests {
 
     fn sink(v: Value) -> SingerSink {
         SingerSink::new(serde_json::from_value(v).unwrap()).unwrap()
+    }
+
+    #[test]
+    fn upsert_is_not_a_keyed_upsert_guarantee() {
+        let s = sink(json!({"target_command": "t", "write_mode": "upsert", "key": ["id"]}));
+        assert_eq!(s.sink_guarantee(), faucet_core::SinkGuarantee::AtLeastOnce);
+        let caps = Sink::capabilities(&s);
+        assert!(caps.supports_write_mode(WriteMode::Upsert));
+        assert!(!caps.keyed_upsert() && !caps.keyed_dedup());
     }
 
     #[test]

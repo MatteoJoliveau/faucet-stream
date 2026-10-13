@@ -45,6 +45,11 @@ pub const RESERVED_IDS: &[&str] = &[
 #[derive(Debug, Clone)]
 pub struct ExpandedNode {
     pub id: String,
+    /// Governance passes this node's caller turned off on purpose, with the
+    /// reason (#875) — a DLQ replay does not re-mask, a repair does not
+    /// profile. Applied by `governance_for`; empty for
+    /// every row a config expands to.
+    pub opt_outs: Vec<faucet_core::OptOut>,
     pub row_index: usize,
     /// Relative dispatch cost for `execution.schedule: lpt` (#644); `None`
     /// means unranked, which sorts after every weighted row.
@@ -772,6 +777,7 @@ pub fn expand(cfg: &PipelineConfig) -> CliResult<Vec<ExpandedNode>> {
                 &format!("row '{row_id}'"),
             )?;
             out.push(ExpandedNode {
+                opt_outs: Vec::new(),
                 id: ids[i].clone(),
                 row_index: i,
                 // A discovery row enumerates a value set rather than moving
@@ -1048,11 +1054,14 @@ pub fn expand(cfg: &PipelineConfig) -> CliResult<Vec<ExpandedNode>> {
                 }
                 Some(_) => {}
             }
-            if !crate::rollback::sink_supports_rollback(&merged_sink.kind) {
+            if !crate::registry::sink_capabilities(&merged_sink.kind, &merged_sink.config)
+                .rollback()
+            {
                 return Err(CliError::Config(format!(
-                    "row '{row_id}': rollback: sink '{}' cannot undo a run (supported: {})",
+                    "row '{row_id}': rollback: sink '{}' cannot undo a run with this config \
+                     (sinks that can: {})",
                     merged_sink.kind,
-                    crate::rollback::ROLLBACK_SINK_KINDS.join(", ")
+                    crate::registry::sink_kinds_where(|c| c.rollback()).join(", ")
                 )));
             }
             if cfg.metadata_columns.as_ref().is_some_and(|m| !m.enabled) {
@@ -1089,17 +1098,13 @@ pub fn expand(cfg: &PipelineConfig) -> CliResult<Vec<ExpandedNode>> {
                 )));
             }
         };
-        if !crate::registry::sink_supported_write_modes(&merged_sink.kind).contains(&mode) {
+        let sink_caps = crate::registry::sink_capabilities(&merged_sink.kind, &merged_sink.config);
+        if !sink_caps.supports_write_mode(mode) {
+            let capable = crate::registry::sink_kinds_where(|c| c.supports_write_mode(mode));
             let sinks = if matches!(mode, faucet_core::WriteMode::Overwrite) {
-                format!(
-                    "overwrite sinks: {}",
-                    crate::registry::OVERWRITE_SINK_KINDS.join(", ")
-                )
+                format!("overwrite sinks: {}", capable.join(", "))
             } else {
-                format!(
-                    "upsert/delete sinks: {}",
-                    crate::registry::UPSERT_SINK_KINDS.join(", ")
-                )
+                format!("upsert/delete sinks: {}", capable.join(", "))
             };
             return Err(CliError::Config(format!(
                 "row '{}': write_mode '{}' is not supported by sink '{}' ({})",
@@ -1201,13 +1206,13 @@ pub fn expand(cfg: &PipelineConfig) -> CliResult<Vec<ExpandedNode>> {
                     ids[i]
                 )));
             }
-            if !crate::registry::sink_supports_scoped_overwrite(&merged_sink.kind) {
+            if !sink_caps.scoped_overwrite() {
                 return Err(CliError::Config(format!(
                     "row '{}': scoped overwrite (`scope`) is not supported by sink '{}' \
                      (scoped-overwrite sinks: {})",
                     ids[i],
                     merged_sink.kind,
-                    crate::registry::SCOPED_OVERWRITE_SINK_KINDS.join(", ")
+                    crate::registry::sink_kinds_where(|c| c.scoped_overwrite()).join(", ")
                 )));
             }
             let scope: faucet_core::OverwriteScope = serde_json::from_value(scope_val.clone())
@@ -1223,19 +1228,46 @@ pub fn expand(cfg: &PipelineConfig) -> CliResult<Vec<ExpandedNode>> {
         // effectively-once even when the user did not request `exactly_once`).
         // `keyed_upsert_configured` relies on the write_mode gate above: after
         // it, an upsert/delete mode implies a non-empty `key`.
+        let source_caps =
+            crate::registry::source_capabilities(&merged_source.kind, &merged_source.config);
         let keyed_upsert_configured = matches!(
             mode,
             faucet_core::WriteMode::Upsert | faucet_core::WriteMode::Delete
-        ) && crate::registry::UPSERT_SINK_KINDS
-            .contains(&merged_sink.kind.as_str());
+        ) && sink_caps.keyed_upsert();
         let guarantee_inputs = faucet_core::GuaranteeInputs {
-            replay: crate::registry::source_replay_guarantee(&merged_source.kind),
-            sink_atomic: crate::registry::sink_supports_idempotent_writes(&merged_sink.kind),
+            replay: source_caps.replay_guarantee(),
+            sink_atomic: sink_caps.idempotent_writes(),
             keyed_upsert_configured,
             durable_state: matches!(state.as_ref(), Some(s) if s.kind != "memory"),
             dlq: dlq.is_some(),
         };
         let delivery_guarantee = faucet_core::derive_delivery_guarantee(&guarantee_inputs);
+
+        // A policy quarantine sends single rows to the DLQ; the atomic
+        // watermark commits whole pages and forbids a DLQ, so the combination
+        // is refused by name before the generic gates below (#873). Keyed
+        // upsert keeps the row path, where per-row quarantine works.
+        #[cfg(feature = "policy")]
+        if delivery == faucet_core::DeliveryMode::ExactlyOnce
+            && !keyed_upsert_configured
+            && cfg.policy.as_ref().is_some_and(|p| {
+                crate::policy::quarantines_at(
+                    p,
+                    &faucet_core::SinkFacts {
+                        id: sink_ref.clone(),
+                        kind: merged_sink.kind.clone(),
+                        attributes: merged_sink.attributes.clone(),
+                    },
+                )
+            })
+        {
+            return Err(CliError::Config(format!(
+                "row '{}': {}; use `on_runtime: fail`, or `write_mode: upsert` + `key` for \
+                 keyed-upsert effectively-once",
+                ids[i],
+                faucet_core::compat::EO_WITH_POLICY_QUARANTINE
+            )));
+        }
 
         // Exactly-once delivery gate: `delivery: exactly_once` means "require
         // ≥ effectively-once". Enforced at config-load time so `faucet
@@ -1247,9 +1279,8 @@ pub fn expand(cfg: &PipelineConfig) -> CliResult<Vec<ExpandedNode>> {
         if delivery == faucet_core::DeliveryMode::ExactlyOnce
             && delivery_guarantee == faucet_core::DeliveryGuarantee::AtLeastOnce
         {
-            if !crate::registry::source_supports_exactly_once(&merged_source.kind) {
-                let keyed_hint = if crate::registry::UPSERT_SINK_KINDS.contains(&&*merged_sink.kind)
-                {
+            if !source_caps.exactly_once() {
+                let keyed_hint = if sink_caps.keyed_upsert() {
                     format!(
                         ", or configure `write_mode: upsert` + `key` on sink '{}' for \
                          keyed-upsert effectively-once with any source",
@@ -1263,13 +1294,12 @@ pub fn expand(cfg: &PipelineConfig) -> CliResult<Vec<ExpandedNode>> {
                      (deterministic-replay sources only: {}{})",
                     ids[i],
                     merged_source.kind,
-                    crate::registry::EXACTLY_ONCE_SOURCE_KINDS.join(", "),
+                    crate::registry::source_kinds_where(|c| c.exactly_once()).join(", "),
                     keyed_hint
                 )));
             }
-            if !crate::registry::sink_supports_idempotent_writes(&merged_sink.kind) {
-                let keyed_hint = if crate::registry::UPSERT_SINK_KINDS.contains(&&*merged_sink.kind)
-                {
+            if !sink_caps.idempotent_writes() {
+                let keyed_hint = if sink_caps.keyed_upsert() {
                     format!(
                         "; alternatively configure `write_mode: upsert` + `key` on '{}' for \
                          keyed-upsert effectively-once",
@@ -1283,7 +1313,7 @@ pub fn expand(cfg: &PipelineConfig) -> CliResult<Vec<ExpandedNode>> {
                      (idempotent sinks only: {}{})",
                     ids[i],
                     merged_sink.kind,
-                    crate::registry::IDEMPOTENT_SINK_KINDS.join(", "),
+                    crate::registry::sink_kinds_where(|c| c.idempotent_writes()).join(", "),
                     keyed_hint
                 )));
             }
@@ -1348,13 +1378,13 @@ pub fn expand(cfg: &PipelineConfig) -> CliResult<Vec<ExpandedNode>> {
                         ids[i]
                     )));
                 }
-                if !crate::registry::sink_supports_cleanup(&merged_sink.kind) {
+                if !sink_caps.cleanup() {
                     return Err(CliError::Config(format!(
                         "row '{}': `complete_for.on_missing: delete` is not supported by sink \
-                         '{}' (cleanup-capable sinks: {})",
+                         '{}' with this config (cleanup-capable sinks: {})",
                         ids[i],
                         merged_sink.kind,
-                        crate::registry::CLEANUP_SINK_KINDS.join(", ")
+                        crate::registry::sink_kinds_where(|c| c.cleanup()).join(", ")
                     )));
                 }
                 if !matches!(mode, faucet_core::WriteMode::Upsert) {
@@ -1431,13 +1461,13 @@ pub fn expand(cfg: &PipelineConfig) -> CliResult<Vec<ExpandedNode>> {
         //    incompatible with exactly-once (which forbids a DLQ).
         if let Some(ref sd) = cfg.pipeline.schema {
             let policy = faucet_core::SchemaDriftPolicy::compile(sd);
-            if policy.on_drift == faucet_core::OnDrift::Evolve
-                && !crate::registry::sink_supports_schema_evolution(&merged_sink.kind)
-            {
+            if policy.on_drift == faucet_core::OnDrift::Evolve && !sink_caps.schema_evolution() {
                 return Err(CliError::Config(format!(
                     "row '{}': schema.on_drift: evolve is not supported by sink '{}' \
-                     (evolvable sinks: postgres, mysql, mssql, sqlite, bigquery, elasticsearch)",
-                    ids[i], merged_sink.kind
+                     (evolvable sinks: {})",
+                    ids[i],
+                    merged_sink.kind,
+                    crate::registry::sink_kinds_where(|c| c.schema_evolution()).join(", ")
                 )));
             }
             if policy.requires_dlq() && dlq.is_none() {
@@ -1453,6 +1483,28 @@ pub fn expand(cfg: &PipelineConfig) -> CliResult<Vec<ExpandedNode>> {
                     ids[i]
                 )));
             }
+        }
+
+        // Feature × write-path compatibility (#883): a combination no path
+        // honours is refused here rather than silently weakened at run time.
+        let compat_features = row_compat_features(
+            cfg,
+            mode,
+            delivery == faucet_core::DeliveryMode::ExactlyOnce
+                && delivery_guarantee
+                    == faucet_core::DeliveryGuarantee::EffectivelyOnce(
+                        faucet_core::EffectivelyOnceMechanism::AtomicWatermark,
+                    ),
+            dlq.as_ref(),
+            cleanup_scope.is_some(),
+        );
+        if let Some((_, _, reason)) =
+            faucet_core::compat::refusals(&compat_features, Some(&sink_caps)).first()
+        {
+            return Err(CliError::Config(format!(
+                "row '{}': {reason} (sink '{}')",
+                ids[i], merged_sink.kind
+            )));
         }
 
         // ── Range partitioning (#479) ───────────────────────────────────
@@ -1524,6 +1576,7 @@ pub fn expand(cfg: &PipelineConfig) -> CliResult<Vec<ExpandedNode>> {
         }
 
         let base = ExpandedNode {
+            opt_outs: Vec::new(),
             id: ids[i].clone(),
             row_index: i,
             weight: row.weight,
@@ -2268,6 +2321,61 @@ fn validate_tag(tag: &str, row_id: &str) -> CliResult<()> {
         )));
     }
     Ok(())
+}
+
+/// The [`faucet_core::compat`] features a row runs with, for the load-time
+/// refusals (#883). Exactly-once counts only when the row takes the atomic
+/// watermark path.
+fn row_compat_features(
+    cfg: &PipelineConfig,
+    mode: faucet_core::WriteMode,
+    watermark: bool,
+    dlq: Option<&crate::config::DlqSpec>,
+    cleanup: bool,
+) -> Vec<faucet_core::compat::Feature> {
+    use faucet_core::compat::Feature as F;
+    let drift = cfg
+        .pipeline
+        .schema
+        .as_ref()
+        .map(|sd| faucet_core::SchemaDriftPolicy::compile(sd).on_drift);
+    #[cfg(feature = "policy")]
+    let policy_quarantine = cfg.policy.as_ref().is_some_and(crate::policy::quarantines);
+    #[cfg(not(feature = "policy"))]
+    let policy_quarantine = false;
+    [
+        (watermark, F::ExactlyOnce),
+        (mode == faucet_core::WriteMode::Overwrite, F::Overwrite),
+        (
+            matches!(
+                mode,
+                faucet_core::WriteMode::Upsert | faucet_core::WriteMode::Delete
+            ),
+            F::KeyedWrites,
+        ),
+        (cleanup, F::Cleanup),
+        (drift.is_some(), F::SchemaDrift),
+        (
+            drift == Some(faucet_core::OnDrift::Fail),
+            F::SchemaDriftFail,
+        ),
+        (
+            drift == Some(faucet_core::OnDrift::Evolve),
+            F::SchemaDriftEvolve,
+        ),
+        (
+            dlq.is_some_and(|d| d.on_batch_error == crate::config::OnBatchErrorSpec::Propagate),
+            F::DlqPropagate,
+        ),
+        (
+            dlq.is_some_and(|d| d.on_batch_error == crate::config::OnBatchErrorSpec::DlqAll),
+            F::DlqAll,
+        ),
+        (policy_quarantine, F::PolicyQuarantine),
+    ]
+    .into_iter()
+    .filter_map(|(on, f)| on.then_some(f))
+    .collect()
 }
 
 /// `complete_for … on_missing: delete` deletes every in-scope destination row

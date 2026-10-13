@@ -56,6 +56,7 @@ pub struct ClickHouseConnection {
     /// `"http://localhost:8123"`. Mutually exclusive with
     /// [`host`](Self::host). A trailing slash is trimmed.
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(extend("x-faucet-resource" = "url"))]
     pub url: Option<String>,
     /// Hostname of the ClickHouse server. Mutually exclusive with
     /// [`url`](Self::url); combined with [`http_port`](Self::http_port) and
@@ -163,11 +164,20 @@ pub const HTTP_READ_TIMEOUT: std::time::Duration = std::time::Duration::from_sec
 /// interface, with connect and idle-read timeouts. Kept in one place so both
 /// connectors share the client-construction path and connection pool.
 pub fn build_client(_conn: &ClickHouseConnection) -> Result<reqwest::Client, FaucetError> {
-    reqwest::Client::builder()
+    faucet_core::http::Client::builder()
+        .connect_timeout(HTTP_CONNECT_TIMEOUT)
+        .read_timeout(HTTP_READ_TIMEOUT)
+        .build_reqwest()
+}
+
+/// [`build_client`] as a [`faucet_core::http::Client`], which runs requests
+/// through a [`CallContext`](faucet_core::io::CallContext) (#880) and drops
+/// credentials on a redirect to another origin.
+pub fn http_client(_conn: &ClickHouseConnection) -> Result<faucet_core::http::Client, FaucetError> {
+    faucet_core::http::Client::builder()
         .connect_timeout(HTTP_CONNECT_TIMEOUT)
         .read_timeout(HTTP_READ_TIMEOUT)
         .build()
-        .map_err(FaucetError::Http)
 }
 
 /// Build the ordered `(key, value)` query parameters for a ClickHouse HTTP
@@ -302,6 +312,13 @@ pub fn quote_ident(name: &str) -> String {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn both_client_builders_succeed() {
+        let conn = ClickHouseConnection::from_url("http://localhost:8123/");
+        assert!(build_client(&conn).is_ok());
+        assert!(http_client(&conn).is_ok());
+    }
 
     #[test]
     fn base_url_from_url_trims_trailing_slash() {

@@ -76,3 +76,30 @@ async fn conformance_capabilities_truthful() {
     assert!(!sink.supports_idempotent_writes());
     assert!(!sink.dedups_by_key());
 }
+
+/// The sink buffers until flush: a cancelled run must still flush (#878).
+#[tokio::test]
+async fn conformance_cancellation_flushes() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("out.jsonl");
+    let sink = JsonlSink::new(JsonlSinkConfig::new(&path));
+    faucet_conformance::assert_cancellation_flushes(&sink, || {
+        let path = path.clone();
+        async move { count_lines(&path) }
+    })
+    .await;
+}
+
+// ── Descriptor (RFC 0013): agrees with the built sink ───────────────────────
+#[test]
+fn descriptor_matches_built_sink() {
+    let v = serde_json::json!({"path": "/tmp/does-not-matter.jsonl"});
+    let cfg: JsonlSinkConfig = serde_json::from_value(v.clone()).unwrap();
+    let built = JsonlSink::new(cfg);
+    faucet_conformance::assert_descriptor_matches_sink(
+        &faucet_sink_jsonl::DESCRIPTOR,
+        "jsonl",
+        &v,
+        &built,
+    );
+}

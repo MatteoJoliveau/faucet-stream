@@ -28,6 +28,7 @@
     feature = "sink-jsonl",
     feature = "sink-csv"
 ))]
+#![allow(clippy::disallowed_methods)] // tests drive time and raw clients directly
 
 use serde_json::Value;
 use std::time::Duration;
@@ -106,6 +107,7 @@ fn serve_args(
         vault_previous_key: Vec::new(),
         connect_providers: None,
         allow_subprocess_connectors: false,
+        references: Default::default(),
     }
 }
 

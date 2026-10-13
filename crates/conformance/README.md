@@ -28,6 +28,60 @@ this crate — a check that cannot fail is worthless.
 | 9 | `assert_batch_size_zero_single_page` | a source built with `batch_size = 0` yields the whole result set as one page |
 | 10 | `assert_connector_name_nonempty` | `connector_name()` is non-empty (an empty name becomes the `"unknown"` metric label) |
 | 11 | `assert_preflight_check_wellformed` | `check()` returns `Ok(CheckReport)` with well-formed probes; a probe failure is a `Fail` probe, not an `Err` |
+| 14 | `assert_descriptor_matches_source` / `_sink` | the connector's static `ConnectorDescriptor` answers, from a config alone, exactly what the connector built from that config declares through `capabilities()` (RFC 0013) — the CLI's load-time gates trust the first, the pipeline the second |
+
+### Declared-capability checks (RFC 0013)
+
+Each proves a sink behaves as a capability it declares says it does:
+
+| # | Function | What it proves |
+|---|---|---|
+| 15 | `assert_partial_outcomes_truthful` | `write_batch_partial` returns one outcome per row and an `Ok` row is in the destination |
+| 16 | `assert_reported_rows_truthful` | `write_batch_reported` accounts for every row offered and `accepted` equals what landed |
+| 17 | `assert_replay_safe` | a replay-safe plain write, retried after a lost response, does not duplicate rows |
+| 18 | `assert_overwrite_lifecycle` | `write_mode: overwrite` stages until commit; an abort leaves the destination as it was |
+| 19 | `assert_batch_atomicity_truthful` | a failed write of a batch declared atomic lands no row; a per-row batch lands exactly its `Ok` rows |
+
+### Which checks a connector must run
+
+`faucet_conformance::required::REQUIREMENTS` maps each declared capability (a
+descriptor flag, a write mode, a trait-method override, a buffering `flush`, a
+declared `BatchAtomicity`) to the assertions that prove it. For the built-in
+connectors `scripts/conformance-coverage.py` (CI `Doc counts` job) enforces the
+table from the committed `declared-capabilities.json` snapshot, each crate's
+`src/` and its `tests/conformance.rs` (or
+`crates/interop-tests/tests/<kind>_conformance.rs`). Checks that cannot run in
+CI are listed with a reason in `conformance-coverage-exempt.txt` (call-deadline
+ones in `call-deadline-exempt.txt`). Regenerate the snapshot after changing a
+connector's declared capabilities:
+
+```bash
+cargo test -p faucet-cli --features full --test declared_capabilities -- --ignored regenerate
+```
+
+A test driving a cloud client whose futures are deeper than the default test
+stack runs its body through `block_on_large_stack`.
+
+### Descriptor checks the built-in connectors cannot run offline
+
+Every built-in connector calls check 14 from its `tests/conformance.rs` for
+sample configs covering each config-dependent capability. These connectors open
+a connection inside `new()`, so they cannot be built without a backend; their
+`src/descriptor.rs` unit tests pin every capability for every config branch
+instead (and `faucet-cli`'s `registry_capability_parity` test probes them
+whenever they do build):
+
+| Connector | Why |
+|---|---|
+| `faucet-source-postgres`, `faucet-source-mysql`, `faucet-source-mssql` | eager connection pool |
+| `faucet-source-oracle`, `faucet-sink-oracle` | connect at construction; need Oracle Instant Client |
+| `faucet-source-mysql-cdc`, `faucet-source-mssql-cdc`, `faucet-source-oracle-cdc` | connection preflight in `new()` |
+| `faucet-source-mongodb-cdc` | `hello` round trip in `new()` |
+| `faucet-sink-postgres`, `faucet-sink-mysql`, `faucet-sink-mssql` | eager connection pool |
+| `faucet-sink-redis` | connection manager opens in `new()` |
+
+The Spanner source and sink run check 14 against the emulator container, like
+their other conformance checks.
 
 ### Integration-level checks
 
@@ -60,6 +114,58 @@ async fn streams_with_bounded_memory() {
 
 Sinks use the value form of check 1:
 `conf::assert_config_schema_valid_value(&sink.config_schema(), sink.connector_name())`.
+
+## Reliability suites
+
+`tests/reliability_*.rs` run the real `Pipeline::run` against scripted doubles
+to pin the engine's guarantees — bookmark ordering, exactly-once, lifecycle,
+cleanup safety, the DLQ boundary, panic isolation, state migration and
+(`reliability_governance`) the governed DLQ, row accounting and per-row policy
+quarantine on every write path (RFC 0013). See the
+[reliability testing guide](../../docs/book/src/operations/reliability-testing.md).
+
+## Forwarding harnesses (for wrappers)
+
+A wrapper (a source or sink that holds another one) must forward every
+defaulted hook, or the feature behind it turns off for everything it wraps.
+Write wrappers with `faucet_core::forward_source!` / `forward_sink!`, then prove
+the result with `faucet_conformance::forwarding`:
+
+```rust
+use faucet_conformance::forwarding::{HookSink, assert_sink_forwards_every_hook};
+
+#[tokio::test]
+async fn my_wrapper_forwards_every_hook() {
+    let probe = HookSink::default();
+    let wrapped = MyWrapper::new(Box::new(probe.clone()));
+    // List the hooks the wrapper deliberately does not forward.
+    assert_sink_forwards_every_hook(&wrapped, &probe, &["load_native"]).await;
+}
+```
+
+`HookSource` / `HookSink` answer every hook differently from the trait default
+and record which hooks were reached; `assert_source_forwards_every_hook` /
+`assert_sink_forwards_every_hook` call every hook through the wrapper and name
+the ones that never reached the inner connector. A name in the skip list that
+is not a hook fails the assertion, so the list cannot go stale. `SOURCE_HOOKS`
+and `SINK_HOOKS` are the canonical hook lists; a test in this crate checks them
+against the trait definitions, so a hook added to either trait without being
+added to the harness fails CI.
+
+## Call deadlines and cancellation
+
+A connector that runs its backend calls through `faucet_core::io::CallContext`
+(#880) proves it with `faucet_conformance::calls`: point the connector at a
+backend that never answers (a wiremock server with a long `set_delay`) and
+call `assert_source_call_deadline(|| make_source())` or
+`assert_sink_call_deadline(|| make_sink(), &records)`. Each installs a context
+with a short deadline, then one with a cancel token, and fails if the read or
+write does not end within `CALL_BOUND`.
+
+`faucet_conformance::hung::StallingBodyServer` answers HTTP requests through a
+route closure and can stop a response body mid-stream
+(`Reply::stall_body`): the same assertions then prove the connector reads the
+body under the context too (`CallContext::reader`), not only the request.
 
 ## Doubles
 

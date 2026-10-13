@@ -162,6 +162,41 @@ advances. So the committed survivors are *not* re-delivered when you fix the
 upstream problem and re-run, and the failed rows are preserved in the DLQ for
 replay rather than dropped. The run still stops, so you get alerted.
 
+## The DLQ is a governed destination
+
+A row on its way to the DLQ is held to the same guarantees as one on its way to
+the main sink (RFC 0013, #870):
+
+- **Policy** — every envelope's payload is classified and checked against the
+  [data-flow policy](./policies.md) with the DLQ's own `attributes:`, whichever
+  pass quarantined it (quality, contract, schema drift, a policy rule, or a
+  per-row sink failure). A row whose labels may not reach the DLQ fails the run
+  instead of landing there.
+- **Masking** — a [masking](./masking.md) rule whose `applies_to` names `dlq`
+  (or the DLQ sink's connector kind) and not the main sink masks the envelope
+  payloads. Rules that apply to the main sink already ran on the page.
+- **Budget** — DLQ envelopes count against the run's [`budget:`](./usage.md#run-budgets)
+  together with the main sink's records; a ceiling the DLQ alone crosses stops
+  the run.
+- **Metering** — DLQ records and bytes appear in the usage record as
+  `dlq_records_written` / `dlq_bytes_written`.
+- **Resilience** — a DLQ write that fails transiently is retried under
+  [`resilience:`](./resilience.md) when the DLQ sink's write is replay-safe
+  (keyed); an append-only DLQ is not retried, because a retry after a lost
+  response would write the envelopes twice.
+
+```yaml
+pipeline:
+  masking:
+    rules:
+      - { match: { fields: [notes] }, action: { type: redact }, applies_to: [dlq] }
+  dlq:
+    sink:
+      type: jsonl
+      config: { path: /eu-bucket/quarantine.jsonl }
+      attributes: { residency: eu }
+```
+
 ## Inspecting the DLQ
 
 `faucet dlq inspect` reads a DLQ location back and groups it by reason and error
@@ -210,6 +245,28 @@ produce `H(H(x))` — breaking the joinability masking exists to guarantee — a
 `json_parse` / `split` would re-run against already-converted values. The quality
 and contract passes *are* re-applied: they are pure checks over the record, so
 re-checking is idempotent, and a replay is exactly when you want them enforced.
+
+A replay runs under the config's [`budget:`](./usage.md#run-budgets) and
+[`resilience:`](./resilience.md), like any run. Under `faucet serve`,
+`POST /v1/dlq/replay` returns the replay's `id` (or takes one you choose), and
+`POST /v1/runs/{id}/cancel` stops it at its next page boundary while it runs.
+A replay `tenant` (`tenants` feature) loads the config under that tenant's scope
+and is admitted against its limits, whose per-run ceilings bound the replay.
+A replay that writes is recorded as a run under its `id` (label
+`dlq_replay: "true"`, `replay_of` = the DLQ location) for as long as it runs,
+so it shows in the run list and counts toward its tenant's
+`max_concurrent_runs`: with the limit at `1`, a run submitted for the tenant
+while its replay runs is refused with `429`. A `--dry-run` replay writes
+nothing and is not recorded. An `id` is claimed atomically: a second replay
+with an `id` in flight, or one naming a run already in the history, is refused
+with `409` and leaves the first untouched.
+
+The DLQ locations a request names — `from` and `failed_dlq` here, `location`
+for `inspect` and `discard` — are server-local paths, so the server checks them
+against its [reference policy](../reference/http-api.md#reference-policy) like a
+connector path in a submitted config: a system tree or a server credential file
+is refused, a path outside `--allow-path-root` is refused (`403`), and a
+tenant's request is confined to `--tenant-path-root/<tenant>`.
 
 Rows that fail **again** on replay are quarantined to a *fresh* DLQ — a
 `replay-failed.jsonl` sibling of the source by default (override with

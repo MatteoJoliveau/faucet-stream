@@ -341,7 +341,7 @@ impl LogExport {
                 metrics::export_error();
                 summary.failed = true;
                 tracing::warn!(run_id = %row.run_id, error = %e.detail, "shipping run logs failed");
-                let stored = crate::secrets::registry::redact(&e.message).into_owned();
+                let stored = crate::secrets::registry::redact_message(&e.message);
                 history.log_ship_fail(&row.run_id, &stored).await?;
                 break;
             }
@@ -600,6 +600,7 @@ pub fn notifier_from_body(body: &str) -> Option<Arc<crate::notify::Notifier>> {
 
 /// The shipper task: a pass every couple of seconds (backing off while the
 /// collector fails) and retention + bounds every minute.
+#[allow(clippy::disallowed_methods)] // a runtime timer, not a connector backend call
 pub async fn run_loop(
     export: Arc<LogExport>,
     history: Arc<dyn RunHistory>,

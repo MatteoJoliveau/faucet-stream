@@ -369,6 +369,14 @@ This crate has no optional features of its own. Enable it in the CLI / umbrella 
 - [faucet-source-mongodb-cdc](https://crates.io/crates/faucet-source-mongodb-cdc) — resumable, effectively-once change capture from MongoDB.
 - [faucet-sink-mongodb](https://crates.io/crates/faucet-sink-mongodb) — write into MongoDB (with upsert/delete write modes).
 
+## Capabilities
+
+Declares dataset discovery (`faucet discover`); no exactly-once or sharding. `faucet list --json` prints the declaration.
+
+## Timeouts, cancellation and retries
+
+Every `find`, each page of cursor reads and discovery run through the pipeline's `CallContext` (#880): the run's deadline and cancel token end a hung server selection, query or `getMore` promptly. Each query counts as one `find` round trip (`discover` for catalog reads) in `faucet_source_roundtrips_total`. Reads are not retried.
+
 ## License
 
 Licensed under either of [Apache License, Version 2.0](https://www.apache.org/licenses/LICENSE-2.0) or [MIT license](https://opensource.org/licenses/MIT) at your option.

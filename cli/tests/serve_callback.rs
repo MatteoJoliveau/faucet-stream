@@ -4,6 +4,7 @@
 //! asserts the callback lands at a wiremock receiver with the right body — plus
 //! the refusals (bad egress target, backfill fan-out, reserved keys).
 #![cfg(feature = "serve")]
+#![allow(clippy::disallowed_methods)] // tests drive time and raw clients directly
 
 use faucet_cli::cli::ServeArgs;
 use faucet_cli::serve::ServeConfig;
@@ -65,6 +66,7 @@ fn args_on(port: u16) -> ServeArgs {
         vault_previous_key: Vec::new(),
         connect_providers: None,
         allow_subprocess_connectors: false,
+        references: Default::default(),
     }
 }
 
@@ -105,7 +107,9 @@ fn ok_yaml(input: &std::path::Path, output: &std::path::Path) -> String {
 /// A pipeline that fails: the csv source points at a path that does not exist.
 fn failing_yaml(output: &std::path::Path) -> String {
     format!(
-        "version: 1\nname: cb_fail\npipeline:\n  source: {{ type: csv, config: {{ path: \"/nonexistent/definitely-not-here.csv\" }} }}\n  sink: {{ type: jsonl, config: {{ path: \"{}\" }} }}\n",
+        "version: 1\nname: cb_fail\npipeline:\n  source: {{ type: csv, config: {{ path: \"{}\" }} }}\n  sink: {{ type: jsonl, config: {{ path: \"{}\" }} }}\n",
+        // Missing, but inside the temp dir the reference policy admits (#881).
+        output.with_file_name("definitely-not-here.csv").display(),
         output.display()
     )
 }

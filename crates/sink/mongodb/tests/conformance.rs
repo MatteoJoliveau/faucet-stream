@@ -140,4 +140,85 @@ mod idempotent {
         })
         .await;
     }
+
+    /// #878: per-row outcomes are truthful, a replayed keyed write converges,
+    /// and `write_mode: overwrite` stages until commit.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn conformance_declared_capabilities() {
+        let (_container, uri, sink) = keyed_sink().await;
+        let count = || {
+            let uri = uri.clone();
+            async move { count_docs(&uri).await }
+        };
+        faucet_conformance::assert_partial_outcomes_truthful(&sink, count).await;
+        faucet_conformance::assert_replay_safe(&sink, count).await;
+
+        let mut config = MongoSinkConfig::new(&uri, DB, COLLECTION);
+        config.write.write_mode = faucet_core::WriteMode::Overwrite;
+        let overwrite = MongoSink::new(config).await.expect("overwrite sink new");
+        faucet_conformance::assert_overwrite_lifecycle(&overwrite, count).await;
+    }
+}
+
+/// The static descriptor answers exactly what the built sink declares (RFC 0013).
+#[tokio::test(flavor = "multi_thread")]
+async fn conformance_descriptor_matches_built_sink() {
+    #[allow(unused_mut)]
+    let configs = vec![
+        r#"{"connection_uri": "mongodb://127.0.0.1:1", "database": "d", "collection": "c"}"#,
+        r#"{"connection_uri": "mongodb://127.0.0.1:1", "database": "d", "collection": "c", "write_mode": "upsert", "key": ["id"]}"#,
+        r#"{"connection_uri": "mongodb://127.0.0.1:1", "database": "d", "collection": "c", "write_mode": "overwrite"}"#,
+    ];
+    for raw in configs {
+        let v: faucet_core::Value = faucet_core::serde_json::from_str(raw).expect("json");
+        let cfg: faucet_sink_mongodb::MongoSinkConfig =
+            faucet_core::serde_json::from_value(v.clone()).expect("config");
+        let built = faucet_sink_mongodb::MongoSink::new(cfg)
+            .await
+            .expect("offline build");
+        faucet_conformance::assert_descriptor_matches_sink(
+            &faucet_sink_mongodb::DESCRIPTOR,
+            "mongodb",
+            &v,
+            &built,
+        );
+    }
+}
+
+/// A server that accepts TCP connections and never answers stands in for a
+/// hung backend (#880); returns a URI whose server selection waits a minute.
+async fn silent_uri() -> String {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        let mut held = Vec::new();
+        while let Ok((stream, _)) = listener.accept().await {
+            held.push(stream);
+        }
+    });
+    format!("mongodb://{addr}/?directConnection=true&serverSelectionTimeoutMS=60000")
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn conformance_call_deadline() {
+    let uri = silent_uri().await;
+    let mut built = Vec::new();
+    for _ in 0..2 {
+        let v = faucet_core::serde_json::json!({
+            "connection_uri": uri, "database": "d", "collection": "c"
+        });
+        let cfg: faucet_sink_mongodb::MongoSinkConfig =
+            faucet_core::serde_json::from_value(v).expect("config");
+        built.push(
+            faucet_sink_mongodb::MongoSink::new(cfg)
+                .await
+                .expect("lazy client"),
+        );
+    }
+    let built = std::sync::Mutex::new(built);
+    faucet_conformance::calls::assert_sink_call_deadline(
+        || built.lock().unwrap().pop().unwrap(),
+        &[faucet_core::serde_json::json!({"id": 1})],
+    )
+    .await;
 }

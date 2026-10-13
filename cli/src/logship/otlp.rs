@@ -180,9 +180,9 @@ impl OtlpLogExporter {
                 Transport::Grpc(LogsServiceClient::new(channel))
             }
             OtelProtocol::Http => Transport::Http {
-                client: reqwest::Client::builder()
+                client: faucet_core::http::Client::builder()
                     .timeout(timeout)
-                    .build()
+                    .build_reqwest()
                     .map_err(|e| format!("building the OTLP HTTP client: {e}"))?,
                 url: http_logs_endpoint(&endpoint),
             },

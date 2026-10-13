@@ -71,6 +71,10 @@ pub struct S3Source {
     /// `list` (one per `ListObjectsV2` page), `get` (one per `GetObject`,
     /// including each ranged Parquet read).
     roundtrips: faucet_core::observability::RecorderSlot,
+    /// Backend-call context (#880): every request runs through it for the
+    /// run's cancel token and deadline. Round trips stay counted by
+    /// `roundtrips`.
+    calls: faucet_core::CallSlot,
     filter: faucet_common_file::ObjectFilter,
 }
 
@@ -88,6 +92,11 @@ impl S3Source {
             client,
             applied_shard: Mutex::new(None),
             roundtrips: faucet_core::observability::RecorderSlot::new(),
+            calls: faucet_core::CallSlot::new(
+                faucet_core::CallContext::new()
+                    .without_timeout()
+                    .with_roundtrip_metering(false),
+            ),
             filter,
         })
     }
@@ -143,12 +152,16 @@ impl S3Source {
                 req = req.continuation_token(token);
             }
 
-            let response = req.send().await.map_err(|e| {
-                FaucetError::Source(format!(
-                    "S3 list objects error for bucket '{}': {e}",
-                    self.config.bucket
-                ))
-            })?;
+            let response = self
+                .calls
+                .call_once("list", async { Ok(req.send().await) })
+                .await?
+                .map_err(|e| {
+                    FaucetError::Source(format!(
+                        "S3 list objects error for bucket '{}': {e}",
+                        self.config.bucket
+                    ))
+                })?;
 
             for object in response.contents() {
                 let key: &str = object.key().unwrap_or_default();
@@ -354,6 +367,7 @@ impl S3Source {
             &self.config.bucket,
             key,
             self.roundtrips.recorder(),
+            self.calls.get(),
         )
         .await?;
         let object_len = reader.len();
@@ -433,9 +447,13 @@ impl S3Source {
         if self.config.verify_checksum {
             request = request.checksum_mode(aws_sdk_s3::types::ChecksumMode::Enabled);
         }
-        let response = request.send().await.map_err(|e| {
-            FaucetError::Source(format!("S3 get object error for key '{key}': {e}"))
-        })?;
+        let response = self
+            .calls
+            .call_once("get", async { Ok(request.send().await) })
+            .await?
+            .map_err(|e| {
+                FaucetError::Source(format!("S3 get object error for key '{key}': {e}"))
+            })?;
 
         // Read all metadata BEFORE consuming `body` (which partially moves
         // `response`), so a cleanly-truncated/corrupted transfer is rejected
@@ -471,7 +489,8 @@ impl S3Source {
         // body in the verifier first so length/checksum cover the stored bytes
         // (below any decompression), then `BufReader` so `.lines()` is usable
         // and ownership is `Unpin`.
-        let verified = faucet_core::VerifyingReader::new(response.body.into_async_read(), checks);
+        let body = self.calls.get().reader(response.body.into_async_read());
+        let verified = faucet_core::VerifyingReader::new(body, checks);
         let buffered = tokio::io::BufReader::new(verified);
         #[cfg(feature = "compression")]
         {
@@ -556,8 +575,14 @@ impl faucet_core::Source for S3Source {
         &self,
         recorder: std::sync::Arc<faucet_core::observability::RoundtripRecorder>,
     ) {
-        self.roundtrips.install(recorder);
+        self.roundtrips.install(recorder.clone());
+        self.calls.install_recorder(recorder);
     }
+
+    fn set_call_context(&self, ctx: faucet_core::CallContext) {
+        self.calls.install(ctx);
+    }
+
     async fn fetch_with_context(
         &self,
         context: &std::collections::HashMap<String, serde_json::Value>,
@@ -1108,9 +1133,10 @@ impl faucet_core::Source for S3Source {
         if let Some(prefix) = self.config.prefix.as_deref() {
             req = req.prefix(prefix);
         }
-        let response = req
-            .send()
-            .await
+        let response = self
+            .calls
+            .call_once("list", async { Ok(req.send().await) })
+            .await?
             .map_err(|e| FaucetError::Source(format!("s3: catalog discovery failed: {e}")))?;
 
         let prefixes: Vec<String> = response
@@ -1273,6 +1299,7 @@ mod tests {
             client,
             applied_shard: Mutex::new(None),
             roundtrips: faucet_core::observability::RecorderSlot::new(),
+            calls: faucet_core::CallSlot::default(),
             filter: Default::default(),
         }
     }

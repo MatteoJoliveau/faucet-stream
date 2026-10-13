@@ -8,6 +8,7 @@
 //!
 //! Idempotency checks (3/4) do not apply — the NATS sink is append-only and
 //! advertises no idempotency/keyed-upsert mechanism.
+#![allow(clippy::disallowed_methods)] // tests drive time and raw clients directly
 
 use faucet_conformance::assert_config_schema_valid_value;
 use faucet_sink_nats::NatsSinkConfig;
@@ -95,15 +96,19 @@ mod docker {
         .await;
 
         let counter_cl = counter.clone();
-        faucet_conformance::assert_capabilities_truthful(&sink, move || {
+        let count = move || {
             let c = counter_cl.clone();
             async move {
                 // Let in-flight deliveries settle before reading the count.
                 tokio::time::sleep(std::time::Duration::from_millis(300)).await;
                 c.load(Ordering::SeqCst)
             }
-        })
-        .await;
+        };
+        faucet_conformance::assert_capabilities_truthful(&sink, count.clone()).await;
+        // #878: per-message outcomes are truthful, and a cancelled run still
+        // flushes the client's buffered publishes.
+        faucet_conformance::assert_partial_outcomes_truthful(&sink, count.clone()).await;
+        faucet_conformance::assert_cancellation_flushes(&sink, count).await;
     }
 
     /// JetStream mode awaits every publish acknowledgement: a row whose
@@ -170,4 +175,60 @@ mod docker {
         );
         assert!(started.elapsed() < std::time::Duration::from_secs(20));
     }
+}
+
+/// The static descriptor answers exactly what the built sink declares (RFC 0013).
+#[tokio::test(flavor = "multi_thread")]
+async fn conformance_descriptor_matches_built_sink() {
+    #[allow(unused_mut)]
+    let configs = vec![r#"{"subject": "out", "servers": ["nats://127.0.0.1:1"]}"#];
+    for raw in configs {
+        let v: faucet_core::Value = faucet_core::serde_json::from_str(raw).expect("json");
+        let cfg: faucet_sink_nats::NatsSinkConfig =
+            faucet_core::serde_json::from_value(v.clone()).expect("config");
+        let built = faucet_sink_nats::NatsSink::new(cfg)
+            .await
+            .expect("offline build");
+        faucet_conformance::assert_descriptor_matches_sink(
+            &faucet_sink_nats::DESCRIPTOR,
+            "nats",
+            &v,
+            &built,
+        );
+    }
+}
+
+/// A server that accepts TCP connections and never answers stands in for a
+/// hung backend (#880): the lazy connect waits on it.
+async fn silent_server() -> String {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        let mut held = Vec::new();
+        while let Ok((stream, _)) = listener.accept().await {
+            held.push(stream);
+        }
+    });
+    format!("nats://{addr}")
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn conformance_call_deadline() {
+    let server = silent_server().await;
+    let mut built = Vec::new();
+    for _ in 0..2 {
+        let mut cfg = NatsSinkConfig::new("events");
+        cfg.connection.servers = vec![server.clone()];
+        built.push(
+            faucet_sink_nats::NatsSink::new(cfg)
+                .await
+                .expect("lazy construction"),
+        );
+    }
+    let built = std::sync::Mutex::new(built);
+    faucet_conformance::calls::assert_sink_call_deadline(
+        || built.lock().unwrap().pop().unwrap(),
+        &[serde_json::json!({"id": 1})],
+    )
+    .await;
 }

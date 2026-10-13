@@ -211,8 +211,11 @@ take a value from records (`${parent.*}` and other runtime tokens other than
 ### SQL connectors run sandboxed
 
 A query can read files by itself — DuckDB's `read_text('/etc/passwd')` or
-`ATTACH`, SQLite's `ATTACH` — so every `duckdb` source and sink and every
-`sqlite` source in a config the server loads runs with `sandbox: true`: DuckDB
+`ATTACH`, SQLite's `ATTACH` — so every connector whose schema marks a confining
+switch with `x-faucet-sandbox` runs with that switch on in a config the server
+loads. Among the built-ins that is every `duckdb` source and sink and every
+`sqlite` source (`sandbox: true`); a plugin connector that marks its own
+switch is confined the same way. DuckDB
 gets `enable_external_access = false` with extension autoload off and the
 configuration locked (a query cannot `SET` it back), and each SQLite
 connection allows no attached database (which also stops `VACUUM INTO`;
@@ -229,7 +232,9 @@ template a trigger runs is sandboxed like any other.
 
 ### Subprocess connectors
 
-The `singer` source and sink run a program named in their config. A config
+A connector whose schema marks a field `x-faucet-resource: command` runs a
+program named in its config — among the built-ins, the `singer` source and
+sink; a plugin connector is recognised the same way. A config
 **the request carries** (`POST /v1/runs`, `/v1/doctor`, `/v1/plan`,
 `/v1/status`, `/v1/backfill`, `/v1/verify`, `/v1/dlq/replay`, a rollback with
 a `config`, MCP `validate_config` / `preview` / `run_pipeline`) may use them
@@ -237,6 +242,64 @@ only when the server was started with `--allow-subprocess-connectors`;
 otherwise it is a `422`. A config submitted for a tenant is refused even then.
 Registered templates and the triggers file are written by the server's
 operator and may always use them.
+
+### Reference policy
+
+Every config the server loads from a caller is checked against one
+allow-list before anything runs. A connector field that names a local path,
+a URL or a program carries an `x-faucet-resource` annotation in its schema, so
+the server confines connector configs it has never seen, plugin connectors
+included, with no per-connector code. The same allow-list covers `${env:}`,
+`${file:}`, `${secret:}` and secret-manager directives, the state, DLQ and
+lineage paths, and the `token_url` / `url` of an `auth:` provider.
+
+| Reference | Default for a caller's config | Widen with |
+|-----------|-------------------------------|------------|
+| Local path (connector path, `${file:}`, state / DLQ / lineage file) | under the server's working directory or the system temp directory | `--allow-path-root DIR` (repeatable) |
+| URL scheme | any | `--allow-url-scheme` restricts it to the listed schemes |
+| URL host | any, except link-local and cloud-metadata addresses (`169.254.0.0/16`, `fe80::/10`, `fd00:ec2::254`, `100.100.100.200`, `metadata.google.internal`) | `--allow-url-host` restricts it to the listed hosts (`*.example.com` matches subdomains); a metadata host is reachable only when listed |
+| `${env:NAME}` / `${secret:NAME}` | none | `--allow-env NAME` or `--allow-env 'PREFIX*'` |
+| `${vault:}` / `${aws-sm:}` / `${gcp-sm:}` / `${azure-kv:}` | none | `--allow-secret-scheme vault,aws-sm` |
+| A program (`singer`) | refused | `--allow-subprocess-connectors` |
+
+A refused reference is a `403` that names the field, the value and the flag
+that would allow it. `/dev/null` and `:memory:` are always allowed. A path is
+compared after symlinks are resolved — a `..` after a symlink climbs out of the
+link's target, as the kernel would — and a `..` that leaves a root, or that
+follows a directory which does not exist yet, is refused. A path field that
+holds a remote URL (`s3://…`) is checked as a URL. A URL host is compared in
+the form a URL parser reads it, so `2852039166`, `0xa9fea9fe`, `0251.0376.0251.0376`
+or a trailing dot (`169.254.169.254.`, `metadata.google.internal.`) name the
+metadata address they spell. A URL whose host a caller's config takes from
+records (`https://${parent.host}/…`, a whole `${parent.next_url}`) cannot be
+checked, so it is refused; register the pipeline as a template instead.
+
+**At run time.** A caller's run executes with the caller policy scoped over
+it — on every instance that claims it, sharded or not — so its HTTP connectors
+check the first request and every redirect hop against it. Whatever the
+origin, an HTTP connector never follows a redirect into a link-local or
+cloud-metadata address.
+
+**DLQ locations.** The `location` of `POST /v1/dlq/inspect` and
+`/v1/dlq/discard`, and the `from` / `failed_dlq` of `POST /v1/dlq/replay`, are
+checked like a connector path: never a system tree or a server credential
+file, and under the path roots — for a tenant, under `--tenant-path-root/<tenant>`.
+
+The server's own credentials stay unreadable whatever the flags say:
+`FAUCET_VAULT_KEY`, the serve token variables and the files and variables
+`--auth-config` read.
+
+**Tenants.** A config submitted for a tenant never runs a program, and with
+`--tenant-path-root DIR` its local paths are confined to `DIR/<tenant id>`
+instead of the roots above.
+
+**Trusted configs.** Registered templates, the `--triggers` file and the
+`--default-config` base are written by the server's operator, so they are not
+checked against the allow-list.
+
+**Errors.** A run's error text is redacted before it is stored, so a resolved
+secret or a URL password in a failure message never reaches the history
+database, a peer instance or `GET /v1/runs/{id}`.
 
 **Who am I.** `GET /v1/whoami` returns the caller's `principal`, `role` and
 `permissions` to any authenticated caller (`--no-auth` and `--auth-token`
@@ -409,6 +472,9 @@ is the last `run_id` from the previous page.
   "invocations": [
     {"row_id": "default", "parent_record_key": null, "records_written": 4096, "error": null,
      "batches": {"attempted": 5, "committed": 5, "dlq_partial": 0, "dlq_all": 0, "failed": 0},
+     "rows": {"transform_in": 4100, "transform_out": 4098, "offered": 4098, "accepted": 4096,
+              "coalesced": 0, "skipped": 0, "failed": 2, "quarantined": 0, "dropped": 0,
+              "unaccounted": 0},
      "source_lag": {"bytes": 4096}}
   ],
   "error": null,
@@ -423,8 +489,20 @@ comes back with every header value as `***` and URL credentials stripped, and
 the stored `config_body` (cluster runs) is returned to admins only — it can
 hold inline credentials. Each invocation carries
 `batches` — how its sink writes ended (`committed` / `dlq_partial` / `dlq_all` /
-`failed`, #737) — and, for a source with a head, `source_lag` at the end of the
+`failed`, #737), `rows` — where every row went (#879): of the `offered` rows,
+how many the sink `accepted`, merged into another row of the same page by a
+keyed write (`coalesced`), declined by design (`skipped`), failed per row to the
+DLQ (`failed`), a quality / contract / drift / policy pass `quarantined`, or a
+poison-pill `drop` action `dropped`; `unaccounted` rows were lost by a sink
+without saying so and fail the run; `transform_in` / `transform_out` count the
+transform chain's input and output, the same view `faucet run --output json`
+prints — and, for a source with a head, `source_lag` at the end of the
 invocation (`bytes` / `events` / `seconds`, #733).
+
+A DLQ replay that writes (`POST /v1/dlq/replay` without `dry_run`) is recorded
+as a run under its `id` while it runs, with the label `dlq_replay: "true"` and
+`replay_of` naming the DLQ location it read, so it appears in `GET /v1/runs`
+and holds one of its tenant's `max_concurrent_runs` slots until it ends.
 
 > **Bookmarks:** run records carry record counts + per-row outcomes, not
 > replication bookmarks. Bookmark state is per-row/per-state-key and lives in the

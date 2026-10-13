@@ -672,6 +672,7 @@ pub async fn serve(config: ServeConfig, mcp: crate::serve::McpServeSettings) -> 
         config.otel.as_ref(),
     );
     crate::serve::callback::set_allow_hosts(config.callback_allow_hosts.clone());
+    crate::serve::references::install(config.references.clone());
     crate::serve::metrics::set_cluster_enabled(config.cluster.enabled);
     if let Some(h) = &prom {
         spawn_metrics_upkeep(h.clone(), Duration::from_secs(5));
@@ -1145,6 +1146,7 @@ async fn wait_for_signal() {
 }
 
 #[cfg(test)]
+#[allow(clippy::disallowed_methods)] // tests drive time and raw clients directly
 mod tests {
     use super::*;
     use crate::serve::history::memory::MemoryHistory;

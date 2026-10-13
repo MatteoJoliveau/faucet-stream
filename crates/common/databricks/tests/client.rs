@@ -1,4 +1,5 @@
 //! Wiremock tests for the shared Statement Execution API client.
+#![allow(clippy::disallowed_methods)] // tests drive time and raw clients directly
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -332,4 +333,132 @@ async fn oauth_m2m_provider_is_used_and_refreshed_on_401() {
     );
     let r = c.execute(&StatementRequest::new("SELECT 1")).await.unwrap();
     assert_eq!(r.statement_id.as_deref(), Some("m"));
+}
+
+#[tokio::test]
+async fn a_spent_call_context_ends_the_poll_and_cancels_the_statement() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/api/2.0/sql/statements"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_json(json!({"statement_id": "s1", "status": {"state": "RUNNING"}})),
+        )
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/api/2.0/sql/statements/s1/cancel"))
+        .respond_with(ResponseTemplate::new(200))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let mut o = opts();
+    o.poll_interval = Duration::from_secs(60);
+    let token = faucet_core::CancellationToken::new();
+    let c = client(&server.uri(), o)
+        .with_call_context(faucet_core::CallContext::new().with_cancel(token.clone()));
+    assert!(c.call_context().cancel().is_some());
+    let cancel = async {
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        token.cancel();
+    };
+    let req = StatementRequest::new("SELECT 1");
+    let (result, ()) = tokio::join!(c.execute(&req), cancel);
+    assert!(
+        matches!(result, Err(FaucetError::Cancelled { .. })),
+        "{result:?}"
+    );
+}
+
+#[tokio::test]
+async fn a_deadline_ends_a_hung_submit() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/api/2.0/sql/statements"))
+        .respond_with(ResponseTemplate::new(200).set_delay(Duration::from_secs(60)))
+        .mount(&server)
+        .await;
+    let c = client(&server.uri(), opts()).with_call_context(
+        faucet_core::CallContext::new()
+            .with_deadline(tokio::time::Instant::now() + Duration::from_millis(200)),
+    );
+    let result = c.execute(&StatementRequest::new("SELECT 1")).await;
+    assert!(
+        matches!(result, Err(FaucetError::Timeout { .. })),
+        "{result:?}"
+    );
+}
+
+/// Answers the statement submit with a still-pending statement and drops the
+/// connection on any other request without a response.
+async fn submit_then_hang_up() -> String {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        while let Ok((mut socket, _)) = listener.accept().await {
+            tokio::spawn(async move {
+                let mut buf = Vec::new();
+                let mut chunk = [0u8; 4096];
+                loop {
+                    let n = match socket.read(&mut chunk).await {
+                        Ok(0) | Err(_) => return,
+                        Ok(n) => n,
+                    };
+                    buf.extend_from_slice(&chunk[..n]);
+                    let Some(h) = buf.windows(4).position(|w| w == b"\r\n\r\n") else {
+                        continue;
+                    };
+                    let head = String::from_utf8_lossy(&buf[..h]).to_ascii_lowercase();
+                    let len = head
+                        .lines()
+                        .find_map(|l| l.strip_prefix("content-length:"))
+                        .and_then(|v| v.trim().parse::<usize>().ok())
+                        .unwrap_or(0);
+                    if buf.len() < h + 4 + len {
+                        continue;
+                    }
+                    if !head.starts_with("post /api/2.0/sql/statements ") {
+                        return;
+                    }
+                    let body = r#"{"statement_id":"s","status":{"state":"PENDING"}}"#;
+                    let reply = format!(
+                        "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\n\r\n{body}",
+                        body.len()
+                    );
+                    let _ = socket.write_all(reply.as_bytes()).await;
+                    buf.drain(..h + 4 + len);
+                }
+            });
+        }
+    });
+    format!("http://{addr}")
+}
+
+/// A cancel request that cannot be sent is only logged, and it is still
+/// metered on the context's recorder.
+#[tokio::test]
+async fn a_cancel_lost_in_transport_is_logged_and_metered() {
+    let uri = submit_then_hang_up().await;
+    let meter = Arc::new(faucet_core::UsageMeter::new());
+    let recorder = Arc::new(
+        faucet_core::observability::RoundtripRecorder::new(
+            faucet_core::observability::RoundtripSide::Sink,
+            "p",
+            "r",
+            "databricks",
+        )
+        .with_meter(meter.clone()),
+    );
+    let mut o = opts();
+    o.statement_timeout = Some(Duration::ZERO);
+    let c =
+        client(&uri, o).with_call_context(faucet_core::CallContext::new().with_recorder(recorder));
+    let err = c
+        .execute(&StatementRequest::new("SELECT 1"))
+        .await
+        .unwrap_err();
+    assert!(err.to_string().contains("did not finish"), "{err}");
+    let trips = meter.snapshot().sink_roundtrips;
+    assert_eq!(trips.get("cancel"), Some(&1), "{trips:?}");
 }

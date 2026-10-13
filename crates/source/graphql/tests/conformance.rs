@@ -184,3 +184,44 @@ async fn conformance_preflight_check_wellformed() {
     )
     .await;
 }
+
+#[test]
+fn conformance_descriptor_matches_built_source() {
+    for v in [
+        serde_json::json!({"endpoint": "http://127.0.0.1:1/graphql", "query": "{ items { id } }", "auth": {"type": "none"}, "records_path": null, "pagination": null}),
+        serde_json::json!({"endpoint": "http://127.0.0.1:1/graphql", "query": "{ items { id } }", "auth": {"type": "none"}, "records_path": "$.data.items[*]", "pagination": null, "batch_size": 0}),
+    ] {
+        let cfg: faucet_source_graphql::GraphqlStreamConfig =
+            serde_json::from_value(v.clone()).unwrap();
+        let built = faucet_source_graphql::GraphqlStream::new(cfg);
+        faucet_conformance::assert_descriptor_matches_source(
+            &faucet_source_graphql::DESCRIPTOR,
+            "graphql",
+            &v,
+            &built,
+        );
+    }
+}
+
+// ── Check: backend calls honour the call deadline and cancel (#880) ──────────
+
+#[tokio::test]
+async fn conformance_call_deadline() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_delay(std::time::Duration::from_secs(60))
+                .set_body_json(json!({ "data": { "users": [] } })),
+        )
+        .mount(&server)
+        .await;
+    let uri = server.uri();
+    faucet_conformance::calls::assert_source_call_deadline(|| {
+        GraphqlStream::new(GraphqlStreamConfig::new(
+            uri.clone(),
+            "query { users { id } }",
+        ))
+    })
+    .await;
+}

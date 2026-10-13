@@ -33,6 +33,7 @@ pub mod error;
 pub mod exec_metrics;
 pub mod executor;
 pub mod expand;
+pub mod governance;
 pub mod hub;
 #[cfg(feature = "catalog")]
 pub mod impact;
@@ -106,6 +107,11 @@ use crate::registry::PluginRegistry;
 pub fn set_build_version() {
     faucet_core::set_build_version(env!("CARGO_PKG_VERSION"));
 }
+
+/// Stack size of the runtime's worker threads. A pipeline run nests many
+/// connector and governance futures; tokio's 2 MiB default leaves little
+/// headroom in debug builds with every connector compiled in.
+pub const RUNTIME_THREAD_STACK: usize = 8 << 20;
 
 /// Entry point for a custom `faucet` binary that bundles third-party
 /// connectors.
@@ -189,6 +195,7 @@ pub fn run_main(registry: PluginRegistry) -> std::process::ExitCode {
 
     let runtime = match tokio::runtime::Builder::new_multi_thread()
         .enable_all()
+        .thread_stack_size(RUNTIME_THREAD_STACK)
         .build()
     {
         Ok(rt) => rt,

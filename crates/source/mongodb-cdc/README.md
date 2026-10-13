@@ -454,6 +454,14 @@ omitted the flag when `false`; such a bookmark is migrated on the next run
 `faucet migrate --state`. A bookmark at a newer schema is refused rather than
 misread. See [Upgrading faucet safely](https://faucet-hq.github.io/faucet-stream/operations/upgrading.html).
 
+## Capabilities
+
+Declares exactly-once replay from its `resumeToken` bookmark and lag reporting, for every config. `faucet list --json` prints the declaration.
+
+## Timeouts, cancellation and retries
+
+Opening the change stream, each `getMore` poll and the catalog and capture queries run through the pipeline's `CallContext` (#880): the run's deadline and cancel token end a hung connection or an idle stream promptly with an error (the pipeline has already stopped reading and flushed what it took). Each call counts as one round trip (`watch`, `query`) in `faucet_source_roundtrips_total`. Nothing is retried: the next run resumes from the last persisted resume token.
+
 ## License
 
 Licensed under either of:

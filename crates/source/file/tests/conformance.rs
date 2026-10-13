@@ -91,3 +91,40 @@ async fn conformance_discover_roundtrips() {
     })
     .await;
 }
+
+// ── Descriptor (RFC 0013): agrees with the built source ─────────────────────
+
+#[test]
+fn descriptor_matches_built_source() {
+    for v in [
+        serde_json::json!({"path": "/tmp/x"}),
+        serde_json::json!({"path": "https://example.test/a.csv"}),
+        serde_json::json!({"path": "/tmp/x", "format": "parquet"}),
+        serde_json::json!({"path": "/tmp/x", "format": "avro"}),
+        serde_json::json!({"path": "/tmp/x", "format": "csv"}),
+    ] {
+        let cfg: FileSourceConfig = serde_json::from_value(v.clone()).unwrap();
+        let built = FileSource::new(cfg).expect("source builds");
+        faucet_conformance::assert_descriptor_matches_source(
+            &faucet_source_file::DESCRIPTOR,
+            "file",
+            &v,
+            &built,
+        );
+    }
+}
+
+// ── Check: backend calls honour the call deadline and cancel (#880) ──────────
+
+/// An `http(s)://` path: the fetch is the backend call.
+#[tokio::test]
+async fn conformance_call_deadline() {
+    let hung = faucet_conformance::hung::SilentListener::start()
+        .await
+        .expect("listener");
+    let url = format!("{}/data.jsonl", hung.http_url());
+    faucet_conformance::calls::assert_source_call_deadline(|| {
+        FileSource::new(FileSourceConfig::new(url.clone())).unwrap()
+    })
+    .await;
+}

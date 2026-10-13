@@ -3,7 +3,7 @@
 //! resolve, and a `selection` honoured by every trigger path — the template
 //! trigger, `POST /v1/runs`, a clustered run, a schedule trigger, a change
 //! request, and the CLI.
-
+#![allow(clippy::disallowed_methods)] // tests drive time and raw clients directly
 #![cfg(feature = "templates")]
 
 use std::path::Path;
@@ -70,6 +70,7 @@ fn args(port: u16) -> ServeArgs {
         vault_previous_key: Vec::new(),
         connect_providers: None,
         allow_subprocess_connectors: false,
+        references: Default::default(),
     }
 }
 

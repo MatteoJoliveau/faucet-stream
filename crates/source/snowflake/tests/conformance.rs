@@ -215,3 +215,49 @@ async fn conformance_errors_not_panics() {
     assert_connector_name_nonempty(&source);
     assert_errors_not_panics(&source).await;
 }
+
+// ── Descriptor agreement (RFC 0013) ───────────────────────────────────────────
+
+#[test]
+fn conformance_descriptor_matches_built_source() {
+    let v = json!({
+        "account": "xy12345",
+        "warehouse": "WH",
+        "database": "DB",
+        "schema": "PUBLIC",
+        "auth": {"type": "oauth", "config": {"token": "t"}},
+        "query": "SELECT 1",
+    });
+    let cfg: SnowflakeSourceConfig = serde_json::from_value(v.clone()).unwrap();
+    let built = SnowflakeSource::new(cfg).expect("source new");
+    faucet_conformance::assert_descriptor_matches_source(
+        &faucet_source_snowflake::DESCRIPTOR,
+        "snowflake",
+        &v,
+        &built,
+    );
+}
+
+// ── Check: backend calls honour the call deadline and cancel (#880) ──────────
+
+#[tokio::test]
+async fn conformance_call_deadline() {
+    let hung = faucet_conformance::hung::SilentListener::start()
+        .await
+        .expect("listener");
+    let uri = hung.http_url();
+    let make = || {
+        let config = SnowflakeSourceConfig::new(
+            "xy12345",
+            "WH",
+            "DB",
+            "PUBLIC",
+            SnowflakeAuth::OAuth { token: "t".into() },
+            "SELECT id FROM events",
+        );
+        SnowflakeSource::new(config)
+            .expect("source new")
+            .with_endpoint_base(uri.clone())
+    };
+    faucet_conformance::calls::assert_source_call_deadline(make).await;
+}

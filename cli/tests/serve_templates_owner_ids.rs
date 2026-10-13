@@ -2,7 +2,7 @@
 //! is percent-encoded into one path segment (`/v1/templates/acme%2Fbilling`),
 //! which every per-template route accepts; the raw two-segment form is not a
 //! template route.
-
+#![allow(clippy::disallowed_methods)] // tests drive time and raw clients directly
 #![cfg(feature = "templates")]
 
 use std::time::Duration;
@@ -67,6 +67,7 @@ fn args(port: u16) -> ServeArgs {
         vault_previous_key: Vec::new(),
         connect_providers: None,
         allow_subprocess_connectors: false,
+        references: Default::default(),
     }
 }
 

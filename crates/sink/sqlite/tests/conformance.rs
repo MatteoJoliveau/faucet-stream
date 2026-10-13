@@ -56,6 +56,37 @@ async fn fresh_sink() -> (TempDir, String, SqliteSink) {
     (dir, url, sink)
 }
 
+#[tokio::test(flavor = "multi_thread")]
+async fn conformance_call_deadline() {
+    // A file another connection holds an exclusive lock on stands in for a
+    // hung backend (#880): the write waits on the lock (busy_timeout 60 s).
+    let (_dir, url, first) = fresh_sink().await;
+    let second = SqliteSink::new(SqliteSinkConfig {
+        database_url: url.clone(),
+        table_name: "t".to_string(),
+        column_mapping: SqliteColumnMapping::AutoMap,
+        batch_size: 1000,
+        max_connections: 1,
+        create_table: true,
+        busy_timeout_secs: 60,
+        write: WriteSpec::default(),
+    })
+    .await
+    .expect("sink");
+    let mut lock = <sqlx::SqliteConnection as sqlx::Connection>::connect(&url)
+        .await
+        .expect("lock connection");
+    sqlx::Executor::execute(&mut lock, "BEGIN EXCLUSIVE")
+        .await
+        .expect("lock");
+    let built = std::sync::Mutex::new(vec![first, second]);
+    faucet_conformance::calls::assert_sink_call_deadline(
+        || built.lock().unwrap().pop().unwrap(),
+        &[serde_json::json!({"id": 1, "v": "a"})],
+    )
+    .await;
+}
+
 async fn count_rows(url: &str) -> usize {
     let pool = SqlitePoolOptions::new()
         .max_connections(1)
@@ -137,4 +168,68 @@ async fn conformance_capabilities_truthful() {
         async move { count_rows(&url).await }
     })
     .await;
+}
+
+/// The capabilities the sink declares beyond its descriptor (#878): truthful
+/// per-row outcomes, a replay-safe keyed write, atomic batches and the
+/// overwrite lifecycle.
+#[tokio::test]
+async fn conformance_declared_capabilities() {
+    let (_dir, url, sink) = fresh_sink().await;
+    let count = || {
+        let url = url.clone();
+        async move { count_rows(&url).await }
+    };
+    faucet_conformance::assert_partial_outcomes_truthful(&sink, count).await;
+    faucet_conformance::assert_replay_safe(&sink, count).await;
+    faucet_conformance::assert_batch_atomicity_truthful(
+        &sink,
+        count,
+        &[
+            serde_json::json!({"id": 951, "v": "kept only if the batch is torn"}),
+            serde_json::json!({"v": "no key"}),
+        ],
+    )
+    .await;
+
+    let overwrite = SqliteSink::new(SqliteSinkConfig {
+        database_url: url.clone(),
+        table_name: "t".to_string(),
+        column_mapping: SqliteColumnMapping::AutoMap,
+        batch_size: 1000,
+        max_connections: 1,
+        create_table: true,
+        busy_timeout_secs: 60,
+        write: WriteSpec {
+            write_mode: WriteMode::Overwrite,
+            ..WriteSpec::default()
+        },
+    })
+    .await
+    .expect("overwrite sink");
+    faucet_conformance::assert_overwrite_lifecycle(&overwrite, count).await;
+}
+
+#[tokio::test]
+async fn descriptor_matches_the_built_sink() {
+    let dir = TempDir::new().expect("tempdir");
+    let url = format!("sqlite://{}?mode=rwc", dir.path().join("d.db").display());
+    for v in [
+        serde_json::json!({"database_url": url, "table_name": "t", "column_mapping": {"json": {"column": "d"}}}),
+        serde_json::json!({"database_url": url, "table_name": "t", "column_mapping": "auto_map"}),
+        serde_json::json!({
+            "database_url": url, "table_name": "t", "column_mapping": "auto_map",
+            "write_mode": "upsert", "key": ["id"]
+        }),
+        serde_json::json!({"database_url": url, "table_name": "t", "column_mapping": "auto_map", "write_mode": "overwrite"}),
+    ] {
+        let cfg: SqliteSinkConfig = serde_json::from_value(v.clone()).unwrap();
+        let built = SqliteSink::new(cfg).await.expect("sink");
+        faucet_conformance::assert_descriptor_matches_sink(
+            &faucet_sink_sqlite::DESCRIPTOR,
+            "sqlite",
+            &v,
+            &built,
+        );
+    }
 }

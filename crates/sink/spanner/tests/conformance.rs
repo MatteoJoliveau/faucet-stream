@@ -24,6 +24,34 @@ fn conformance_config_schema_valid() {
     assert_config_schema_valid_value(&schema, "spanner");
 }
 
+// ── Descriptor agreement (RFC 0013, Docker) ─────────────────────────────────
+
+/// `new()` opens a session pool, so the built sink needs the emulator.
+#[tokio::test(flavor = "multi_thread")]
+async fn conformance_descriptor_matches_built_sink() {
+    let conn = support::create_database("descriptor", Vec::new()).await;
+    let base = serde_json::json!({
+        "project_id": conn.project_id,
+        "instance": conn.instance,
+        "database": conn.database,
+        "emulator_host": conn.emulator_host,
+        "table_name": "t",
+    });
+    let mut upsert = base.clone();
+    upsert["write_mode"] = serde_json::json!("upsert");
+    upsert["key"] = serde_json::json!(["id"]);
+    for v in [base, upsert] {
+        let cfg: SpannerSinkConfig = serde_json::from_value(v.clone()).unwrap();
+        let built = SpannerSink::new(cfg).await.expect("sink");
+        faucet_conformance::assert_descriptor_matches_sink(
+            &faucet_sink_spanner::DESCRIPTOR,
+            "spanner",
+            &v,
+            &built,
+        );
+    }
+}
+
 /// A fresh database + upsert-configured sink (key = PK), mirroring the
 /// postgres conformance setup.
 async fn fresh_sink(database: &str) -> SpannerSink {
@@ -126,5 +154,59 @@ async fn conformance_write_modes_truthful() {
         let conn = conn.clone();
         async move { support::count_rows(&conn, "t").await }
     })
+    .await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn conformance_declared_capabilities() {
+    // #878: per-row outcomes are truthful and a replayed keyed write converges
+    // on the primary key.
+    let sink = fresh_sink_delete("conf-declared").await;
+    let conn = support::connection("conf-declared", &support::emulator_host().await);
+    let count = || {
+        let conn = conn.clone();
+        async move { support::count_rows(&conn, "t").await }
+    };
+    faucet_conformance::assert_partial_outcomes_truthful(&sink, count).await;
+    faucet_conformance::assert_replay_safe(&sink, count).await;
+}
+
+// ── Check: backend calls honour the call deadline and cancel (#880) ──────────
+
+fn block_on<F: std::future::Future>(f: F) -> F::Output {
+    tokio::task::block_in_place(|| tokio::runtime::Handle::current().block_on(f))
+}
+
+/// The client opens its session pool while it is built, so the backend hangs
+/// only once the sink exists: a proxy forwards to the emulator during `new()`
+/// and then stops answering.
+#[tokio::test(flavor = "multi_thread")]
+async fn conformance_call_deadline() {
+    let conn = support::create_database(
+        "deadline",
+        vec!["CREATE TABLE t (id INT64 NOT NULL) PRIMARY KEY (id)".to_string()],
+    )
+    .await;
+    let emulator = conn.emulator_host.clone().expect("emulator host");
+    let proxy = faucet_conformance::hung::HangingProxy::start(&emulator)
+        .await
+        .expect("proxy");
+    let host = proxy.addr().to_string();
+    faucet_conformance::calls::assert_sink_call_deadline(
+        || {
+            proxy.resume();
+            let mut cfg = SpannerSinkConfig::new(
+                conn.project_id.clone(),
+                conn.instance.clone(),
+                conn.database.clone(),
+                "t",
+            );
+            cfg.connection.emulator_host = Some(host.clone());
+            let sink = block_on(SpannerSink::new(cfg)).expect("sink builds");
+            proxy.hang();
+            sink
+        },
+        &[serde_json::json!({"id": 1})],
+    )
     .await;
 }

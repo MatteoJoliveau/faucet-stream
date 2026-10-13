@@ -9,6 +9,7 @@
 //!   `delivery: exactly_once`).
 //!
 //! Check 5 requires Docker (LocalStack via testcontainers), mirroring `sink.rs`.
+#![allow(clippy::disallowed_methods)] // tests drive time and raw clients directly
 
 use faucet_conformance::assert_config_schema_valid_value;
 use faucet_core::Sink;
@@ -119,6 +120,12 @@ async fn conformance_capabilities_truthful() {
         async move { count_messages(client_ref, &url).await }
     })
     .await;
+    // #878: per-entry SendMessageBatch outcomes are truthful.
+    faucet_conformance::assert_partial_outcomes_truthful(&sink, || {
+        let url = url.clone();
+        async move { count_messages(client_ref, &url).await }
+    })
+    .await;
 
     // The honest branch must have left the append-only sink non-idempotent.
     assert!(!sink.supports_idempotent_writes());
@@ -192,4 +199,49 @@ async fn large_records_and_fifo_order() {
         }
     }
     assert_eq!(seen, (0..25).collect::<Vec<i64>>());
+}
+
+/// The static descriptor answers exactly what the built sink declares (RFC 0013).
+#[tokio::test(flavor = "multi_thread")]
+async fn conformance_descriptor_matches_built_sink() {
+    #[allow(unused_mut)]
+    let configs = vec![
+        r#"{"queue_url": "http://127.0.0.1:1/1/q", "region": "us-east-1", "endpoint_url": "http://127.0.0.1:1", "credentials": {"type": "access_key", "config": {"access_key_id": "t", "secret_access_key": "t"}}}"#,
+    ];
+    for raw in configs {
+        let v: faucet_core::Value = faucet_core::serde_json::from_str(raw).expect("json");
+        let cfg: faucet_sink_sqs::SqsSinkConfig =
+            faucet_core::serde_json::from_value(v.clone()).expect("config");
+        let built = faucet_sink_sqs::SqsSink::new(cfg)
+            .await
+            .expect("offline build");
+        faucet_conformance::assert_descriptor_matches_sink(
+            &faucet_sink_sqs::DESCRIPTOR,
+            "sqs",
+            &v,
+            &built,
+        );
+    }
+}
+
+// ── Check: backend calls honour the call deadline and cancel (#880) ──────────
+
+#[tokio::test(flavor = "multi_thread")]
+async fn conformance_call_deadline() {
+    let hung = faucet_conformance::hung::SilentListener::start()
+        .await
+        .expect("listener");
+    let endpoint = hung.http_url();
+    let make = || {
+        let mut cfg = SqsSinkConfig::new(format!("{endpoint}/1/hung"));
+        cfg.region = Some("us-east-1".into());
+        cfg.endpoint_url = Some(endpoint.clone());
+        cfg.credentials = test_credentials();
+        tokio::task::block_in_place(|| {
+            tokio::runtime::Handle::current().block_on(SqsSink::new(cfg))
+        })
+        .expect("sink builds offline")
+    };
+    faucet_conformance::calls::assert_sink_call_deadline(make, &[serde_json::json!({"a": 1})])
+        .await;
 }

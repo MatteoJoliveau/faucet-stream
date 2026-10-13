@@ -98,6 +98,17 @@ pub enum FaucetError {
         actual: u64,
     },
 
+    /// A sink accounted for fewer rows of a page than it was offered (#879):
+    /// its write returned `accepted` for a page of `offered` rows, without
+    /// per-row outcomes or a coalescing report
+    /// ([`Sink::write_batch_reported`](crate::Sink::write_batch_reported))
+    /// saying where the rest went. The page is not checkpointed, so a resumed
+    /// run reads it again.
+    #[error(
+        "Rows unaccounted: the sink accepted {accepted} of {offered} offered rows and reported          no per-row failure or coalescing for the rest"
+    )]
+    RowsUnaccounted { offered: u64, accepted: u64 },
+
     /// A run's learned column profile drifted from its baseline under a
     /// `profiling.on_drift: fail` policy (#708). Raised after the run's data
     /// is written: the failure marks the run, it does not undo it.
@@ -152,6 +163,15 @@ pub enum FaucetError {
         operation: String,
         /// The bound that elapsed.
         after: Duration,
+    },
+
+    /// A backend call was abandoned because the run was cancelled
+    /// ([`CallContext::call`](crate::io::CallContext::call)). Not retriable:
+    /// the caller is stopping.
+    #[error("{operation} cancelled")]
+    Cancelled {
+        /// What was being waited on, e.g. `"page call"`.
+        operation: String,
     },
 
     /// A custom error from a third-party connector.
@@ -283,6 +303,15 @@ mod tests {
             body: "Too Many Requests".into(),
         };
         assert!(err.is_retriable());
+    }
+
+    #[test]
+    fn cancelled_is_not_retriable() {
+        let err = FaucetError::Cancelled {
+            operation: "page call".into(),
+        };
+        assert!(!err.is_retriable());
+        assert_eq!(err.to_string(), "page call cancelled");
     }
 
     #[test]

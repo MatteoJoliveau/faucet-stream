@@ -49,4 +49,37 @@ async fn conformance_capabilities_truthful() {
 
     assert!(!sink.supports_idempotent_writes());
     assert!(!sink.dedups_by_key());
+
+    // #878: per-row outcomes are truthful and a failed batch lands no row.
+    let count = || async move { sink_ref.scalar_count("t").await.expect("count") as usize };
+    faucet_conformance::assert_partial_outcomes_truthful(&sink, count).await;
+    faucet_conformance::assert_batch_atomicity_truthful(
+        &sink,
+        count,
+        &[
+            serde_json::json!({"id": 952, "v": "kept only if the batch is torn"}),
+            serde_json::json!({"id": "not a number", "v": "x"}),
+        ],
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn descriptor_matches_the_built_sink() {
+    for v in [
+        serde_json::json!({"database": ":memory:", "table_name": "t"}),
+        serde_json::json!({
+            "database": ":memory:", "table_name": "t", "column_mapping": "auto_map",
+            "create_table": false
+        }),
+    ] {
+        let cfg: DuckdbSinkConfig = serde_json::from_value(v.clone()).unwrap();
+        let built = DuckdbSink::new(cfg).await.expect("sink");
+        faucet_conformance::assert_descriptor_matches_sink(
+            &faucet_sink_duckdb::DESCRIPTOR,
+            "duckdb",
+            &v,
+            &built,
+        );
+    }
 }

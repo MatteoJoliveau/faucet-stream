@@ -101,3 +101,52 @@ async fn conformance_preflight_check_wellformed() {
     )
     .await;
 }
+
+#[test]
+fn conformance_descriptor_matches_built_source() {
+    for kind in [RpcKind::Unary, RpcKind::ServerStreaming] {
+        let typed = GrpcStreamConfig::new(
+            "http://127.0.0.1:1",
+            "faucet.test.echo.EchoService",
+            "List",
+            common::descriptor_set_path(),
+        )
+        .request(json!({ "count": 1 }))
+        .rpc_kind(kind);
+        let v = serde_json::to_value(typed).unwrap();
+        let cfg: GrpcStreamConfig = serde_json::from_value(v.clone()).unwrap();
+        let built = faucet_source_grpc::GrpcStream::new(cfg).unwrap();
+        faucet_conformance::assert_descriptor_matches_source(
+            &faucet_source_grpc::DESCRIPTOR,
+            "grpc",
+            &v,
+            &built,
+        );
+    }
+}
+
+// ── Check: backend calls honour the call deadline and cancel (#880) ──────────
+
+fn hung_source(endpoint: &str, kind: RpcKind) -> GrpcStream {
+    let config = GrpcStreamConfig::new(
+        endpoint,
+        "faucet.test.echo.EchoService",
+        "List",
+        common::descriptor_set_path(),
+    )
+    .request(json!({ "count": 1 }))
+    .rpc_kind(kind);
+    GrpcStream::new(config).expect("grpc stream builds from a valid config")
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn conformance_call_deadline() {
+    let hung = faucet_conformance::hung::SilentListener::start()
+        .await
+        .expect("listener");
+    let endpoint = hung.http_url();
+    for kind in [RpcKind::Unary, RpcKind::ServerStreaming] {
+        faucet_conformance::calls::assert_source_call_deadline(|| hung_source(&endpoint, kind))
+            .await;
+    }
+}

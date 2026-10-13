@@ -1,6 +1,7 @@
 //! Integration tests for event-driven triggers (#196). Drive the serve runner
 //! in-process against an in-memory history backend.
 #![cfg(all(feature = "triggers", feature = "source-csv", feature = "sink-jsonl"))]
+#![allow(clippy::disallowed_methods)] // tests drive time and raw clients directly
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -51,6 +52,7 @@ fn test_config() -> ServeConfig {
         vault: None,
         connect_providers_path: None,
         allow_subprocess_connectors: false,
+        references: Default::default(),
     }
 }
 
@@ -753,6 +755,7 @@ async fn spawn_serve_with_triggers(
         vault_previous_key: Vec::new(),
         connect_providers: None,
         allow_subprocess_connectors: false,
+        references: Default::default(),
     };
     let mut config = ServeConfig::from_args(args).unwrap();
     config.log_level = "warn".into();

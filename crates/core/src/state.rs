@@ -116,7 +116,7 @@ pub const STATE_EXPORT_VERSION: u32 = 1;
 
 /// The key prefix every state key of pipeline `name` starts with.
 pub fn namespace_prefix(pipeline: &str) -> String {
-    format!("{pipeline}::")
+    crate::state_key::StateKey::pipeline(pipeline).children_prefix()
 }
 
 /// A portable snapshot of one pipeline's durable state — every key under its
@@ -403,6 +403,7 @@ async fn open_lock_file(path: &Path) -> Result<std::fs::File, FaucetError> {
         .await)
 }
 
+#[allow(clippy::disallowed_methods)] // a runtime timer, not a connector backend call
 async fn acquire_lock_file(path: &Path) -> Result<LockFile, FaucetError> {
     let started = tokio::time::Instant::now();
     let mut file = open_lock_file(path).await?;
@@ -1093,6 +1094,7 @@ impl FileStateStore {
 }
 
 #[cfg(test)]
+#[allow(clippy::disallowed_methods)] // tests drive time and raw clients directly
 mod tests {
     use super::*;
     use serde_json::json;

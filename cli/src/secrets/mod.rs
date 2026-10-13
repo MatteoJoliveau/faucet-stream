@@ -41,10 +41,11 @@ pub trait SecretResolver: Send + Sync {
 /// load instead of hanging it.
 #[cfg(any(feature = "secrets-vault", feature = "secrets-gcp-sm"))]
 pub(crate) fn secret_http_client() -> reqwest::Client {
-    reqwest::Client::builder()
+    faucet_core::http::Client::builder()
         .connect_timeout(std::time::Duration::from_secs(10))
         .timeout(std::time::Duration::from_secs(30))
-        .build()
+        .sensitive_header("x-vault-token")
+        .build_reqwest()
         .unwrap_or_default()
 }
 

@@ -9,6 +9,7 @@
 //! The destination count is read back by draining a subscription created on the
 //! target topic before the sink publishes. Passing this battery in CI is the
 //! Tier-1 (supported) criterion.
+#![allow(clippy::disallowed_methods)] // tests drive time and raw clients directly
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -109,8 +110,16 @@ async fn conformance_capabilities_truthful() {
     let mut cfg = PubsubSinkConfig::new("conf-sink-t");
     cfg.connection = conn(&host);
     cfg.value_format = ValueFormat::Json;
+    let cfg_value = faucet_core::serde_json::to_value(&cfg).expect("config serializes");
     let sink = PubsubSink::new(cfg).await.expect("sink builds");
     faucet_conformance::assert_batch_atomicity_declared(&sink);
+    // RFC 0013: the static descriptor answers what the built sink declares.
+    faucet_conformance::assert_descriptor_matches_sink(
+        &faucet_sink_pubsub::DESCRIPTOR,
+        "pubsub",
+        &cfg_value,
+        &sink,
+    );
 
     // Check 10: connector_name is non-empty (metric-cardinality contract).
     faucet_conformance::assert_connector_name_nonempty_value(
@@ -139,10 +148,41 @@ async fn assert_capabilities_truthful_count(
     seen: Arc<AtomicUsize>,
     sub: Arc<Subscription>,
 ) {
+    let (seen2, sub2) = (seen.clone(), sub.clone());
     faucet_conformance::assert_capabilities_truthful(sink, move || {
         let seen = seen.clone();
         let sub = sub.clone();
         async move { count_available(&sub, &seen).await }
     })
+    .await;
+    // #878: per-message publish outcomes are truthful.
+    faucet_conformance::assert_partial_outcomes_truthful(sink, move || {
+        let seen = seen2.clone();
+        let sub = sub2.clone();
+        async move { count_available(&sub, &seen).await }
+    })
+    .await;
+}
+
+// ── Check: backend calls honour the call deadline and cancel (#880) ──────────
+
+fn block_on<F: std::future::Future>(f: F) -> F::Output {
+    tokio::task::block_in_place(|| tokio::runtime::Handle::current().block_on(f))
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn conformance_call_deadline() {
+    let hung = faucet_conformance::hung::SilentListener::start()
+        .await
+        .expect("listener");
+    let host = hung.addr().to_string();
+    faucet_conformance::calls::assert_sink_call_deadline(
+        || {
+            let mut cfg = PubsubSinkConfig::new("hung-t");
+            cfg.connection = conn(&host);
+            block_on(PubsubSink::new(cfg)).expect("sink builds offline")
+        },
+        &[faucet_core::serde_json::json!({"id": 1})],
+    )
     .await;
 }

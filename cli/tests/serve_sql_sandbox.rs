@@ -8,6 +8,7 @@
     feature = "source-sqlite",
     feature = "sink-jsonl"
 ))]
+#![allow(clippy::disallowed_methods)] // tests drive time and raw clients directly
 
 use serde_json::{Value, json};
 use std::path::{Path, PathBuf};
@@ -69,6 +70,7 @@ fn args(port: u16, triggers: Option<PathBuf>) -> faucet_cli::cli::ServeArgs {
         vault_previous_key: Vec::new(),
         connect_providers: None,
         allow_subprocess_connectors: false,
+        references: Default::default(),
     }
 }
 

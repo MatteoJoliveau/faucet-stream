@@ -6,6 +6,7 @@
 //! cleanly when Docker is unavailable (so `cargo test` passes on a Docker-less
 //! host) and runs for real in CI, where Docker is present. Passing this battery
 //! in CI is the Tier-1 (supported) criterion.
+#![allow(clippy::disallowed_methods)] // tests drive time and raw clients directly
 
 mod common;
 
@@ -89,4 +90,35 @@ async fn conformance_bounded_memory() {
     )
     .expect("source");
     assert_bounded_memory(&source, 50, 250).await;
+}
+
+#[test]
+fn descriptor_matches_the_built_source() {
+    for v in [
+        serde_json::json!({"url": "http://localhost:8123", "query": "SELECT 1"}),
+        serde_json::json!({"host": "localhost", "query": "SELECT 1", "batch_size": 0}),
+    ] {
+        let cfg: ClickHouseSourceConfig = serde_json::from_value(v.clone()).unwrap();
+        let built = ClickHouseSource::new(cfg).expect("source");
+        faucet_conformance::assert_descriptor_matches_source(
+            &faucet_source_clickhouse::DESCRIPTOR,
+            "clickhouse",
+            &v,
+            &built,
+        );
+    }
+}
+
+// ── Check: backend calls honour the call deadline and cancel (#880) ──────────
+
+#[tokio::test]
+async fn conformance_call_deadline() {
+    let hung = faucet_conformance::hung::SilentListener::start()
+        .await
+        .expect("listener");
+    let uri = hung.http_url();
+    faucet_conformance::calls::assert_source_call_deadline(|| {
+        ClickHouseSource::new(ClickHouseSourceConfig::new(&uri, "SELECT 1")).unwrap()
+    })
+    .await;
 }

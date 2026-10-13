@@ -82,10 +82,13 @@ impl StateScope {
     /// The first segments of every state key: `{namespace}::{pipeline}` or
     /// just the pipeline name.
     pub fn prefix(&self, pipeline_name: &str) -> String {
-        match &self.namespace {
-            Some(ns) => format!("{ns}::{pipeline_name}"),
-            None => pipeline_name.to_string(),
-        }
+        self.key(pipeline_name).namespace()
+    }
+
+    /// The pipeline-level [`StateKey`](faucet_core::StateKey) every key of a
+    /// run of `pipeline_name` is built from.
+    pub fn key(&self, pipeline_name: &str) -> faucet_core::StateKey {
+        faucet_core::StateKey::pipeline(pipeline_name).with_tenant(self.namespace.as_deref())
     }
 }
 
@@ -386,6 +389,9 @@ pub struct InvocationMetrics {
     pub batches: Option<faucet_core::BatchOutcomes>,
     /// The source's lag at the end of the run (#733), when it reports one.
     pub source_lag: Option<faucet_core::SourceLag>,
+    /// Where every row went (#879): offered, accepted, coalesced, failed to the
+    /// DLQ, quarantined, dropped. `None` when nothing was offered.
+    pub rows: Option<faucet_core::RowAccountsSnapshot>,
 }
 
 /// Counters one invocation's pipeline fills in and the caller reads afterwards
@@ -395,6 +401,8 @@ pub(crate) struct RunObservers {
     pub(crate) meter: Arc<faucet_core::UsageMeter>,
     pub(crate) batches: Arc<faucet_core::BatchOutcomeCounters>,
     pub(crate) lag: Arc<faucet_core::LagObserver>,
+    /// Per-run row accounting (#879).
+    pub(crate) rows: Arc<faucet_core::RowAccounts>,
 }
 
 impl RunObservers {
@@ -497,6 +505,26 @@ pub fn run_expanded_boxed(
 }
 
 pub async fn run_expanded(nodes: Vec<ExpandedNode>, opts: ExecuteOptions) -> CliResult<RunSummary> {
+    run_expanded_unredacted(nodes, opts)
+        .await
+        .map(redact_summary)
+}
+
+/// Redact every invocation error where it is created (#874), before any
+/// consumer persists or forwards it.
+fn redact_summary(mut summary: RunSummary) -> RunSummary {
+    for inv in &mut summary.invocations {
+        if let Some(e) = inv.error.take() {
+            inv.error = Some(crate::secrets::registry::redact_message(&e));
+        }
+    }
+    summary
+}
+
+async fn run_expanded_unredacted(
+    nodes: Vec<ExpandedNode>,
+    opts: ExecuteOptions,
+) -> CliResult<RunSummary> {
     check_budget_sinks(&nodes, opts.budget.as_ref())?;
     if !opts.dry_run {
         check_overwrite_plan(&nodes, &opts).await?;
@@ -720,18 +748,13 @@ pub async fn run_expanded(nodes: Vec<ExpandedNode>, opts: ExecuteOptions) -> Cli
             match &node.role {
                 NodeRole::Root => {
                     let uses_state = node.state.is_some() || opts.state_path_override.is_some();
-                    let state_key = build_state_key(
-                        &opts.state_scope.prefix(&opts.pipeline_name),
-                        &node.id,
-                        None,
-                    );
+                    let key = opts.state_scope.key(&opts.pipeline_name);
+                    let state_key = key.clone().with_row(node.id.as_str()).render();
                     validate_unit_state_key(&node.id, uses_state, &state_key)?;
                     let legacy_state_keys = node
                         .legacy_state_ids
                         .iter()
-                        .map(|id| {
-                            build_state_key(&opts.state_scope.prefix(&opts.pipeline_name), id, None)
-                        })
+                        .map(|id| key.clone().with_row(id.as_str()).render())
                         .collect();
                     units.push(Unit {
                         node: node.clone(),
@@ -747,11 +770,11 @@ pub async fn run_expanded(nodes: Vec<ExpandedNode>, opts: ExecuteOptions) -> Cli
                         // One-level discovery (#501): one invocation; run_unit
                         // intercepts it to enumerate the dimension. State is
                         // unused, so the key is a placeholder.
-                        let state_key = build_state_key(
-                            &opts.state_scope.prefix(&opts.pipeline_name),
-                            &node.id,
-                            None,
-                        );
+                        let state_key = opts
+                            .state_scope
+                            .key(&opts.pipeline_name)
+                            .with_row(node.id.as_str())
+                            .render();
                         units.push(Unit {
                             node: node.clone(),
                             parent_record: None,
@@ -773,11 +796,12 @@ pub async fn run_expanded(nodes: Vec<ExpandedNode>, opts: ExecuteOptions) -> Cli
                         for ctx in crate::discovery_matrix::cartesian(&resolved) {
                             let suffix =
                                 crate::discovery_matrix::tuple_state_key_suffix(&resolved, &ctx);
-                            let state_key = build_state_key(
-                                &opts.state_scope.prefix(&opts.pipeline_name),
-                                &node.id,
-                                Some(&suffix),
-                            );
+                            let state_key = opts
+                                .state_scope
+                                .key(&opts.pipeline_name)
+                                .with_row(node.id.as_str())
+                                .with_sub(suffix.as_str())
+                                .render();
                             units.push(Unit {
                                 node: node.clone(),
                                 parent_record: None,
@@ -820,11 +844,12 @@ pub async fn run_expanded(nodes: Vec<ExpandedNode>, opts: ExecuteOptions) -> Cli
                         crate::discovery_matrix::inject_collected(&mut ctx, &collected_dims);
                         let suffix =
                             crate::discovery_matrix::tuple_state_key_suffix(&resolved, &ctx);
-                        let state_key = build_state_key(
-                            &opts.state_scope.prefix(&opts.pipeline_name),
-                            &node.id,
-                            Some(&suffix),
-                        );
+                        let state_key = opts
+                            .state_scope
+                            .key(&opts.pipeline_name)
+                            .with_row(node.id.as_str())
+                            .with_sub(suffix.as_str())
+                            .render();
                         if let Err(e) =
                             check_unit_state_key(&node.id, uses_state, &state_key, &mut seen_keys)
                         {
@@ -868,7 +893,7 @@ pub async fn run_expanded(nodes: Vec<ExpandedNode>, opts: ExecuteOptions) -> Cli
                             .map(value_to_string_brief)
                             .unwrap_or_else(|| "(missing)".to_string());
                         let (state_key, legacy_state_keys) = child_state_keys(
-                            &opts.state_scope.prefix(&opts.pipeline_name),
+                            opts.state_scope.key(&opts.pipeline_name),
                             &node.id,
                             &pk_string,
                         );
@@ -1009,26 +1034,25 @@ pub async fn run_expanded(nodes: Vec<ExpandedNode>, opts: ExecuteOptions) -> Cli
             let dlq_sinks = Arc::clone(&dlq_sinks);
             let state_stores = Arc::clone(&state_stores);
             let handle = joinset.spawn(
-                STATE_STORES
-                    .scope(
-                        state_stores,
-                        DLQ_SINKS.scope(dlq_sinks, async move {
-                            let _permit = sem.acquire().await.expect("semaphore not closed");
-                            run_unit(
-                                &unit,
-                                capture,
-                                &captured,
-                                &discovered,
-                                &collected,
-                                &opts2,
-                                unit_cancel,
-                                suppress_overwrite,
-                                overwrite_grouped,
-                            )
-                            .await
-                        }),
-                    )
-                    .in_current_span(),
+                faucet_core::http::inherit_reference_policy(STATE_STORES.scope(
+                    state_stores,
+                    DLQ_SINKS.scope(dlq_sinks, async move {
+                        let _permit = sem.acquire().await.expect("semaphore not closed");
+                        run_unit(
+                            &unit,
+                            capture,
+                            &captured,
+                            &discovered,
+                            &collected,
+                            &opts2,
+                            unit_cancel,
+                            suppress_overwrite,
+                            overwrite_grouped,
+                        )
+                        .await
+                    }),
+                ))
+                .in_current_span(),
             );
             task_meta.insert(handle.id(), meta);
         }
@@ -1358,7 +1382,7 @@ struct OverwriteGroup {
 /// its own).
 fn mark_overwrite_staging(kind: &str, cfg: &mut Value, grouped: bool) {
     if grouped
-        && crate::registry::sink_supports_direct_overwrite(kind)
+        && crate::registry::sink_capabilities(kind, cfg).direct_overwrite()
         && let Value::Object(map) = cfg
     {
         map.insert("_overwrite_staging".to_string(), Value::Bool(true));
@@ -1528,7 +1552,7 @@ fn resolved_sink_destination(unit: &Unit, opts: &ExecuteOptions) -> CliResult<Va
         && opts.limit.is_none()
         && opts.shard.is_none()
         && unit.node.state.is_some()
-        && crate::rollback::sink_supports_rollback(&unit.node.sink.kind)
+        && crate::rollback::sink_supports_rollback(&unit.node.sink.kind, &sink_cfg)
     {
         let column = crate::rollback::run_id_column(unit.node.metadata_columns.as_ref());
         crate::rollback::inject_write_spec(&mut sink_cfg, spec, "", &column);
@@ -1752,6 +1776,7 @@ async fn run_unit(
         duration_ms,
         batches: observers.batch_outcomes(),
         source_lag: observers.lag.last(),
+        rows: Some(observers.rows.snapshot()).filter(|r| r.offered > 0 || r.unaccounted > 0),
         ..Default::default()
     };
     match result {
@@ -1912,57 +1937,37 @@ fn boxed_run_one_invocation<'a>(
 /// The durable store the run lease and run-outcome marker are written to —
 /// `None` for preview / `--limit` / shard runs and memory or absent state,
 /// whose markers would describe nothing durable.
-/// A child invocation's state key, and the key releases before #840 used —
-/// the parent-key value verbatim — when that differs and is a valid key
-/// (#862 M-021).
-fn child_state_keys(prefix: &str, row: &str, parent_key: &str) -> (String, Vec<String>) {
-    let current = build_state_key(
-        prefix,
-        row,
-        Some(&crate::discovery_matrix::state_key_component(
-            parent_key, true,
-        )),
-    );
-    let verbatim = build_state_key(prefix, row, Some(parent_key));
-    let legacy = (verbatim != current && faucet_core::state::validate_state_key(&verbatim).is_ok())
-        .then_some(verbatim)
-        .into_iter()
-        .collect();
-    (current, legacy)
+/// A child invocation's state key, and the keys earlier key schemes rendered
+/// for it (the pre-#840 verbatim parent key, #862 M-021).
+fn child_state_keys(
+    base: impl Into<StateKeyBase>,
+    row: &str,
+    parent_key: &str,
+) -> (String, Vec<String>) {
+    let key = base.into().0.with_row(row).with_parent_key(parent_key);
+    (key.render(), key.legacy_renderings())
 }
 
-/// Move a bookmark stored under a key an earlier release used to `key`, when
-/// `key` holds none (#862 M-021/M-025). A failure leaves both keys as they were.
+/// The pipeline-level key a child key is built from.
+struct StateKeyBase(faucet_core::StateKey);
+
+impl From<faucet_core::StateKey> for StateKeyBase {
+    fn from(k: faucet_core::StateKey) -> Self {
+        Self(k)
+    }
+}
+
+impl From<&str> for StateKeyBase {
+    fn from(pipeline: &str) -> Self {
+        Self(faucet_core::StateKey::pipeline(pipeline))
+    }
+}
+
+/// Move a bookmark an earlier key scheme or a renamed row left behind to `key`,
+/// when `key` holds none (#882). A failure leaves both keys as they were.
 async fn adopt_legacy_state(store: &dyn StateStore, key: &str, legacy: &[String]) {
-    if legacy.is_empty() {
-        return;
-    }
-    match store.get(key).await {
-        Ok(None) => {}
-        Ok(Some(_)) => return,
-        Err(e) => {
-            tracing::warn!(key, error = %e, "state unreadable; legacy state key not checked");
-            return;
-        }
-    }
-    for old in legacy {
-        let value = match store.get(old).await {
-            Ok(Some(v)) => v,
-            Ok(None) => continue,
-            Err(e) => {
-                tracing::warn!(key = %old, error = %e, "legacy state key unreadable");
-                return;
-            }
-        };
-        if let Err(e) = store.put(key, &value).await {
-            tracing::warn!(key, error = %e, "could not move state from its legacy key");
-            return;
-        }
-        if let Err(e) = store.delete(old).await {
-            tracing::warn!(key = %old, error = %e, "legacy state key could not be removed");
-        }
-        tracing::info!(from = %old, to = key, "moved state from the key an earlier release used");
-        return;
+    if let Err(e) = faucet_core::migrate_state_key(store, key, legacy).await {
+        tracing::warn!(key, error = %e, "state key migration skipped");
     }
 }
 
@@ -2089,15 +2094,13 @@ async fn run_discovery(
     }
 }
 
-/// Produce `{pipeline_name}::{row_id}` or `{pipeline_name}::{row_id}::{key}`.
-pub(crate) fn build_state_key(
-    pipeline_name: &str,
-    row_id: &str,
-    parent_key: Option<&str>,
-) -> String {
-    match parent_key {
-        None => format!("{pipeline_name}::{row_id}"),
-        Some(k) => format!("{pipeline_name}::{row_id}::{k}"),
+/// `{pipeline_name}::{row_id}` or `{pipeline_name}::{row_id}::{sub}`, rendered
+/// through [`faucet_core::StateKey`]; `sub` is already in key form.
+pub(crate) fn build_state_key(pipeline_name: &str, row_id: &str, sub: Option<&str>) -> String {
+    let key = faucet_core::StateKey::invocation(pipeline_name, row_id);
+    match sub {
+        None => key.render(),
+        Some(sub) => key.with_sub(sub).render(),
     }
 }
 
@@ -2328,73 +2331,31 @@ async fn build_pipeline<'a>(
     cleanup_scope: Option<Value>,
     suppress_overwrite: bool,
     observers: RunObservers,
+    governance: faucet_core::Governance,
+    row_accounts: Arc<faucet_core::RowAccounts>,
 ) -> CliResult<Pipeline<'a, dyn Source + 'a, dyn Sink + 'a>> {
     let mut pipeline = Pipeline::new(source, sink)
         .with_name(pipeline_name.to_owned())
         .with_row(row_id.to_owned())
         .with_run_id(run_id.to_owned())
         .with_usage_meter(observers.meter)
+        .with_row_accounts(row_accounts)
         .with_batch_outcomes(observers.batches)
         .with_lag_observer(observers.lag)
         .with_legacy_state_writes(opts.legacy_state_writes);
     if let Some(store) = state {
         pipeline = pipeline.with_state_store(store);
     }
-    if let Some(ref dlq_spec) = node.dlq {
-        let dlq_cfg = if opts.dry_run {
-            preview_dlq_config(dlq_spec)
-        } else {
-            build_dlq_config(dlq_spec).await?
-        };
-        pipeline = pipeline
-            .with_dlq(dlq_cfg)
-            .allow_dlq_all_duplicates(dlq_spec.allow_duplicates_on_dlq_all);
+    if let Some(dlq_spec) = &node.dlq {
+        pipeline = pipeline.allow_dlq_all_duplicates(dlq_spec.allow_duplicates_on_dlq_all);
     }
-    // Cooperative cancellation: a cancelled token makes the streaming loop stop
-    // at the next page boundary and flush the sink (#146 H16). The pipeline takes
-    // a clone so the caller's lineage terminal-event classification and SLA pass
-    // can still read `cancel.is_cancelled()` (cheap — the token is an `Arc`).
-    pipeline = pipeline.with_cancel(cancel.clone());
-    // Pipeline-level quality checks (v1: no matrix-row override). `expand` already
-    // validated this spec, but compile again here to obtain the runtime
-    // `CompiledQuality`; map any error to a config-level failure.
-    #[cfg(feature = "quality")]
-    if let Some(ref quality_spec) = node.quality {
-        let compiled = Arc::new(
-            faucet_core::CompiledQuality::compile(quality_spec)
-                .map_err(|e| CliError::Config(format!("quality: {e}")))?,
-        );
-        pipeline = pipeline.with_quality(compiled);
-    }
-    // Pipeline-level data contract (v1: no matrix-row override). `expand` already
-    // validated the spec; compile again here to obtain the runtime
-    // `CompiledContract`.
-    #[cfg(feature = "contract")]
-    if let Some(ref contract_spec) = node.contract {
-        let compiled = Arc::new(
-            faucet_core::CompiledContract::compile(contract_spec)
-                .map_err(|e| CliError::Config(format!("contract: {e}")))?,
-        );
-        pipeline = pipeline.with_contract(compiled);
-    }
-    // Pipeline-level PII masking (v1: no matrix-row override). Compile scoped to
-    // this node's destination sink — by template name (`sink_ref`) and by
-    // connector kind — so `applies_to` per-destination rules resolve. When no
-    // rule applies to this sink the compiled policy is empty and the pass is
-    // skipped entirely.
-    #[cfg(feature = "masking")]
-    if let Some(ref masking_spec) = node.masking {
-        let sink_ids = [node.sink_ref.as_str(), node.sink.kind.as_str()];
-        let compiled = faucet_core::CompiledMasking::compile_for_sink(masking_spec, &sink_ids)
-            .map_err(|e| CliError::Config(format!("masking: {e}")))?;
-        if !compiled.is_empty() {
-            pipeline = pipeline.with_masking(Arc::new(compiled));
-        }
-    }
-    // Schema-drift policy (pipeline-level in v1; same for every invocation).
-    if let Some(ref sd) = node.schema {
-        pipeline = pipeline.with_schema_drift(faucet_core::SchemaDriftPolicy::compile(sd));
-    }
+    // Every governance pass — masking, quality, contract, schema drift, the
+    // policy / profiling / metadata / budget sink layers, metering, resilience,
+    // cancellation and the governed DLQ — comes from `governance_for` (#875).
+    // The cancel token is a clone, so the caller can still read
+    // `cancel.is_cancelled()` for the lineage terminal event and the SLA pass.
+    let _ = cancel;
+    pipeline = pipeline.with_governance(governance);
     // ── Scoped cleanup (#478) ────────────────────────────────────────────────
     // Attaching the policy is what authorises a delete, so the coarse gating
     // lives here — `run_stream` only adds "the run finished uncancelled".
@@ -2448,11 +2409,6 @@ async fn build_pipeline<'a>(
             .map_err(|e| CliError::Config(format!("adaptive_batch_size: {e}")))?;
         pipeline = pipeline.with_adaptive(ab);
     }
-    // Resilience policy (retry/backoff/circuit-breaker/poison). Top-level in v1,
-    // so the same policy is attached to every invocation.
-    if let Some(policy) = opts.resilience.clone() {
-        pipeline = pipeline.with_resilience(policy);
-    }
     // Delivery guarantee (exactly-once resume/skip when the node opted in; the
     // expand gate already verified source/sink/state support). Preview modes
     // (`--dry-run`, `--limit`) swap in counting/truncating sinks that cannot
@@ -2502,6 +2458,7 @@ async fn run_one_invocation(
         Some(opts.run_id.clone().unwrap_or_else(|| run_id.clone())),
         Some(run_id.clone()),
     );
+    let invocation_clock = std::time::Instant::now();
     let pipeline_name = opts.pipeline_name.clone();
     let row_id = node.id.clone();
     #[cfg(feature = "lineage")]
@@ -2518,23 +2475,24 @@ async fn run_one_invocation(
         && !opts.dry_run
         && opts.limit.is_none()
         && opts.shard.is_none();
-    // Column profiling (#708): roots only, real runs only — the same scoping
-    // as SLA / catalog. The profiler is shared with the sink decorator below
-    // and read back after the run.
-    let profiling_active = node.profiling.is_some()
-        && matches!(node.role, NodeRole::Root)
-        && !opts.dry_run
-        && opts.limit.is_none()
-        && opts.shard.is_none();
-    let profiler: Option<Arc<std::sync::Mutex<faucet_core::Profiler>>> = node
-        .profiling
-        .as_ref()
-        .filter(|_| profiling_active)
-        .map(|spec| {
-            Arc::new(std::sync::Mutex::new(faucet_core::Profiler::new(
-                spec.clone(),
-            )))
-        });
+    // Every governance pass for this invocation, from one place (#875). The
+    // profiler (#708) is shared with the sink layer and read back after the run.
+    let crate::governance::GovernanceBuild {
+        governance,
+        profiler,
+    } = Box::pin(crate::governance::governance_for(
+        crate::governance::GovernanceRequest {
+            node,
+            opts,
+            pipeline: &pipeline_name,
+            row: &row_id,
+            run_id: &run_id,
+            cancel: &cancel,
+            meter: Some(Arc::clone(&observers.meter)),
+        },
+    ))
+    .await?;
+    let row_accounts = Arc::clone(&observers.rows);
     // 1) Resolve `${parent.path}` in the per-row source + sink configs.
     let mut source_cfg = node.source.config.clone();
     let mut sink_cfg = node.sink.config.clone();
@@ -2574,7 +2532,7 @@ async fn run_one_invocation(
         && opts.limit.is_none()
         && opts.shard.is_none()
         && node.state.is_some()
-        && crate::rollback::sink_supports_rollback(&node.sink.kind);
+        && crate::rollback::sink_supports_rollback(&node.sink.kind, &sink_cfg);
     let run_id_column = crate::rollback::run_id_column(node.metadata_columns.as_ref());
     if rollback_active && let Some(spec) = &opts.rollback {
         crate::rollback::inject_write_spec(&mut sink_cfg, spec, &run_id, &run_id_column);
@@ -2695,37 +2653,8 @@ async fn run_one_invocation(
         build_sink(&node.sink.kind, sink_cfg, &opts.auth).await?
     };
     let sink_dataset_uri = faucet_core::redact_uri_credentials(&raw_sink.dataset_uri());
-    // Run budget (#703): innermost, right around the destination, so the
-    // ceilings count exactly what the sink accepts (post-masking, post-policy
-    // quarantine). A page that would cross `max_records` / `max_bytes` is
-    // refused whole before it is written; `max_duration_secs` cancels the
-    // cooperative token from a timer. `_budget_timer` keeps that timer alive
-    // for the invocation. `allowed_sinks` was checked before anything ran.
-    let (raw_sink, budget_state, _budget_timer): (
-        Box<dyn Sink>,
-        Option<Arc<faucet_core::BudgetState>>,
-        Option<faucet_core::BudgetTimer>,
-    ) = match opts.budget.as_ref().filter(|b| !b.is_empty()) {
-        Some(spec) => {
-            let (s, state, timer) =
-                faucet_core::BudgetSink::wrap(raw_sink, spec.clone(), cancel.clone());
-            (Box::new(s), Some(state), Some(timer))
-        }
-        None => (raw_sink, None, None),
-    };
-    let raw_sink: Box<dyn Sink> = match opts.limit {
-        Some(n) => Box::new(LimitedSink::wrap(raw_sink, n)),
-        None => raw_sink,
-    };
     let captured = Arc::new(Mutex::new(Vec::<Value>::new()));
-    let sink: Box<dyn Sink> = match &capture {
-        Some(projection) => Box::new(CapturingSink::wrap(
-            raw_sink,
-            Arc::clone(&captured),
-            Arc::clone(projection),
-        )),
-        None => raw_sink,
-    };
+    let sink: Box<dyn Sink> = raw_sink;
 
     // ── Lineage: sampling wrappers (only for requested facets) ───────────────
     // `in_sample` taps the source's pre-transform records (input schema /
@@ -2801,12 +2730,15 @@ async fn run_one_invocation(
         if stages.is_empty() {
             source
         } else {
-            Box::new(faucet_core::TransformingSource::new_with_batches(
-                source,
-                stages,
-                batch_fns,
-                obs_labels.clone(),
-            )?)
+            Box::new(
+                faucet_core::TransformingSource::new_with_batches(
+                    source,
+                    stages,
+                    batch_fns,
+                    obs_labels.clone(),
+                )?
+                .with_row_accounts(Arc::clone(&row_accounts)),
+            )
         }
     };
     #[cfg(not(feature = "arrow"))]
@@ -2815,11 +2747,10 @@ async fn run_one_invocation(
         if stages.is_empty() {
             source
         } else {
-            Box::new(faucet_core::TransformingSource::new(
-                source,
-                stages,
-                obs_labels.clone(),
-            )?)
+            Box::new(
+                faucet_core::TransformingSource::new(source, stages, obs_labels.clone())?
+                    .with_row_accounts(Arc::clone(&row_accounts)),
+            )
         }
     };
 
@@ -2828,7 +2759,13 @@ async fn run_one_invocation(
     //    one (which is shared across all matrix rows of the same kind).
     let state = match prebuilt_state {
         Some(store) => Some(store),
-        None => build_state_for_node(node, opts.state_path_override.as_deref()).await?,
+        None => {
+            Box::pin(build_state_for_node(
+                node,
+                opts.state_path_override.as_deref(),
+            ))
+            .await?
+        }
     };
     // Preview modes must not persist bookmarks: the counting/truncating sinks
     // return `Ok` without a real write, so a persisted (advanced) bookmark would
@@ -2846,7 +2783,9 @@ async fn run_one_invocation(
     // Per-shard bookmark: suffix the state key with the shard id so a reassigned
     // shard resumes where its dead owner left off, independent of sibling shards.
     let effective_state_key = match &opts.shard {
-        Some(shard) => format!("{state_key}::{}", shard.id),
+        Some(shard) => faucet_core::StateKey::from_rendered(state_key)
+            .with_shard(shard.id.as_str())
+            .render(),
         None => state_key.to_owned(),
     };
     if let (Some(hook), Some(spec), Some(_)) = (&opts.state_scope.on_key, &node.state, &state)
@@ -2892,88 +2831,32 @@ async fn run_one_invocation(
         source
     };
 
-    // #510: stamp `_faucet_*` run/lineage metadata columns closest to the real
-    // sink (so `loaded_at` ≈ the actual write), and inside the lineage sampler
-    // below so samples reflect the source records, not the added columns.
-    let sink: Box<dyn Sink> = match &node.metadata_columns {
-        Some(spec) => match faucet_core::CompiledMetadata::compile(spec)
-            .map_err(|e| CliError::Config(format!("metadata_columns: {e}")))?
-        {
-            Some(meta) => Box::new(faucet_core::MetadataSink::new(
-                sink,
-                meta,
-                faucet_core::MetadataContext {
-                    run_id: run_id.clone(),
-                    source: node.source.kind.clone(),
-                },
-            )),
-            None => sink,
-        },
-        None => sink,
-    };
-
-    // Wrap the sink so it samples written records — outermost, immediately
-    // before the pipeline is constructed (after capture/limit wrappers).
-    #[cfg(feature = "lineage")]
-    let sink: Box<dyn Sink> = match &out_sample {
-        Some(state) => Box::new(faucet_lineage::SamplingSink::new(
-            sink,
-            std::sync::Arc::clone(state),
-        )),
-        None => sink,
-    };
-    // Column profiling (#708): outermost too, so the profile describes the
-    // post-transform, post-masking records without the `_faucet_*` columns.
-    let sink: Box<dyn Sink> = match &profiler {
-        Some(p) => Box::new(faucet_core::ProfilingSink::new(sink, Arc::clone(p))),
-        None => sink,
-    };
-    // Data-flow policy runtime backstop (#702): classify the real records
-    // (names + value detectors) with the same rules the static pass used and
-    // fail / quarantine per the violated rule. Post-masking, so a properly
-    // masked value no longer trips its detector.
-    #[cfg(feature = "policy")]
-    let sink: Box<dyn Sink> = match &node.policy {
-        Some(spec) => {
-            if crate::policy::quarantines(spec) && node.dlq.is_none() {
-                return Err(CliError::Config(format!(
-                    "row '{}': policy: a rule with `on_runtime: quarantine` needs a `dlq:` \
-                     block to route the quarantined records to",
-                    node.id
-                )));
-            }
-            let compiled =
-                faucet_core::CompiledPolicy::compile(&crate::policy::runtime_spec(spec, node))
-                    .map_err(|e| CliError::Config(format!("policy: {e}")))?;
-            let mut policy_sink = faucet_core::PolicySink::new(
-                sink,
-                Arc::new(compiled),
-                faucet_core::SinkFacts {
-                    id: node.sink_ref.clone(),
-                    kind: node.sink.kind.clone(),
-                    attributes: node.sink.attributes.clone(),
-                },
-                faucet_core::PolicyScope {
-                    pipeline: pipeline_name.clone(),
-                    row: row_id.clone(),
-                },
-            );
-            if let Some(dlq) = &node.dlq {
-                policy_sink = policy_sink.with_dlq_destination(crate::policy::dlq_facts(dlq));
-            }
-            Box::new(match &node.masking {
-                Some(masking) => policy_sink.with_masking(Arc::new(
-                    faucet_core::CompiledMasking::compile_for_sink(
-                        masking,
-                        &[node.sink_ref.as_str(), node.sink.kind.as_str()],
-                    )
-                    .map_err(|e| CliError::Config(format!("masking: {e}")))?,
-                )),
-                None => policy_sink,
-            })
+    // The governed sink stack, in core's canonical order (#875): policy →
+    // profiling → [lineage sampler] → metadata → [--limit, fan-out capture] →
+    // budget → destination. The budget is innermost so its ceilings count what
+    // the destination accepts; a duration ceiling cancels the cooperative token.
+    let limit = opts.limit;
+    let capture_sink = capture
+        .as_ref()
+        .map(|p| (Arc::clone(&captured), Arc::clone(p)));
+    #[allow(unused_mut)]
+    let mut builder = governance.sink_builder().inner_tap(move |s| {
+        let s: Box<dyn Sink> = match limit {
+            Some(n) => Box::new(LimitedSink::wrap(s, n)),
+            None => s,
+        };
+        match capture_sink {
+            Some((buf, projection)) => Box::new(CapturingSink::wrap(s, buf, projection)),
+            None => s,
         }
-        None => sink,
-    };
+    });
+    #[cfg(feature = "lineage")]
+    if let Some(state) = out_sample.clone() {
+        builder = builder.outer_tap(move |s| Box::new(faucet_lineage::SamplingSink::new(s, state)));
+    }
+    let governed = builder.build(sink);
+    let budget_state = governed.budget_state().cloned();
+    let sink: Box<dyn Sink> = Box::new(governed);
 
     // 5) Assemble the runtime pipeline. The whole `with_*` builder chain (state,
     //    DLQ, cancellation, quality, contract, masking, schema-drift, adaptive
@@ -2982,7 +2865,7 @@ async fn run_one_invocation(
     //    (cf. #321 H1) is harder to make (#324 C). The identity strings are
     //    borrowed — the lineage START/terminal lifecycle below still needs
     //    `pipeline_name` / `row_id` / `run_id`.
-    let pipeline = build_pipeline(
+    let pipeline = Box::pin(build_pipeline(
         source.as_ref(),
         sink.as_ref(),
         node,
@@ -2995,7 +2878,9 @@ async fn run_one_invocation(
         cleanup_scope,
         suppress_overwrite,
         observers.clone(),
-    )
+        governance,
+        Arc::clone(&row_accounts),
+    ))
     .await?;
     // ── Lineage: START + heartbeat + terminal ────────────────────────────────
     #[cfg(feature = "lineage")]
@@ -3054,10 +2939,11 @@ async fn run_one_invocation(
     // from this combined `result`, then `?`-propagated below — restoring the
     // original early-return behaviour while still firing the terminal event on
     // both success and error.
-    let result: Result<faucet_core::PipelineResult, FaucetError> = match pipeline.run().await {
-        Ok(r) => sink.flush().await.map(|_| r),
-        Err(e) => Err(e),
-    };
+    let result: Result<faucet_core::PipelineResult, FaucetError> =
+        match Box::pin(pipeline.run()).await {
+            Ok(r) => sink.flush().await.map(|_| r),
+            Err(e) => Err(e),
+        };
     // A duration ceiling cancels cooperatively, so the pipeline returns `Ok`
     // with a partial result; the verdict turns it into the budget failure
     // (a records / bytes crossing already surfaced as the write error).
@@ -3081,7 +2967,7 @@ async fn run_one_invocation(
                 && !cancel.is_cancelled() =>
         {
             let written = r.records_written as u64;
-            match crate::reconcile::run(spec, &opts.auth, written).await {
+            match Box::pin(crate::reconcile::run(spec, &opts.auth, written)).await {
                 Ok(()) => result,
                 Err(e) => Err(e),
             }
@@ -3117,7 +3003,20 @@ async fn run_one_invocation(
             // machine is large, and inlining it here overflowed the 2 MiB
             // test-thread stack under `--all-features` (see
             // `boxed_run_one_invocation`).
-            match crate::verify::verify_node_boxed(node, spec, &inputs).await {
+            // A repair is bounded by what is left of this run's budget, stops
+            // with it, and retries like it (#871).
+            let guards = crate::verify::RunGuards {
+                budget: opts.budget.as_ref().map(|spec| {
+                    crate::budget::remaining_budget(
+                        spec,
+                        budget_state.as_deref(),
+                        invocation_clock.elapsed(),
+                    )
+                }),
+                cancel: Some(cancel.clone()),
+                resilience: opts.resilience.clone(),
+            };
+            match crate::verify::verify_node_boxed(node, spec, &inputs, &guards).await {
                 Ok(outcome) if outcome.report.equal() => result,
                 // A repair that re-synced every reported difference healed the
                 // drift: the run is green, and the drift is logged.
@@ -3255,7 +3154,7 @@ async fn run_one_invocation(
             },
             Err(_) => crate::sla::RunOutcome::Failure,
         };
-        let mut v = crate::sla::evaluate_post_run(
+        let mut v = Box::pin(crate::sla::evaluate_post_run(
             spec,
             sla_store.as_ref(),
             state_key,
@@ -3263,7 +3162,7 @@ async fn run_one_invocation(
             &obs_labels.row,
             outcome,
             chrono::Utc::now().timestamp(),
-        )
+        ))
         .await;
         v.extend(crate::sla::evaluate_lag_post_run(
             spec,
@@ -3285,7 +3184,7 @@ async fn run_one_invocation(
         (Some(p), Some(spec), Ok(_)) if is_notifiable_root => {
             let profile = p.lock().map(|g| g.finish()).unwrap_or_default();
             Some(
-                crate::profiling::evaluate_post_run(
+                Box::pin(crate::profiling::evaluate_post_run(
                     spec,
                     sla_store.as_ref(),
                     state_key,
@@ -3294,7 +3193,7 @@ async fn run_one_invocation(
                     &run_id,
                     profile,
                     chrono::Utc::now(),
-                )
+                ))
                 .await,
             )
         }
@@ -3468,7 +3367,7 @@ async fn run_one_invocation(
             },
             column_lineage,
         };
-        crate::catalog::record(handle, &update).await;
+        Box::pin(crate::catalog::record(handle, &update)).await;
     }
 
     // Column profile → catalog (#708): a browsable copy of this run's profile
@@ -3492,7 +3391,12 @@ async fn run_one_invocation(
             drift: o.drift.clone(),
             baseline_runs: o.baseline_runs,
         };
-        crate::catalog::record_profile(handle, &dataset_id(&uri), &record).await;
+        Box::pin(crate::catalog::record_profile(
+            handle,
+            &dataset_id(&uri),
+            &record,
+        ))
+        .await;
     }
 
     // Local sink outputs (#587): record the concrete files this invocation's
@@ -3741,6 +3645,7 @@ fn faucet_error_kind(err: &FaucetError) -> &'static str {
         FaucetError::ProfileDrift { .. } => "profile_drift",
         FaucetError::PolicyViolation { .. } => "policy",
         FaucetError::BudgetExceeded { .. } => "budget_exceeded",
+        FaucetError::RowsUnaccounted { .. } => "rows_unaccounted",
         FaucetError::Timeout { .. } => "timeout",
         _ => "error",
     }
@@ -3935,135 +3840,12 @@ struct StateKeyOverride {
 
 #[async_trait]
 impl Source for StateKeyOverride {
-    async fn fetch_with_context(
-        &self,
-        ctx: &HashMap<String, Value>,
-    ) -> Result<Vec<Value>, FaucetError> {
-        self.inner.fetch_with_context(ctx).await
-    }
-    async fn fetch_with_context_incremental(
-        &self,
-        ctx: &HashMap<String, Value>,
-    ) -> Result<(Vec<Value>, Option<Value>), FaucetError> {
-        self.inner.fetch_with_context_incremental(ctx).await
-    }
-    // Forward `stream_pages` so the wrapped connector's *native* page stream
-    // survives the wrap. Without this the trait's buffering default kicks in
-    // for every stateful run — losing per-page bookmarks (CDC per-transaction
-    // durability, exactly-once per-page tokens) and the O(batch_size) memory
-    // bound.
-    fn stream_pages<'a>(
-        &'a self,
-        ctx: &'a HashMap<String, Value>,
-        batch_size: usize,
-    ) -> std::pin::Pin<
-        Box<
-            dyn faucet_core::Stream<Item = Result<faucet_core::StreamPage, FaucetError>>
-                + Send
-                + 'a,
-        >,
-    > {
-        self.inner.stream_pages(ctx, batch_size)
-    }
-    fn connector_name(&self) -> &'static str {
-        self.inner.connector_name()
-    }
-    fn dataset_uri(&self) -> String {
-        self.inner.dataset_uri()
-    }
-    fn set_roundtrip_recorder(&self, recorder: Arc<faucet_core::observability::RoundtripRecorder>) {
-        self.inner.set_roundtrip_recorder(recorder);
-    }
+    // Every hook but the state key reaches the wrapped connector, so a per-row
+    // key never disables a capability or fast path behind it.
+    faucet_core::forward_source!(inner; except state_key);
 
-    fn set_run_clock(&self, now: chrono::DateTime<chrono::Utc>) {
-        self.inner.set_run_clock(now);
-    }
-
-    fn set_cancel(&self, cancel: faucet_core::CancellationToken) -> bool {
-        self.inner.set_cancel(cancel)
-    }
     fn state_key(&self) -> Option<String> {
         Some(self.key.clone())
-    }
-    async fn apply_start_bookmark(&self, bookmark: Value) -> Result<(), FaucetError> {
-        self.inner.apply_start_bookmark(bookmark).await
-    }
-    fn supports_exactly_once(&self) -> bool {
-        self.inner.supports_exactly_once()
-    }
-    fn consumes_destructively(&self) -> bool {
-        self.inner.consumes_destructively()
-    }
-    fn replay_guarantee(&self) -> faucet_core::ReplayGuarantee {
-        self.inner.replay_guarantee()
-    }
-    async fn capture_resume_position(&self) -> Result<Option<Value>, FaucetError> {
-        self.inner.capture_resume_position().await
-    }
-    async fn lag(&self) -> Result<Option<faucet_core::SourceLag>, FaucetError> {
-        self.inner.lag().await
-    }
-
-    fn state_schema(&self) -> u32 {
-        self.inner.state_schema()
-    }
-
-    fn migrate_state(&self, from: u32, data: Value) -> Result<Value, FaucetError> {
-        self.inner.migrate_state(from, data)
-    }
-
-    fn record_table(&self, record: &Value) -> Option<String> {
-        self.inner.record_table(record)
-    }
-
-    fn position_le(&self, a: &Value, b: &Value) -> Option<bool> {
-        self.inner.position_le(a, b)
-    }
-
-    fn record_covered(&self, record: &Value, position: &Value) -> Option<bool> {
-        self.inner.record_covered(record, position)
-    }
-
-    fn position_min(&self, positions: &[Value]) -> Option<Value> {
-        self.inner.position_min(positions)
-    }
-    // Forward the fast-path capabilities so wrapping the source for a per-row
-    // state key never silently disables the columnar (#375) or native
-    // byte-passthrough (#633) transfer paths.
-    #[cfg(feature = "arrow")]
-    fn supports_columnar(&self) -> bool {
-        self.inner.supports_columnar()
-    }
-    #[cfg(feature = "arrow")]
-    fn stream_batches<'a>(
-        &'a self,
-        ctx: &'a HashMap<String, Value>,
-        batch_size: usize,
-    ) -> std::pin::Pin<
-        Box<
-            dyn faucet_core::Stream<Item = Result<faucet_core::columnar::ColumnarPage, FaucetError>>
-                + Send
-                + 'a,
-        >,
-    > {
-        self.inner.stream_batches(ctx, batch_size)
-    }
-    fn native_output_formats(&self) -> &'static [faucet_core::NativeFormat] {
-        self.inner.native_output_formats()
-    }
-    fn stream_native<'a>(
-        &'a self,
-        ctx: &'a HashMap<String, Value>,
-        format: faucet_core::NativeFormat,
-        batch_size: usize,
-    ) -> std::pin::Pin<
-        Box<
-            dyn faucet_core::Stream<Item = Result<faucet_core::NativeBatch, FaucetError>>
-                + Send
-                + 'a,
-        >,
-    > {
-        self.inner.stream_native(ctx, format, batch_size)
     }
 }
 
@@ -4079,6 +3861,18 @@ struct BindContextSource {
 
 #[async_trait]
 impl Source for BindContextSource {
+    // Every hook reaches the wrapped connector; the reads below substitute the
+    // bind context, and the convenience fetches take the trait default so they
+    // do too. The columnar pair is gated together on this crate's `arrow`.
+    faucet_core::forward_source!(inner; except
+        fetch_with_context, fetch_with_context_incremental, stream_pages, stream_batches,
+        stream_native, fetch_all, fetch_all_incremental, supports_columnar);
+
+    #[cfg(feature = "arrow")]
+    fn supports_columnar(&self) -> bool {
+        self.inner.supports_columnar()
+    }
+
     async fn fetch_with_context(
         &self,
         _ctx: &HashMap<String, Value>,
@@ -4104,49 +3898,6 @@ impl Source for BindContextSource {
     > {
         self.inner.stream_pages(&self.ctx, batch_size)
     }
-    fn connector_name(&self) -> &'static str {
-        self.inner.connector_name()
-    }
-    fn dataset_uri(&self) -> String {
-        self.inner.dataset_uri()
-    }
-    fn set_roundtrip_recorder(&self, recorder: Arc<faucet_core::observability::RoundtripRecorder>) {
-        self.inner.set_roundtrip_recorder(recorder);
-    }
-    fn set_run_clock(&self, now: chrono::DateTime<chrono::Utc>) {
-        self.inner.set_run_clock(now);
-    }
-    fn set_cancel(&self, cancel: faucet_core::CancellationToken) -> bool {
-        self.inner.set_cancel(cancel)
-    }
-    fn state_key(&self) -> Option<String> {
-        self.inner.state_key()
-    }
-    async fn apply_start_bookmark(&self, bookmark: Value) -> Result<(), FaucetError> {
-        self.inner.apply_start_bookmark(bookmark).await
-    }
-    fn supports_exactly_once(&self) -> bool {
-        self.inner.supports_exactly_once()
-    }
-    fn consumes_destructively(&self) -> bool {
-        self.inner.consumes_destructively()
-    }
-    fn replay_guarantee(&self) -> faucet_core::ReplayGuarantee {
-        self.inner.replay_guarantee()
-    }
-    async fn lag(&self) -> Result<Option<faucet_core::SourceLag>, FaucetError> {
-        self.inner.lag().await
-    }
-    fn state_schema(&self) -> u32 {
-        self.inner.state_schema()
-    }
-    fn migrate_state(&self, from: u32, data: Value) -> Result<Value, FaucetError> {
-        self.inner.migrate_state(from, data)
-    }
-    #[cfg(feature = "arrow")]
-    fn supports_columnar(&self) -> bool {
-        self.inner.supports_columnar()
-    }
     #[cfg(feature = "arrow")]
     fn stream_batches<'a>(
         &'a self,
@@ -4161,9 +3912,6 @@ impl Source for BindContextSource {
     > {
         self.inner.stream_batches(&self.ctx, batch_size)
     }
-    fn native_output_formats(&self) -> &'static [faucet_core::native::NativeFormat] {
-        self.inner.native_output_formats()
-    }
     fn stream_native<'a>(
         &'a self,
         _ctx: &'a HashMap<String, Value>,
@@ -4177,56 +3925,6 @@ impl Source for BindContextSource {
         >,
     > {
         self.inner.stream_native(&self.ctx, format, batch_size)
-    }
-    fn config_schema(&self) -> Value {
-        self.inner.config_schema()
-    }
-    async fn capture_resume_position(&self) -> Result<Option<Value>, FaucetError> {
-        self.inner.capture_resume_position().await
-    }
-    fn is_shardable(&self) -> bool {
-        self.inner.is_shardable()
-    }
-    async fn enumerate_shards(
-        &self,
-        target: usize,
-    ) -> Result<Vec<faucet_core::ShardSpec>, FaucetError> {
-        self.inner.enumerate_shards(target).await
-    }
-    async fn apply_shard(&self, shard: &faucet_core::ShardSpec) -> Result<(), FaucetError> {
-        self.inner.apply_shard(shard).await
-    }
-    async fn range_digest(
-        &self,
-        range: &faucet_core::diff::KeyRange,
-        key: &str,
-        columns: &[String],
-    ) -> Result<Option<faucet_core::diff::ServerDigest>, FaucetError> {
-        self.inner.range_digest(range, key, columns).await
-    }
-    fn supports_discover(&self) -> bool {
-        self.inner.supports_discover()
-    }
-    async fn discover(&self) -> Result<Vec<faucet_core::DatasetDescriptor>, FaucetError> {
-        self.inner.discover().await
-    }
-    fn record_table(&self, record: &Value) -> Option<String> {
-        self.inner.record_table(record)
-    }
-    fn position_le(&self, a: &Value, b: &Value) -> Option<bool> {
-        self.inner.position_le(a, b)
-    }
-    fn record_covered(&self, record: &Value, position: &Value) -> Option<bool> {
-        self.inner.record_covered(record, position)
-    }
-    fn position_min(&self, positions: &[Value]) -> Option<Value> {
-        self.inner.position_min(positions)
-    }
-    async fn check(
-        &self,
-        ctx: &faucet_core::CheckContext,
-    ) -> Result<faucet_core::CheckReport, FaucetError> {
-        self.inner.check(ctx).await
     }
 }
 
@@ -4255,21 +3953,30 @@ impl CapturingSink {
 
 #[async_trait]
 impl Sink for CapturingSink {
-    async fn admit_page(&self, records: &[Value]) -> Result<(), FaucetError> {
-        self.inner.admit_page(records).await
+    // Children read the captured rows, so the columnar and native paths (which
+    // carry none) stay at the trait default (off); everything else reaches the
+    // wrapped sink.
+    faucet_core::forward_sink!(inner; except
+        write_batch, write_batch_reported, write_batch_partial, write_batch_idempotent,
+        write_batch_idempotent_reported, supports_columnar, write_batch_columnar,
+        native_load_capabilities, load_native);
+
+    async fn write_batch_reported(
+        &self,
+        records: &[Value],
+    ) -> Result<faucet_core::WriteReport, FaucetError> {
+        let report = self.inner.write_batch_reported(records).await?;
+        let n = (report.accepted + report.coalesced).min(records.len());
+        let mut buf = self.captured.lock().await;
+        buf.extend(
+            records
+                .iter()
+                .take(n)
+                .map(|r| project_record(r, &self.projection)),
+        );
+        Ok(report)
     }
-    fn connector_name(&self) -> &'static str {
-        self.inner.connector_name()
-    }
-    fn dataset_uri(&self) -> String {
-        self.inner.dataset_uri()
-    }
-    // Local-output provenance for the retention GC (#587) must survive every
-    // decorator — a wrapper that fell back to the empty default would hide the
-    // real sink's files and they would never be reclaimed.
-    async fn local_outputs(&self) -> Vec<faucet_core::LocalOutput> {
-        self.inner.local_outputs().await
-    }
+
     async fn write_batch(&self, records: &[Value]) -> Result<usize, FaucetError> {
         let written = self.inner.write_batch(records).await?;
         // Capture only what actually landed (LimitedSink may have dropped some),
@@ -4283,21 +3990,6 @@ impl Sink for CapturingSink {
                 .map(|r| project_record(r, &self.projection)),
         );
         Ok(written)
-    }
-    async fn flush(&self) -> Result<(), FaucetError> {
-        self.inner.flush().await
-    }
-    // Capability + exactly-once passthroughs, so a parent row that fans out to
-    // children (which is what this wrapper serves) keeps the inner sink's
-    // delivery semantics instead of being masked down to the trait defaults.
-    fn supports_idempotent_writes(&self) -> bool {
-        self.inner.supports_idempotent_writes()
-    }
-    fn dedups_by_key(&self) -> bool {
-        self.inner.dedups_by_key()
-    }
-    fn batch_atomicity(&self) -> faucet_core::BatchAtomicity {
-        self.inner.batch_atomicity()
     }
     // The per-row path: only rows the inner sink accepted are captured for
     // the children (#789 CLI-21); rejected ones go to the DLQ.
@@ -4315,75 +4007,6 @@ impl Sink for CapturingSink {
                 .map(|(r, _)| project_record(r, &self.projection)),
         );
         Ok(outcomes)
-    }
-    fn sink_guarantee(&self) -> faucet_core::SinkGuarantee {
-        self.inner.sink_guarantee()
-    }
-    fn write_batch_is_replay_safe(&self) -> bool {
-        self.inner.write_batch_is_replay_safe()
-    }
-    fn supported_write_modes(&self) -> &'static [faucet_core::WriteMode] {
-        self.inner.supported_write_modes()
-    }
-    fn supports_cleanup(&self) -> bool {
-        self.inner.supports_cleanup()
-    }
-    async fn cleanup_scope(
-        &self,
-        scope: &std::collections::BTreeMap<String, Value>,
-        seen: &faucet_core::cleanup::SeenKeys,
-    ) -> Result<u64, FaucetError> {
-        self.inner.cleanup_scope(scope, seen).await
-    }
-    fn is_overwrite(&self) -> bool {
-        self.inner.is_overwrite()
-    }
-    async fn begin_overwrite(&self) -> Result<(), FaucetError> {
-        self.inner.begin_overwrite().await
-    }
-    async fn commit_overwrite(&self) -> Result<(), FaucetError> {
-        self.inner.commit_overwrite().await
-    }
-    async fn abort_overwrite(&self) -> Result<(), FaucetError> {
-        self.inner.abort_overwrite().await
-    }
-    async fn overwrite_staging_exists(&self) -> Result<Option<bool>, FaucetError> {
-        self.inner.overwrite_staging_exists().await
-    }
-    async fn complete_run(&self) -> Result<(), FaucetError> {
-        self.inner.complete_run().await
-    }
-    fn set_roundtrip_recorder(
-        &self,
-        recorder: std::sync::Arc<faucet_core::observability::RoundtripRecorder>,
-    ) {
-        self.inner.set_roundtrip_recorder(recorder)
-    }
-    async fn rollback_run(
-        &self,
-        run_id: &str,
-        opts: &faucet_core::rollback::RollbackOptions,
-    ) -> Result<faucet_core::rollback::RollbackOutcome, FaucetError> {
-        self.inner.rollback_run(run_id, opts).await
-    }
-    async fn rewind_commit_token(
-        &self,
-        scope: &str,
-        token: Option<&str>,
-    ) -> Result<(), FaucetError> {
-        self.inner.rewind_commit_token(scope, token).await
-    }
-    fn readback_source(&self) -> Option<(String, Value)> {
-        self.inner.readback_source()
-    }
-    fn config_schema(&self) -> Value {
-        self.inner.config_schema()
-    }
-    async fn check(
-        &self,
-        ctx: &faucet_core::CheckContext,
-    ) -> Result<faucet_core::CheckReport, FaucetError> {
-        self.inner.check(ctx).await
     }
     async fn write_batch_idempotent(
         &self,
@@ -4405,26 +4028,25 @@ impl Sink for CapturingSink {
         );
         Ok(written)
     }
-    async fn last_committed_token(&self, scope: &str) -> Result<Option<String>, FaucetError> {
-        self.inner.last_committed_token(scope).await
-    }
-    fn supports_rollback(&self) -> bool {
-        self.inner.supports_rollback()
-    }
-    async fn forget_run(&self, run_id: &str) -> Result<(), FaucetError> {
-        self.inner.forget_run(run_id).await
-    }
-    async fn current_schema(&self) -> Result<Option<Value>, FaucetError> {
-        self.inner.current_schema().await
-    }
-    fn supports_schema_evolution(&self) -> bool {
-        self.inner.supports_schema_evolution()
-    }
-    async fn evolve_schema(
+    async fn write_batch_idempotent_reported(
         &self,
-        evolution: &faucet_core::SchemaEvolution,
-    ) -> Result<(), FaucetError> {
-        self.inner.evolve_schema(evolution).await
+        records: &[Value],
+        scope: &str,
+        token: &str,
+    ) -> Result<faucet_core::WriteReport, FaucetError> {
+        let report = self
+            .inner
+            .write_batch_idempotent_reported(records, scope, token)
+            .await?;
+        let n = (report.accepted + report.coalesced).min(records.len());
+        let mut buf = self.captured.lock().await;
+        buf.extend(
+            records
+                .iter()
+                .take(n)
+                .map(|r| project_record(r, &self.projection)),
+        );
+        Ok(report)
     }
 }
 
@@ -4446,27 +4068,15 @@ impl LimitedSink {
 
 #[async_trait]
 impl Sink for LimitedSink {
-    async fn admit_page(&self, records: &[Value]) -> Result<(), FaucetError> {
-        self.inner.admit_page(records).await
-    }
-    fn connector_name(&self) -> &'static str {
-        self.inner.connector_name()
-    }
-    fn dataset_uri(&self) -> String {
-        self.inner.dataset_uri()
-    }
-    // Local-output provenance for the retention GC (#587) must survive every
-    // decorator — a wrapper that fell back to the empty default would hide the
-    // real sink's files and they would never be reclaimed.
-    async fn local_outputs(&self) -> Vec<faucet_core::LocalOutput> {
-        self.inner.local_outputs().await
-    }
-    fn batch_atomicity(&self) -> faucet_core::BatchAtomicity {
-        self.inner.batch_atomicity()
-    }
-    fn dedups_by_key(&self) -> bool {
-        self.inner.dedups_by_key()
-    }
+    // Every write path must go through the cap below, so the idempotent, columnar
+    // and native paths stay at the trait default (the idempotent default calls
+    // write_batch); everything else reaches the wrapped sink.
+    faucet_core::forward_sink!(inner; except
+        write_batch_partial, commit_overwrite, write_batch, write_batch_reported,
+        supports_idempotent_writes,
+        write_batch_idempotent, last_committed_token, supports_columnar, write_batch_columnar,
+        native_load_capabilities, load_native);
+
     // The per-row path keeps the DLQ routing of the inner sink (#789 CLI-21);
     // rows past the cap are dropped by design and reported as accepted.
     async fn write_batch_partial(
@@ -4486,49 +4096,6 @@ impl Sink for LimitedSink {
         outcomes.resize_with(records.len(), || Ok(()));
         Ok(outcomes)
     }
-    fn supports_rollback(&self) -> bool {
-        self.inner.supports_rollback()
-    }
-    async fn forget_run(&self, run_id: &str) -> Result<(), FaucetError> {
-        self.inner.forget_run(run_id).await
-    }
-    async fn current_schema(&self) -> Result<Option<Value>, FaucetError> {
-        self.inner.current_schema().await
-    }
-    fn supports_schema_evolution(&self) -> bool {
-        self.inner.supports_schema_evolution()
-    }
-    async fn evolve_schema(
-        &self,
-        evolution: &faucet_core::SchemaEvolution,
-    ) -> Result<(), FaucetError> {
-        self.inner.evolve_schema(evolution).await
-    }
-    fn sink_guarantee(&self) -> faucet_core::SinkGuarantee {
-        self.inner.sink_guarantee()
-    }
-    fn write_batch_is_replay_safe(&self) -> bool {
-        self.inner.write_batch_is_replay_safe()
-    }
-    fn supported_write_modes(&self) -> &'static [faucet_core::WriteMode] {
-        self.inner.supported_write_modes()
-    }
-    fn supports_cleanup(&self) -> bool {
-        self.inner.supports_cleanup()
-    }
-    async fn cleanup_scope(
-        &self,
-        scope: &std::collections::BTreeMap<String, Value>,
-        seen: &faucet_core::cleanup::SeenKeys,
-    ) -> Result<u64, FaucetError> {
-        self.inner.cleanup_scope(scope, seen).await
-    }
-    fn is_overwrite(&self) -> bool {
-        self.inner.is_overwrite()
-    }
-    async fn begin_overwrite(&self) -> Result<(), FaucetError> {
-        self.inner.begin_overwrite().await
-    }
     // A capped sample must never replace the destination, whoever drives the
     // overwrite lifecycle (#862 H-06): the swap becomes a discard.
     async fn commit_overwrite(&self) -> Result<(), FaucetError> {
@@ -4539,46 +4106,22 @@ impl Sink for LimitedSink {
         );
         self.inner.abort_overwrite().await
     }
-    async fn abort_overwrite(&self) -> Result<(), FaucetError> {
-        self.inner.abort_overwrite().await
-    }
-    async fn overwrite_staging_exists(&self) -> Result<Option<bool>, FaucetError> {
-        self.inner.overwrite_staging_exists().await
-    }
-    async fn complete_run(&self) -> Result<(), FaucetError> {
-        self.inner.complete_run().await
-    }
-    fn set_roundtrip_recorder(
+    // Rows past the cap are dropped by design and reported as skipped, so row
+    // accounting (#879) does not take them for a silent loss.
+    async fn write_batch_reported(
         &self,
-        recorder: std::sync::Arc<faucet_core::observability::RoundtripRecorder>,
-    ) {
-        self.inner.set_roundtrip_recorder(recorder)
-    }
-    async fn rollback_run(
-        &self,
-        run_id: &str,
-        opts: &faucet_core::rollback::RollbackOptions,
-    ) -> Result<faucet_core::rollback::RollbackOutcome, FaucetError> {
-        self.inner.rollback_run(run_id, opts).await
-    }
-    async fn rewind_commit_token(
-        &self,
-        scope: &str,
-        token: Option<&str>,
-    ) -> Result<(), FaucetError> {
-        self.inner.rewind_commit_token(scope, token).await
-    }
-    fn readback_source(&self) -> Option<(String, Value)> {
-        self.inner.readback_source()
-    }
-    fn config_schema(&self) -> Value {
-        self.inner.config_schema()
-    }
-    async fn check(
-        &self,
-        ctx: &faucet_core::CheckContext,
-    ) -> Result<faucet_core::CheckReport, FaucetError> {
-        self.inner.check(ctx).await
+        records: &[Value],
+    ) -> Result<faucet_core::WriteReport, FaucetError> {
+        let remaining = self.remaining.load(Ordering::Relaxed);
+        let take = remaining.min(records.len());
+        let report = if take == 0 {
+            faucet_core::WriteReport::default()
+        } else {
+            self.inner.write_batch_reported(&records[..take]).await?
+        };
+        self.remaining
+            .fetch_sub(report.accepted.min(remaining), Ordering::Relaxed);
+        Ok(report.with_skipped(report.skipped + (records.len() - take)))
     }
     async fn write_batch(&self, records: &[Value]) -> Result<usize, FaucetError> {
         let remaining = self.remaining.load(Ordering::Relaxed);
@@ -4591,9 +4134,6 @@ impl Sink for LimitedSink {
         self.remaining
             .fetch_sub(written.min(remaining), Ordering::Relaxed);
         Ok(written)
-    }
-    async fn flush(&self) -> Result<(), FaucetError> {
-        self.inner.flush().await
     }
 }
 
@@ -4635,8 +4175,119 @@ fn value_to_string_brief(v: &Value) -> String {
 }
 
 #[cfg(test)]
+impl ExecuteOptions {
+    /// Plain options for a unit test: no budget, cancel, resilience or
+    /// observers.
+    pub(crate) fn for_tests(name: &str) -> Self {
+        ExecuteOptions {
+            legacy_state_writes: false,
+            force_lease: false,
+            pipeline_name: name.into(),
+            run_id: None,
+            execution: None,
+            concurrency: None,
+            dry_run: false,
+            limit: None,
+            state_path_override: None,
+            state_scope: Default::default(),
+            shard: None,
+            auth: Default::default(),
+            clock: chrono::Utc::now().fixed_offset(),
+            cancel: None,
+            resilience: None,
+            sla: None,
+            reconcile: None,
+            verify: None,
+            rollback: None,
+            #[cfg(feature = "lineage")]
+            lineage: None,
+            #[cfg(feature = "lineage")]
+            lineage_cfg: None,
+            #[cfg(feature = "notify")]
+            notifier: None,
+            #[cfg(feature = "catalog")]
+            catalog: None,
+            usage: Default::default(),
+            budget: None,
+        }
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
+    use faucet_conformance::forwarding::{
+        HookSink, HookSource, assert_sink_forwards_every_hook, assert_source_forwards_every_hook,
+    };
+
+    #[tokio::test]
+    async fn state_key_override_forwards_every_hook_but_the_key() {
+        let probe = HookSource::default();
+        let wrapped = StateKeyOverride {
+            inner: Box::new(probe.clone()),
+            key: "row-key".into(),
+        };
+        assert_eq!(wrapped.state_key().as_deref(), Some("row-key"));
+        assert_source_forwards_every_hook(&wrapped, &probe, &["state_key"]).await;
+    }
+
+    #[tokio::test]
+    async fn bind_context_source_forwards_every_hook() {
+        let probe = HookSource::default();
+        let wrapped = BindContextSource {
+            inner: Box::new(probe.clone()),
+            ctx: HashMap::from([("faucet_bind_0".to_string(), Value::from(1))]),
+        };
+        let mut skip = vec!["fetch_all", "fetch_all_incremental"];
+        if !cfg!(feature = "arrow") {
+            skip.extend(["supports_columnar", "stream_batches"]);
+        }
+        assert_source_forwards_every_hook(&wrapped, &probe, &skip).await;
+    }
+
+    #[tokio::test]
+    async fn capturing_sink_forwards_every_hook_but_the_fast_paths() {
+        let probe = HookSink::default();
+        let wrapped = CapturingSink::wrap(
+            Box::new(probe.clone()),
+            Arc::new(Mutex::new(Vec::new())),
+            Arc::new(Projection::Full),
+        );
+        assert_sink_forwards_every_hook(
+            &wrapped,
+            &probe,
+            &[
+                "supports_columnar",
+                "write_batch_columnar",
+                "native_load_capabilities",
+                "load_native",
+            ],
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn limited_sink_forwards_every_hook_but_the_uncapped_paths() {
+        let probe = HookSink::default();
+        let wrapped = LimitedSink::wrap(Box::new(probe.clone()), 10);
+        assert_sink_forwards_every_hook(
+            &wrapped,
+            &probe,
+            &[
+                "supports_idempotent_writes",
+                "write_batch_idempotent",
+                "write_batch_idempotent_reported",
+                "last_committed_token",
+                "supports_columnar",
+                "write_batch_columnar",
+                "native_load_capabilities",
+                "load_native",
+                // The swap of a capped sample becomes a discard.
+                "commit_overwrite",
+            ],
+        )
+        .await;
+    }
 
     /// A change-stream double with its own multi-table hooks (#731).
     #[tokio::test]
@@ -4735,6 +4386,7 @@ mod tests {
 
         fn node(id: &str, weight: Option<f64>) -> ExpandedNode {
             ExpandedNode {
+                opt_outs: Vec::new(),
                 id: id.into(),
                 row_index: 0,
                 weight,
@@ -6588,6 +6240,7 @@ matrix:
 
         fn child(id: &str, parent: &str, parent_key: &str, refs: &[(&str, &str)]) -> ExpandedNode {
             ExpandedNode {
+                opt_outs: Vec::new(),
                 id: id.into(),
                 row_index: 0,
                 weight: None,
@@ -6679,6 +6332,7 @@ matrix:
         use crate::config::ConnectorSpec;
         use crate::expand::{DeferredRef, ExpandedNode, NodeRole};
         let c = ExpandedNode {
+            opt_outs: Vec::new(),
             id: "c".into(),
             row_index: 0,
             weight: None,
@@ -7095,6 +6749,7 @@ matrix:
     fn stub_node(state: Option<crate::config::StateStoreSpec>) -> ExpandedNode {
         use crate::config::ConnectorSpec;
         ExpandedNode {
+            opt_outs: Vec::new(),
             id: "n".into(),
             row_index: 0,
             weight: None,
@@ -7355,6 +7010,7 @@ matrix:
         // list exercises the executor's own deadlock guard (lines 227-233).
         use crate::config::ConnectorSpec;
         let orphan = ExpandedNode {
+            opt_outs: Vec::new(),
             id: "orphan".into(),
             row_index: 0,
             weight: None,

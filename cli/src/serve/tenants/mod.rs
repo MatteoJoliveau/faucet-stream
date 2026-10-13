@@ -42,7 +42,13 @@ const ACTIVE_STATUSES: [RunStatus; 4] = [
 
 /// Suffixes of the marker keys a run keeps next to its bookmark (SLA,
 /// profiling, rollback index). Deleting a tenant deletes them too.
-const MARKER_SUFFIXES: [&str; 3] = ["::__sla__", "::__profiling__", "::__rollback__"];
+const MARKER_SUFFIXES: [faucet_core::KeySuffix; 5] = [
+    faucet_core::KeySuffix::Sla,
+    faucet_core::KeySuffix::Profiling,
+    faucet_core::KeySuffix::RollbackIndex,
+    faucet_core::KeySuffix::Status,
+    faucet_core::KeySuffix::Lease,
+];
 
 /// The server's tenant runtime: the vault key, the hosted-OAuth providers,
 /// and the per-tenant admission locks.
@@ -367,6 +373,23 @@ pub async fn admit(
     tenant: &str,
     req: &mut crate::serve::runner::SubmitRequest,
 ) -> Result<Admission, ServeError> {
+    let (admission, budget) = admit_inline(state, tenant).await?;
+    if let Some(b) = budget {
+        req.budget = Some(match req.budget.take() {
+            Some(own) => own.merge(&b),
+            None => b,
+        });
+    }
+    Ok(admission)
+}
+
+/// [`admit`] for work that is not a submitted run (a DLQ replay, #871):
+/// the same existence, suspension and concurrency checks, returning the
+/// tenant's per-run ceilings for the caller to apply.
+pub async fn admit_inline(
+    state: &ServerState,
+    tenant: &str,
+) -> Result<(Admission, Option<faucet_core::BudgetSpec>), ServeError> {
     let rec = get_tenant(state, tenant).await?;
     if rec.suspended {
         metrics::record_limit_rejection(tenant, "suspended");
@@ -391,13 +414,7 @@ pub async fn admit(
             )));
         }
     }
-    if let Some(b) = rec.limits.budget() {
-        req.budget = Some(match req.budget.take() {
-            Some(own) => own.merge(&b),
-            None => b,
-        });
-    }
-    Ok(Admission { _guard: guard })
+    Ok((Admission { _guard: guard }, rec.limits.budget()))
 }
 
 /// Whether `tenant` is past its `max_concurrent_runs` now that a new run is
@@ -970,7 +987,10 @@ pub async fn delete_tenant(state: &ServerState, tenant: &str) -> Result<DeleteRe
     }
 
     let purged = history
-        .catalog_purge(&format!("{tenant}::"), &run_ids)
+        .catalog_purge(
+            &faucet_core::StateKey::pipeline(tenant).children_prefix(),
+            &run_ids,
+        )
         .await
         .map_err(store_err)?;
     report.catalog_datasets = purged.datasets;
@@ -1013,16 +1033,24 @@ async fn delete_state_key(vault: Option<&Vault>, r: &TenantStateRef) -> Result<(
         .await
         .map_err(|e| format!("building its state store: {e}"))?;
     let mut keys = vec![r.key.clone()];
-    keys.extend(MARKER_SUFFIXES.iter().map(|s| format!("{}{s}", r.key)));
-    let rollback_index = format!("{}::__rollback__", r.key);
+    let base = faucet_core::StateKey::from_rendered(r.key.as_str());
+    keys.extend(
+        MARKER_SUFFIXES
+            .iter()
+            .map(|s| base.clone().with_suffix(s.clone()).render()),
+    );
+    let rollback_index = base
+        .clone()
+        .with_suffix(faucet_core::KeySuffix::RollbackIndex)
+        .render();
     if let Ok(Some(index)) = store.get(&rollback_index).await
         && let Some(runs) = index.get("runs").and_then(Value::as_array)
     {
-        keys.extend(
-            runs.iter()
-                .filter_map(Value::as_str)
-                .map(|id| format!("{rollback_index}::{id}")),
-        );
+        keys.extend(runs.iter().filter_map(Value::as_str).map(|id| {
+            base.clone()
+                .with_suffix(faucet_core::KeySuffix::RollbackRun(id.to_owned()))
+                .render()
+        }));
     }
     for k in keys {
         store
@@ -1059,6 +1087,7 @@ fn decode_state_spec(
 }
 
 #[cfg(test)]
+#[allow(clippy::disallowed_methods)] // tests drive time and raw clients directly
 mod tests {
     use super::*;
 

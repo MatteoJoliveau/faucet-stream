@@ -784,7 +784,10 @@ paths:
       description: >
         Re-feeds the unwrapped original payloads from a DLQ location through the
         submitted config's transforms / quality / contract / sink. Rows that
-        fail again land in a fresh DLQ (never the source). Requires the
+        fail again land in a fresh DLQ (never the source). The replay runs
+        under the config's `budget:` (merged with a tenant's per-run limits)
+        and `resilience:`, and is cancellable while it runs with
+        `POST /v1/runs/{id}/cancel` using the replay's `id` (#871). Requires the
         `DlqManage` permission (operator); audited as `dlq.replay`.
       security: [{ bearerAuth: [] }]
       requestBody:
@@ -807,14 +810,23 @@ paths:
                   items: { type: string }
                   description: Keys for a DLQ sealed at rest by the jsonl sink's `encryption` block (first = current, rest = rotated). Requires a server built with the `encryption` feature.
                   # When empty, the config's own dlq jsonl `encryption` block is used.
+                id:
+                  type: string
+                  description: An id to cancel this replay with `POST /v1/runs/{id}/cancel` while it runs. Generated (`dlq-replay-<uuid>`) when omitted; returned as `id`. An id already in flight is a 409.
+                tenant:
+                  type: string
+                  description: Replay on behalf of this tenant (`tenants` feature) — the config loads under the tenant's scope and the replay is admitted against its limits, whose per-run ceilings bound it. A principal confined to another tenant gets a 404.
       responses:
         "200":
-          description: Replay outcome (candidates, records_written, failed_dlq)
+          description: Replay outcome (id, tenant, candidates, records_written, failed_dlq)
           content: { application/json: { schema: { type: object } } }
         "400": { description: Bad config, location, or reason filter }
         "401": { description: Missing or invalid bearer token }
         "403": { description: Principal's role lacks the required permission }
+        "404": { description: The named tenant is not visible to this principal }
+        "409": { description: The replay id is already in flight, or the tenant is suspended }
         "422": { description: Config failed validation / expansion }
+        "429": { description: The tenant is at its max_concurrent_runs limit }
   /v1/dlq/discard:
     post:
       summary: Discard (archive or delete) DLQ envelopes
@@ -2823,6 +2835,29 @@ components:
         bytes: { type: integer, description: Unread change log (Postgres WAL, MySQL binlog) }
         events: { type: integer, description: Unconsumed messages or change transactions }
         seconds: { type: number, description: Age of the oldest unread change }
+    RowAccounts:
+      type: object
+      description: >
+        Where every row of an invocation went (#879). `offered` rows reached the
+        governance passes and the sink; each ends `accepted`, `coalesced` (merged
+        into another row of the same page by a keyed write), `skipped` (declined
+        by the sink and reported), `failed` (per-row failure routed to the DLQ),
+        `quarantined` (a quality / contract / drift / policy pass sent it to the
+        DLQ) or `dropped` (a poison-pill `drop` action). `unaccounted` rows were
+        lost by a sink without saying so; any non-zero value failed the run.
+        `transform_in` / `transform_out` count the transform chain's input and
+        output.
+      properties:
+        transform_in: { type: integer }
+        transform_out: { type: integer }
+        offered: { type: integer }
+        accepted: { type: integer }
+        coalesced: { type: integer }
+        skipped: { type: integer }
+        failed: { type: integer }
+        quarantined: { type: integer }
+        dropped: { type: integer }
+        unaccounted: { type: integer }
     InvocationRecord:
       type: object
       properties:
@@ -2834,6 +2869,7 @@ components:
         error: { type: string, nullable: true }
         batches: { $ref: "#/components/schemas/BatchOutcomes" }
         source_lag: { $ref: "#/components/schemas/SourceLag" }
+        rows: { $ref: "#/components/schemas/RowAccounts" }
         skipped: { type: boolean, description: "The invocation never ran because its parent or a `depends_on` row failed or was skipped; `error` names it. Absent when false." }
       example:
         row_id: orders_to_warehouse
@@ -2892,6 +2928,7 @@ components:
         tenant: { type: string, description: "The tenant this run was started for (#709); absent for an ordinary run." }
         selection: { $ref: "#/components/schemas/RowSelection" }
         host_access: { type: boolean, description: "The config came from the server's --triggers file, so its SQL connectors are not sandboxed (#862). Absent otherwise." }
+        caller_config: { type: boolean, description: "The request carried the config, so its HTTP requests and redirect hops are checked against the caller reference policy wherever the run executes (#881). Absent otherwise." }
         invocations:
           type: array
           items: { $ref: "#/components/schemas/InvocationRecord" }
@@ -3303,6 +3340,8 @@ components:
           type: object
           description: Source-side retries by class (`rate_limited`, `http_5xx`, `connection`, `timeout`).
           additionalProperties: { type: integer }
+        dlq_records_written: { type: integer, description: "Envelopes written to the dead-letter queue (#870). Omitted when zero." }
+        dlq_bytes_written: { type: integer, description: "Estimated serialized bytes written to the dead-letter queue. Omitted when zero." }
     CostEstimate:
       type: object
       description: The priced view of a `UsageSnapshot` — an estimate, in the deployment's configured currency.

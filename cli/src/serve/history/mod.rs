@@ -109,6 +109,11 @@ pub struct InvocationRecord {
     /// The source's lag when the invocation ended (#733).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub source_lag: Option<faucet_core::SourceLag>,
+    /// Where every row went (#879): offered, accepted, coalesced, failed to
+    /// the DLQ, quarantined, dropped — the same view `faucet run --output
+    /// json` prints. Absent when nothing was offered.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rows: Option<faucet_core::RowAccountsSnapshot>,
     /// The invocation never ran: its parent or a `depends_on` row failed or
     /// was skipped. `error` says which; it is not a failure of its own.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
@@ -123,10 +128,14 @@ impl From<&InvocationOutcome> for InvocationRecord {
             run_id: o.run_id.clone(),
             records_written: o.records_written,
             duration_ms: o.metrics.as_ref().map(|m| m.duration_ms).unwrap_or(0),
-            error: o.error.clone(),
+            error: o
+                .error
+                .as_deref()
+                .map(crate::secrets::registry::redact_message),
             usage: o.usage.clone(),
             batches: o.metrics.as_ref().and_then(|m| m.batches),
             source_lag: o.metrics.as_ref().and_then(|m| m.source_lag),
+            rows: o.metrics.as_ref().and_then(|m| m.rows),
             skipped: o.error_kind == Some(crate::executor::InvocationErrorKind::Skipped),
         }
     }
@@ -196,6 +205,11 @@ pub struct RunRecord {
     /// so a claim or resume keeps its SQL connectors' host access (#862 H-04).
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub host_access: bool,
+    /// The run's config was carried by the request (not a template or a
+    /// server file), so its HTTP requests and redirect hops stay under the
+    /// caller reference policy wherever it runs (#881).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub caller_config: bool,
 }
 
 impl RunRecord {
@@ -232,6 +246,7 @@ impl RunRecord {
             tenant: None,
             selection: None,
             host_access: false,
+            caller_config: false,
         }
     }
 }
@@ -624,6 +639,17 @@ pub trait RunHistory: Send + Sync {
 
     /// Insert or replace a run record.
     async fn upsert(&self, rec: &RunRecord) -> Result<(), HistoryError>;
+
+    /// Insert a run record only when no record has its id; `false` when one
+    /// does. Backends override it with an atomic insert so two writers racing
+    /// for one id cannot both win.
+    async fn insert_new(&self, rec: &RunRecord) -> Result<bool, HistoryError> {
+        if self.get(&rec.run_id).await?.is_some() {
+            return Ok(false);
+        }
+        self.upsert(rec).await?;
+        Ok(true)
+    }
 
     async fn get(&self, id: &str) -> Result<Option<RunRecord>, HistoryError>;
 
@@ -1994,6 +2020,7 @@ const CONNECT_ATTEMPTS: usize = 8;
 /// unclassified one costs at most the (bounded) attempt budget before
 /// degrading with the same message it would have degraded with immediately.
 #[cfg(any(feature = "serve-history-postgres", feature = "serve-history-sqlite"))]
+#[allow(clippy::disallowed_methods)] // a runtime timer, not a connector backend call
 async fn connect_with_retry<H, F, Fut>(label: &str, mut make: F) -> Result<H, HistoryError>
 where
     F: FnMut() -> Fut,

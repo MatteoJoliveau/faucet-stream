@@ -83,3 +83,119 @@ async fn conformance_preflight_check_wellformed() {
     )
     .await;
 }
+
+fn async_job(fetch: serde_json::Value) -> serde_json::Value {
+    json!({
+        "submit": { "method": "POST", "url": "/jobs" },
+        "job_id": "$.id",
+        "poll": { "url": "/jobs/${job_id}", "interval_secs": 0, "timeout_secs": 30 },
+        "status": { "path": "$.state", "success": ["done"], "failure": ["failed"] },
+        "fetch": fetch
+    })
+}
+
+#[test]
+fn conformance_descriptor_matches_built_source() {
+    let base = "http://127.0.0.1:1";
+    let configs = [
+        json!({ "base_url": base, "path": "/items" }),
+        json!({
+            "base_url": base, "path": "/items", "response_format": "csv",
+            "async_job": async_job(json!({
+                "url": "/jobs/${job_id}/result", "locator_header": "x-next", "locator_param": "loc"
+            }))
+        }),
+        json!({
+            "base_url": base, "path": "/items", "response_format": "csv",
+            "async_job": async_job(json!({
+                "url": "/jobs/${job_id}/result", "locator_body": "$.next", "locator_param": "loc"
+            }))
+        }),
+        json!({
+            "base_url": base, "path": "/items", "response_format": "json",
+            "async_job": async_job(json!({ "url": "/jobs/${job_id}/result" }))
+        }),
+        json!({ "base_url": base, "path": "", "odata": { "entity": "Orders" } }),
+    ];
+    for v in configs {
+        let cfg: RestStreamConfig = serde_json::from_value(v.clone()).unwrap();
+        let built = RestStream::new(cfg).unwrap();
+        faucet_conformance::assert_descriptor_matches_source(
+            &faucet_source_rest::DESCRIPTOR,
+            "rest",
+            &v,
+            &built,
+        );
+    }
+}
+
+/// A hung endpoint: the read ends at the call deadline and on cancel (#880).
+#[tokio::test]
+async fn conformance_call_deadline() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_delay(std::time::Duration::from_secs(60))
+                .set_body_json(json!([])),
+        )
+        .mount(&server)
+        .await;
+    let uri = server.uri();
+    faucet_conformance::calls::assert_source_call_deadline(|| {
+        RestStream::new(RestStreamConfig::new(&uri, "/items").pagination(PaginationStyle::None))
+            .expect("rest stream builds from a valid config")
+    })
+    .await;
+}
+
+/// #878: every dataset an OData `$metadata` discovery reports can be selected
+/// by its `config_patch` and read.
+#[tokio::test]
+async fn conformance_discover_roundtrips() {
+    const EDMX: &str = r#"<?xml version="1.0" encoding="utf-8"?>
+<edmx:Edmx Version="4.0" xmlns:edmx="http://docs.oasis-open.org/odata/ns/edmx">
+  <edmx:DataServices>
+    <Schema Namespace="Fin" xmlns="http://docs.oasis-open.org/odata/ns/edm">
+      <EntityType Name="Ledger">
+        <Key><PropertyRef Name="RecId"/></Key>
+        <Property Name="RecId" Type="Edm.Int64" Nullable="false"/>
+      </EntityType>
+      <EntityContainer Name="C">
+        <EntitySet Name="LedgerEntries" EntityType="Fin.Ledger"/>
+        <EntitySet Name="Departments" EntityType="Fin.Ledger"/>
+      </EntityContainer>
+    </Schema>
+  </edmx:DataServices>
+</edmx:Edmx>"#;
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/$metadata"))
+        .respond_with(ResponseTemplate::new(200).set_body_string(EDMX))
+        .mount(&server)
+        .await;
+    for entity in ["LedgerEntries", "Departments"] {
+        Mock::given(method("GET"))
+            .and(path(format!("/{entity}")))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(json!({"value": [{"RecId": 1}]})),
+            )
+            .mount(&server)
+            .await;
+    }
+    let base = json!({
+        "base_url": server.uri(),
+        "path": "/",
+        "odata": {"version": "v4", "fan_out": true, "objects": "LedgerEntries,Departments"}
+    });
+    let cfg: RestStreamConfig = serde_json::from_value(base.clone()).unwrap();
+    let source = RestStream::new(cfg).unwrap();
+    faucet_conformance::assert_discover_roundtrips(&source, |patch| {
+        let v = faucet_conformance::merge_config_patch(base.clone(), &patch);
+        async move {
+            let cfg: RestStreamConfig = serde_json::from_value(v).unwrap();
+            Box::new(RestStream::new(cfg).unwrap()) as Box<dyn faucet_core::Source>
+        }
+    })
+    .await;
+}

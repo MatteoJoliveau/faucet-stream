@@ -74,6 +74,18 @@ is refused on a best-effort configuration unless the `dlq:` block sets
 already landed a second time). See
 [batch atomicity](https://faucet-hq.github.io/faucet-stream/cookbook/dlq.html#batch-atomicity-and-dlq_all).
 
+## Capabilities
+
+Declares `write_mode: append` only; no idempotent writes. `faucet list --json` prints the declaration.
+
+## Timeouts, cancellation and retries
+
+Every `PutRecords` runs through the pipeline's `CallContext` (#880): each
+attempt is bounded by the default 300 s call timeout and any caller deadline,
+and metered as a `put` round trip. The per-entry partial-failure retry and its
+backoff (the `retry:` block) are unchanged; the backoff waits through the same
+context, so a deadline ends it.
+
 ## License
 
 MIT OR Apache-2.0

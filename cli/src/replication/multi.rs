@@ -119,7 +119,7 @@ impl Shared {
     /// Whether a snapshot replaces the destination atomically (so a redo or a
     /// re-sync after a pause leaves no row the source no longer has).
     fn snapshot_replaces(&self) -> bool {
-        crate::registry::sink_supports_overwrite(&self.sink_kind)
+        crate::registry::sink_kind_capabilities(&self.sink_kind).overwrite()
     }
 
     /// Whether the table's destination already exists (asked of the sinks
@@ -185,8 +185,8 @@ async fn discover(shared: &Shared) -> CliResult<BTreeMap<String, Resolution>> {
     )
     .await?;
     let descriptors = source.discover().await?;
-    let upsert_capable = crate::registry::sink_supported_write_modes(&shared.sink_kind)
-        .contains(&faucet_core::WriteMode::Upsert);
+    let upsert_capable = crate::registry::sink_kind_capabilities(&shared.sink_kind)
+        .supports_write_mode(faucet_core::WriteMode::Upsert);
     let sink_template = shared
         .cfg
         .pipeline
@@ -945,6 +945,7 @@ async fn stop_cycle<T>(cancel: &CancellationToken, task: &mut AbortOnDrop<T>) {
     let _ = tokio::time::timeout(CYCLE_STOP_GRACE, &mut task.0).await;
 }
 
+#[allow(clippy::disallowed_methods)] // a runtime timer, not a connector backend call
 async fn drive(shared: Arc<Shared>, cancel: CancellationToken) -> CliResult<()> {
     let mut d = Driver {
         shared,

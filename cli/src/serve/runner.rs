@@ -9,7 +9,7 @@ use crate::registry::build_source;
 use crate::serve::error::ServeError;
 use crate::serve::history::{Claim, InvocationRecord, RunRecord, RunStatus};
 use crate::serve::history::{ClaimedShard, ShardInsert, ShardOutcome};
-use crate::serve::load::{BodyOrigin, ConfigFormat, LoadedSubmission, load_submission_scoped};
+use crate::serve::load::{BodyOrigin, ConfigFormat, LoadedSubmission};
 use crate::serve::rbac::AuthContext;
 use crate::serve::state::ServerState;
 use crate::serve::{idempotency, metrics};
@@ -116,6 +116,34 @@ pub fn stored_origin(rec: &RunRecord) -> BodyOrigin {
         BodyOrigin::ServerFile
     } else {
         BodyOrigin::Trusted
+    }
+}
+
+/// The reference policy a run's HTTP clients check their requests and
+/// redirect hops against (#881): the caller policy for a config the request
+/// carried, none (metadata redirects are still refused) for an operator's.
+pub(crate) fn runtime_reference_policy(
+    caller_config: bool,
+    tenant: Option<&str>,
+) -> Option<std::sync::Arc<faucet_core::resolve::ReferencePolicy>> {
+    caller_config.then(|| {
+        std::sync::Arc::new(crate::serve::references::installed().for_origin(
+            BodyOrigin::Caller {
+                allow_subprocess: false,
+            },
+            tenant,
+        ))
+    })
+}
+
+/// Run `fut` under `policy` ([`runtime_reference_policy`]).
+async fn under_reference_policy<F: std::future::Future>(
+    policy: Option<std::sync::Arc<faucet_core::resolve::ReferencePolicy>>,
+    fut: F,
+) -> F::Output {
+    match policy {
+        Some(p) => faucet_core::http::with_reference_policy(p, fut).await,
+        None => fut.await,
     }
 }
 
@@ -317,13 +345,14 @@ pub(crate) async fn load_for(
         None => None,
         Some(t) => Some(tenant_scope(state, t).await?),
     };
-    load_submission_scoped(
+    crate::serve::load::load_submission_with(
         body,
         format,
         state.default_base().as_ref(),
         server_policy(state).as_deref(),
         origin,
         scope,
+        &state.references(),
     )
     .await
 }
@@ -508,16 +537,20 @@ fn resume_claimed(
         // calling registry.cancel) reaches this run.
         let run_token = CancellationToken::new();
         state.registry().register(run_id.clone(), run_token.clone());
-        execute_run(
-            state.clone(),
-            loaded,
-            run_id,
-            run_token,
-            rec.submitted_at,
-            rec.timeout_secs,
-            rec.clock.clone(),
-            rec.concurrency,
-            Some(guard),
+        let policy = runtime_reference_policy(rec.caller_config, rec.tenant.as_deref());
+        under_reference_policy(
+            policy,
+            execute_run(
+                state.clone(),
+                loaded,
+                run_id,
+                run_token,
+                rec.submitted_at,
+                rec.timeout_secs,
+                rec.clock.clone(),
+                rec.concurrency,
+                Some(guard),
+            ),
         )
         .await;
     });
@@ -700,17 +733,21 @@ pub fn resume_claimed_shard(state: ServerState, claimed: ClaimedShard) {
             run_id: run_id.clone(),
             shard_id: shard_id.clone(),
         };
-        let (outcome, shutdown) = execute_shard(
-            &state,
-            loaded,
-            &run_id,
-            &shard_id,
-            shard,
-            coop,
-            run.timeout_secs,
-            run.clock.clone(),
-            run.concurrency,
-            run.submitted_at,
+        let policy = runtime_reference_policy(run.caller_config, run.tenant.as_deref());
+        let (outcome, shutdown) = under_reference_policy(
+            policy,
+            execute_shard(
+                &state,
+                loaded,
+                &run_id,
+                &shard_id,
+                shard,
+                coop,
+                run.timeout_secs,
+                run.clock.clone(),
+                run.concurrency,
+                run.submitted_at,
+            ),
         )
         .await;
 
@@ -771,6 +808,7 @@ pub fn resume_claimed_shard(state: ServerState, claimed: ClaimedShard) {
 /// Does not touch the parent run record — the caller finalizes the shard and
 /// the parent. The flag is `true` when a server shutdown interrupted it.
 #[allow(clippy::too_many_arguments)]
+#[allow(clippy::disallowed_methods)] // a runtime timer, not a connector backend call
 async fn execute_shard(
     state: &ServerState,
     loaded: LoadedSubmission,
@@ -1233,6 +1271,7 @@ pub async fn submit(
     rec.tenant = actor.tenant.clone();
     rec.selection = req.selection.clone();
     rec.host_access = req.server_file;
+    rec.caller_config = matches!(req.origin(&state), BodyOrigin::Caller { .. });
 
     if state.cluster().enabled() {
         // A degraded (DB-unreachable) backend can't coordinate a cluster: the
@@ -1830,16 +1869,23 @@ fn spawn_run(
             }
             permit = state.semaphore().acquire_owned() => permit.expect("semaphore not closed"),
         };
-        execute_run(
-            state,
-            loaded,
-            run_id,
-            run_token,
-            submitted_at,
-            req.timeout_secs,
-            req.clock,
-            req.concurrency,
-            None,
+        let policy = runtime_reference_policy(
+            matches!(req.origin(&state), BodyOrigin::Caller { .. }),
+            loaded.tenant.as_ref().map(|t| t.values.id.as_str()),
+        );
+        under_reference_policy(
+            policy,
+            execute_run(
+                state,
+                loaded,
+                run_id,
+                run_token,
+                submitted_at,
+                req.timeout_secs,
+                req.clock,
+                req.concurrency,
+                None,
+            ),
         )
         .await;
         // `_permit` drops here.
@@ -1852,6 +1898,7 @@ fn spawn_run(
 /// `from_queue` is `true` when the run consumed a local queue slot (submit path)
 /// and `false` for a cluster claim-path run that never reserved one (#228).
 #[allow(clippy::too_many_arguments)]
+#[allow(clippy::disallowed_methods)] // a runtime timer, not a connector backend call
 async fn execute_run(
     state: ServerState,
     loaded: LoadedSubmission,
@@ -2244,7 +2291,7 @@ async fn finalize(state: &ServerState, run_id: &str, started: DateTime<Utc>, ter
     rec.elapsed_secs = elapsed;
     rec.records_written = records;
     rec.invocations = invs;
-    rec.error = error;
+    rec.error = error.map(|e| crate::secrets::registry::redact_message(&e));
     if state.cluster().enabled() {
         // Owner-fenced: if another instance reclaimed this run (lease expired),
         // our write is a no-op and we discard our result — the reclaimer is now
@@ -2309,6 +2356,7 @@ async fn finalize_queued_cancel(
 
 /// Spawn a detached timer that drops a finished run's log buffer after the drain
 /// window, freeing its ring once late `/logs` fetchers have had a chance to read.
+#[allow(clippy::disallowed_methods)] // a runtime timer, not a connector backend call
 fn schedule_log_drop(state: ServerState, run_id: String) {
     tokio::spawn(async move {
         tokio::time::sleep(crate::serve::logs::LOG_DRAIN).await;
@@ -2336,8 +2384,31 @@ fn recount_refusal(tenant: &str, recount: Result<Option<String>, ServeError>) ->
 }
 
 #[cfg(test)]
+#[allow(clippy::disallowed_methods)] // tests drive time and raw clients directly
 mod tests {
     use super::*;
+
+    /// A caller's config runs with the caller reference policy scoped over
+    /// it, so its HTTP clients check every request and redirect hop (#881).
+    #[tokio::test]
+    async fn a_caller_run_executes_under_the_caller_reference_policy() {
+        assert!(runtime_reference_policy(false, None).is_none());
+        let policy = runtime_reference_policy(true, None).expect("a caller run is scoped");
+        assert!(policy.check_url("http://169.254.169.254/").is_err());
+        assert!(!policy.allows_subprocess());
+        let seen = under_reference_policy(Some(policy), async {
+            faucet_core::http::current_reference_policy()
+        })
+        .await;
+        assert!(seen.is_some());
+        assert!(
+            under_reference_policy(None, async {
+                faucet_core::http::current_reference_policy()
+            })
+            .await
+            .is_none()
+        );
+    }
 
     #[test]
     fn caller_idempotency_keys_stay_out_of_the_server_namespaces() {
@@ -2632,6 +2703,7 @@ mod tests {
             vault: None,
             connect_providers_path: None,
             allow_subprocess_connectors: false,
+            references: Default::default(),
         };
         let history = Arc::new(MemoryHistory::new(Duration::from_secs(60))) as Arc<dyn RunHistory>;
         let state = ServerState::new(
@@ -2729,6 +2801,7 @@ mod tests {
             vault: None,
             connect_providers_path: None,
             allow_subprocess_connectors: false,
+            references: Default::default(),
         };
         let history = Arc::new(MemoryHistory::new(Duration::from_secs(60))) as Arc<dyn RunHistory>;
         let state = ServerState::new(
@@ -2816,6 +2889,7 @@ mod tests {
             vault: None,
             connect_providers_path: None,
             allow_subprocess_connectors: false,
+            references: Default::default(),
         };
         let history = Arc::new(MemoryHistory::new(Duration::from_secs(60))) as Arc<dyn RunHistory>;
         ServerState::new(
@@ -2946,6 +3020,7 @@ mod tests {
             vault: None,
             connect_providers_path: None,
             allow_subprocess_connectors: false,
+            references: Default::default(),
         };
         // A backend that is degraded from startup (primary unreachable).
         let history = Arc::new(FallbackHistory::degraded_at_startup(
@@ -3064,6 +3139,7 @@ mod tests {
                 vault: None,
                 connect_providers_path: None,
                 allow_subprocess_connectors: false,
+                references: Default::default(),
             };
             ServerState::new(
                 &cfg,

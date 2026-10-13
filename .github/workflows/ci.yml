@@ -13,6 +13,10 @@ env:
   CARGO_TERM_COLOR: always
   CARGO_INCREMENTAL: 0
   RUSTFLAGS: "-C debuginfo=0"
+  # Test threads get the stack `faucet` gives its runtime workers
+  # (`faucet_cli::RUNTIME_THREAD_STACK`): a debug build with every connector
+  # compiled in nests pipeline futures deeper than the 2 MiB default allows.
+  RUST_MIN_STACK: "8388608"
   # Harden against transient crates.io connectivity drops seen on GitHub-hosted
   # runners (`curl failed` / `SSL_read: unexpected eof` / connection reset) that
   # abort cargo during dependency download. Retry more, and disable HTTP/2
@@ -140,6 +144,10 @@ jobs:
         run: |
           python3 scripts/test_helm_app_version.py
           python3 scripts/helm-app-version.py
+      - name: Check every declared connector capability has its conformance test (#878)
+        run: |
+          python3 scripts/test_conformance_coverage.py
+          python3 scripts/conformance-coverage.py
 
   # The agent skills ship with the engine (#853): they link to docs pages and
   # cli/examples files that must exist, carry no version facts, and their
@@ -340,11 +348,21 @@ jobs:
           docker ps -aq | xargs -r docker rm -f >/dev/null
           docker system prune -af --volumes >/dev/null
           df -h /
-      - name: Run workspace tests
+      - name: Run workspace tests (libraries and connectors)
         # Integration tests boot Docker containers via testcontainers, whose
         # in-process (bollard) image pull intermittently fails. Only that is
         # retried: any other failure — a flaky test included — fails at once.
-        run: scripts/retry-on-image-pull.sh cargo test --workspace --all-features
+        # Split from faucet-cli: building every test binary of the workspace
+        # at once, plus the test containers' images, exhausts the runner disk.
+        run: scripts/retry-on-image-pull.sh cargo test --workspace --exclude faucet-cli --all-features
+      - name: Free disk taken by the library test binaries and containers
+        run: |
+          find target/debug/deps -maxdepth 1 -type f -perm -u+x -delete
+          docker ps -aq | xargs -r docker rm -f >/dev/null
+          docker system prune -af --volumes >/dev/null
+          df -h /
+      - name: Run workspace tests (faucet-cli)
+        run: scripts/retry-on-image-pull.sh cargo test -p faucet-cli --all-features
       - name: Free disk taken by the workspace test binaries
         # The next step rebuilds faucet-cli with other features; the runner
         # runs out of disk if the workspace run's test executables stay.
@@ -1026,15 +1044,31 @@ jobs:
           cargo llvm-cov clean --workspace
           rm -f target/*.profraw
           eval "$(cargo llvm-cov show-env --sh)"
-          retry cargo test --workspace --all-features --test '*'
+          # Libraries and connectors first, then faucet-cli, with the first
+          # batch's test executables and containers dropped in between: all of
+          # them at once (plus the instrumented build) exhausts the runner disk.
           # The staged-load execution shims need a live warehouse that can reach
           # a live bucket, so they are excluded here, in codecov.yml, and in
           # scripts/patch-coverage.py (all three kept in sync).
-          cargo llvm-cov report --lcov --output-path integration.lcov --ignore-filename-regex "$IGNORE_RE"
+          retry cargo test --workspace --exclude faucet-cli --all-features --test '*'
+          # Report this batch before deleting its executables: llvm-cov maps the
+          # profile data through the binaries, so a deleted binary's counts are lost.
+          cargo llvm-cov report --lcov --output-path integration-libs.lcov --ignore-filename-regex "$IGNORE_RE"
+          cargo test --workspace --exclude faucet-cli --all-features --test '*' --no-run --message-format=json 2>/dev/null \
+            | jq -r 'select(.reason == "compiler-artifact" and .profile.test == true) | .executable // empty' \
+            | while read -r exe; do rm -f "$exe" "${exe}.d"; done
+          rm -f target/*.profraw
+          docker ps -aq | xargs -r docker rm -f >/dev/null
+          docker system prune -af --volumes >/dev/null
+          df -h /
+          retry cargo test -p faucet-cli --all-features --test '*'
+          cargo llvm-cov report --lcov --output-path integration-cli.lcov --ignore-filename-regex "$IGNORE_RE"
+          # Both scripts merge a file's records across reports (a line hit in either counts).
+          cat integration-libs.lcov integration-cli.lcov > integration.lcov
 
           echo "::group::teardown before the unit phase"
           df -h /
-          cargo test --workspace --all-features --test '*' --no-run --message-format=json 2>/dev/null \
+          cargo test -p faucet-cli --all-features --test '*' --no-run --message-format=json 2>/dev/null \
             | jq -r 'select(.reason == "compiler-artifact" and .profile.test == true) | .executable // empty' \
             | while read -r exe; do rm -f "$exe" "${exe}.d"; done
           rm -f target/*.profraw
@@ -1046,6 +1080,19 @@ jobs:
           retry cargo test --workspace --all-features --lib --bins
           cargo llvm-cov report --lcov --output-path unit.lcov --ignore-filename-regex "$IGNORE_RE"
           cat integration.lcov unit.lcov > lcov.info
+      - name: Keep the coverage reports
+        # So a failing coverage gate can be read line by line (Codecov only
+        # receives the report after the gates pass).
+        if: ${{ always() && (github.event_name != 'pull_request' || needs.changes.outputs.code == 'true') }}
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: coverage-lcov
+          path: |
+            lcov.info
+            integration.lcov
+            unit.lcov
+          if-no-files-found: ignore
+          retention-days: 14
       - name: Test the coverage gate scripts
         if: ${{ github.event_name == 'pull_request' && needs.changes.outputs.code == 'true' }}
         run: python3 -m unittest discover -s scripts -p 'test_*.py'

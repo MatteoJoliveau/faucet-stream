@@ -7,6 +7,7 @@ use async_trait::async_trait;
 use faucet_common_bigquery::build_client;
 use faucet_core::FaucetError;
 use faucet_core::idempotency::COMMIT_TOKEN_TOKEN_COL;
+use faucet_core::io::{CallContext, CallSlot};
 use gcp_bigquery_client::Client;
 use gcp_bigquery_client::error::BQError;
 use gcp_bigquery_client::model::get_query_results_parameters::GetQueryResultsParameters;
@@ -79,10 +80,46 @@ pub(crate) enum CancelOutcome {
     },
 }
 
+/// `fut` sent once as the backend call `op` through `calls` (#880): bounded by
+/// the context's attempt timeout and deadline, stopped by its cancel token.
+pub(crate) async fn call_once<T, Fut>(
+    calls: &CallContext,
+    op: &'static str,
+    fut: Fut,
+) -> Result<T, FaucetError>
+where
+    Fut: std::future::Future<Output = Result<T, FaucetError>>,
+{
+    Box::pin(calls.call_once(op, Box::pin(fut))).await
+}
+
+/// [`call_once`] for a client call that keeps its typed `BQError`; the context
+/// running out (deadline, cancel) comes back as a non-transient `BQError`.
+async fn call_once_bq<T, Fut>(calls: &CallContext, op: &'static str, fut: Fut) -> Result<T, BQError>
+where
+    Fut: std::future::Future<Output = Result<T, BQError>>,
+{
+    match call_once(calls, op, async { Ok(fut.await) }).await {
+        Ok(result) => result,
+        Err(spent) => Err(BQError::ConnectionPoolError(spent.to_string())),
+    }
+}
+
+/// The sink's call slot: the default attempt timeout, one attempt, and no
+/// round-trip metering (the `roundtrips` slot counts them).
+fn call_slot() -> CallSlot {
+    CallSlot::new(
+        CallContext::new()
+            .without_retry()
+            .with_roundtrip_metering(false),
+    )
+}
+
 /// Request `jobs.cancel` for a job that outlived `job_timeout`, then poll it
 /// (up to [`CANCEL_CONFIRM`]) until it stops (SQL-96). A job that won the race
 /// and succeeded is reported as such instead of as a failure.
 pub(crate) async fn cancel_timed_out_job(
+    calls: &CallContext,
     client: &Client,
     config: &BigQuerySinkConfig,
     kind: &str,
@@ -97,10 +134,14 @@ pub(crate) async fn cancel_timed_out_job(
         )),
         terminal,
     };
-    if let Err(e) = client
-        .job()
-        .cancel_job(&config.project_id, job_id, location)
-        .await
+    if let Err(e) = call_once_bq(
+        calls,
+        "job",
+        client
+            .job()
+            .cancel_job(&config.project_id, job_id, location),
+    )
+    .await
     {
         tracing::warn!(job_id, error = %e, "BigQuery jobs.cancel failed after job_timeout");
         return failed(
@@ -114,12 +155,16 @@ pub(crate) async fn cancel_timed_out_job(
             creds: &config.auth,
             host: config.upload_base_url.as_deref(),
         };
-        let job = match faucet_common_bigquery::raw::tolerant_get_job(
-            client,
-            target,
-            &config.project_id,
-            job_id,
-            location,
+        let job = match call_once_bq(
+            calls,
+            "job",
+            faucet_common_bigquery::raw::tolerant_get_job(
+                client,
+                target,
+                &config.project_id,
+                job_id,
+                location,
+            ),
         )
         .await
         {
@@ -149,7 +194,14 @@ pub(crate) async fn cancel_timed_out_job(
                 false,
             );
         }
-        tokio::time::sleep(Duration::from_millis(500)).await;
+        if let Err(spent) = calls.wait(Duration::from_millis(500)).await {
+            return failed(
+                format!(
+                    "cancel requested but not confirmed ({spent}), so the job may still commit"
+                ),
+                false,
+            );
+        }
     }
 }
 
@@ -204,21 +256,28 @@ fn is_transient_bq_error(err: &BQError) -> bool {
 /// is typed over `FaucetError`, and these call sites need the **typed
 /// `BQError`** after retrying (e.g. `tables.get` 404 → "table absent", a
 /// legitimate `Ok(None)` outcome, not a failure).
-async fn retry_control_plane<F, Fut, T>(what: &str, mut call: F) -> Result<T, BQError>
+async fn retry_control_plane<F, Fut, T>(
+    calls: &CallContext,
+    what: &str,
+    mut call: F,
+) -> Result<T, BQError>
 where
     F: FnMut() -> Fut,
     Fut: std::future::Future<Output = Result<T, BQError>>,
 {
     let mut delay = Duration::from_millis(500);
     for attempt in 1..=BQ_CP_ATTEMPTS {
-        match call().await {
+        match call_once_bq(calls, "control", call()).await {
             Ok(v) => return Ok(v),
             Err(e) if attempt < BQ_CP_ATTEMPTS && is_transient_bq_error(&e) => {
                 tracing::warn!(
                     what, attempt, error = %e,
                     "BigQuery control-plane transient error; retrying"
                 );
-                tokio::time::sleep(delay).await;
+                calls
+                    .wait(delay)
+                    .await
+                    .map_err(|e| BQError::ConnectionPoolError(e.to_string()))?;
                 delay = (delay * 2).min(Duration::from_secs(8));
             }
             Err(e) => return Err(e),
@@ -669,6 +728,8 @@ struct UploadSession {
     /// HTTP client with redirects disabled (a 308 "Resume Incomplete" must not
     /// be auto-followed).
     http: reqwest::Client,
+    /// The sink's call context (#880): every chunk PUT runs through it.
+    calls: CallContext,
     /// Set once the terminating chunk has been accepted, so a second
     /// flush/commit is a no-op.
     finalized: bool,
@@ -749,14 +810,16 @@ impl UploadSession {
             } else {
                 format!("bytes {pos}-{}/{size}", end - 1)
             };
-            let resp = self
-                .http
-                .put(&self.session_uri)
-                .header(reqwest::header::CONTENT_RANGE, range)
-                .body(body)
-                .send()
-                .await
-                .map_err(|e| FaucetError::Sink(format!("resumable chunk PUT failed: {e}")))?;
+            let resp = call_once(&self.calls, "load", async {
+                self.http
+                    .put(&self.session_uri)
+                    .header(reqwest::header::CONTENT_RANGE, range)
+                    .body(body)
+                    .send()
+                    .await
+                    .map_err(|e| FaucetError::Sink(format!("resumable chunk PUT failed: {e}")))
+            })
+            .await?;
             if resp.status().as_u16() != 308 {
                 return Ok(resp);
             }
@@ -847,6 +910,10 @@ pub struct BigQuerySink {
     /// `bytes_streamed` (estimated insertAll payload), `bytes_loaded` (media
     /// upload size), `bytes_billed` (a query job's `totalBytesBilled`).
     roundtrips: faucet_core::observability::RecorderSlot,
+    /// Backend-call context (#880): every request runs through it for the
+    /// run's timeout and deadline, once — writes are never re-sent here.
+    /// Round trips stay counted by `roundtrips`.
+    calls: CallSlot,
 }
 
 /// Connect timeout of the upload clients.
@@ -855,9 +922,9 @@ pub(crate) const HTTP_CONNECT_TIMEOUT: std::time::Duration = std::time::Duration
 /// this long fails instead of hanging on a half-open connection.
 pub(crate) const HTTP_READ_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(300);
 
-/// A `reqwest` builder with the upload clients' timeouts.
-pub(crate) fn upload_builder() -> reqwest::ClientBuilder {
-    reqwest::Client::builder()
+/// A `faucet_core::http` builder with the upload clients' timeouts.
+pub(crate) fn upload_builder() -> faucet_core::http::ClientBuilder {
+    faucet_core::http::Client::builder()
         .connect_timeout(HTTP_CONNECT_TIMEOUT)
         .read_timeout(HTTP_READ_TIMEOUT)
 }
@@ -865,7 +932,7 @@ pub(crate) fn upload_builder() -> reqwest::ClientBuilder {
 /// The client media and multipart load uploads use.
 pub(crate) fn upload_client() -> Result<reqwest::Client, FaucetError> {
     upload_builder()
-        .build()
+        .build_reqwest()
         .map_err(|e| FaucetError::Sink(format!("BigQuery: cannot build upload client: {e}")))
 }
 
@@ -894,6 +961,7 @@ impl BigQuerySink {
             client,
             schema_cache: RwLock::new(None),
             roundtrips: faucet_core::observability::RecorderSlot::new(),
+            calls: call_slot(),
             table_ready: AtomicBool::new(false),
             overwrite_setup: AtomicBool::new(false),
             stream_appends: AtomicBool::new(false),
@@ -920,6 +988,7 @@ impl BigQuerySink {
             client,
             schema_cache: RwLock::new(None),
             roundtrips: faucet_core::observability::RecorderSlot::new(),
+            calls: call_slot(),
             table_ready: AtomicBool::new(false),
             overwrite_setup: AtomicBool::new(false),
             stream_appends: AtomicBool::new(false),
@@ -976,16 +1045,19 @@ impl BigQuerySink {
             "bytes",
             faucet_core::usage::estimate_page_bytes(rows) as f64,
         );
-        self.client
-            .tabledata()
-            .insert_all(
-                &self.config.project_id,
-                &self.config.dataset_id,
-                &self.config.table_id,
-                insert_request,
-            )
-            .await
-            .map_err(|e| FaucetError::Sink(format!("BigQuery insertAll failed: {e}")))
+        call_once(&self.calls.get(), "insert", async {
+            self.client
+                .tabledata()
+                .insert_all(
+                    &self.config.project_id,
+                    &self.config.dataset_id,
+                    &self.config.table_id,
+                    insert_request,
+                )
+                .await
+                .map_err(|e| FaucetError::Sink(format!("BigQuery insertAll failed: {e}")))
+        })
+        .await
     }
 
     /// Insert a single chunk of rows in one `tabledata.insertAll` call,
@@ -1051,7 +1123,7 @@ impl BigQuerySink {
     /// caching. Returns the raw [`idempotent::FieldSpec`]s (possibly empty for a
     /// schemaless table); a missing table surfaces as the client's `BQError`.
     async fn fetch_schema_fields(&self) -> Result<Vec<idempotent::FieldSpec>, BQError> {
-        let table = retry_control_plane("tables.get (schema)", || {
+        let table = retry_control_plane(&self.calls.get(), "tables.get (schema)", || {
             faucet_common_bigquery::raw::tolerant_get_table(
                 &self.client,
                 self.raw_target(),
@@ -1084,16 +1156,17 @@ impl BigQuerySink {
         table_id: &str,
         infer: impl FnOnce() -> Option<Value>,
     ) -> Result<Option<Value>, FaucetError> {
-        let existing = retry_control_plane("tables.get (truncate schema)", || {
-            faucet_common_bigquery::raw::tolerant_get_table(
-                &self.client,
-                self.raw_target(),
-                &self.config.project_id,
-                &self.config.dataset_id,
-                table_id,
-            )
-        })
-        .await;
+        let existing =
+            retry_control_plane(&self.calls.get(), "tables.get (truncate schema)", || {
+                faucet_common_bigquery::raw::tolerant_get_table(
+                    &self.client,
+                    self.raw_target(),
+                    &self.config.project_id,
+                    &self.config.dataset_id,
+                    table_id,
+                )
+            })
+            .await;
         match existing {
             Ok(table) => Ok(existing_load_schema(&table.schema)?.or_else(infer)),
             Err(e) if is_table_not_found(&e) => Ok(infer()),
@@ -1285,14 +1358,16 @@ impl BigQuerySink {
         req.parameter_mode = Some("NAMED".to_string());
         req.query_parameters = Some(vec![Self::string_param("payload", &payload)]);
         self.roundtrips.record("query");
-        let resp = self
-            .client
-            .job()
-            .query(&self.config.project_id, req)
-            .await
-            .map_err(|e| {
-                FaucetError::Sink(format!("BigQuery overwrite page insert failed: {e}"))
-            })?;
+        let resp = call_once(&self.calls.get(), "query", async {
+            self.client
+                .job()
+                .query(&self.config.project_id, req)
+                .await
+                .map_err(|e| {
+                    FaucetError::Sink(format!("BigQuery overwrite page insert failed: {e}"))
+                })
+        })
+        .await?;
         self.await_query_complete(resp).await?;
         Ok(records.len())
     }
@@ -1353,23 +1428,27 @@ impl BigQuerySink {
             self.config.project_id
         );
         let client = upload_client()?;
-        let resp = client
-            .post(&url)
-            .bearer_auth(&token)
-            .header(
-                reqwest::header::CONTENT_TYPE,
-                format!("multipart/related; boundary={boundary}"),
-            )
-            .body(body)
-            .send()
-            .await
-            .map_err(|e| FaucetError::Sink(format!("BigQuery media load upload failed: {e}")))?;
-
-        let status = resp.status();
-        let text = resp
-            .text()
-            .await
-            .map_err(|e| FaucetError::Sink(format!("BigQuery media load: read response: {e}")))?;
+        let (status, text) = call_once(&self.calls.get(), "load", async {
+            let resp = client
+                .post(&url)
+                .bearer_auth(&token)
+                .header(
+                    reqwest::header::CONTENT_TYPE,
+                    format!("multipart/related; boundary={boundary}"),
+                )
+                .body(body)
+                .send()
+                .await
+                .map_err(|e| {
+                    FaucetError::Sink(format!("BigQuery media load upload failed: {e}"))
+                })?;
+            let status = resp.status();
+            let text = resp.text().await.map_err(|e| {
+                FaucetError::Sink(format!("BigQuery media load: read response: {e}"))
+            })?;
+            Ok((status, text))
+        })
+        .await?;
         if !status.is_success() {
             return Err(FaucetError::Sink(format!(
                 "BigQuery media load upload returned HTTP {status}: {text}"
@@ -1401,15 +1480,18 @@ impl BigQuerySink {
         let started = std::time::Instant::now();
         loop {
             self.roundtrips.record("job");
-            let job = faucet_common_bigquery::raw::tolerant_get_job(
-                &self.client,
-                self.raw_target(),
-                &self.config.project_id,
-                job_id,
-                location,
-            )
-            .await
-            .map_err(|e| FaucetError::Sink(format!("BigQuery load jobs.get failed: {e}")))?;
+            let job = call_once(&self.calls.get(), "job", async {
+                faucet_common_bigquery::raw::tolerant_get_job(
+                    &self.client,
+                    self.raw_target(),
+                    &self.config.project_id,
+                    job_id,
+                    location,
+                )
+                .await
+                .map_err(|e| FaucetError::Sink(format!("BigQuery load jobs.get failed: {e}")))
+            })
+            .await?;
             let (state, error_result) = {
                 let status = job.status.as_ref().ok_or_else(|| {
                     FaucetError::Sink(format!(
@@ -1435,7 +1517,7 @@ impl BigQuerySink {
                     CancelOutcome::Failed { error, .. } => return Err(error),
                 }
             }
-            tokio::time::sleep(Duration::from_millis(500)).await;
+            self.calls.wait(Duration::from_millis(500)).await?;
         }
     }
 
@@ -1487,7 +1569,15 @@ impl BigQuerySink {
         job_id: &str,
         location: Option<&str>,
     ) -> CancelOutcome {
-        cancel_timed_out_job(&self.client, &self.config, kind, job_id, location).await
+        cancel_timed_out_job(
+            &self.calls.get(),
+            &self.client,
+            &self.config,
+            kind,
+            job_id,
+            location,
+        )
+        .await
     }
 
     /// Base URL for the media/resumable **upload** endpoint. Fixed Google host in
@@ -1531,21 +1621,24 @@ impl BigQuerySink {
         );
         // Redirects disabled: a 308 "Resume Incomplete" must not be auto-followed.
         let http = upload_builder()
-            .redirect(reqwest::redirect::Policy::none())
-            .build()
+            .max_redirects(0)
+            .build_reqwest()
             .map_err(|e| FaucetError::Sink(format!("resumable HTTP client: {e}")))?;
-        let resp = http
-            .post(&url)
-            .bearer_auth(&token)
-            .header(
-                reqwest::header::CONTENT_TYPE,
-                "application/json; charset=UTF-8",
-            )
-            .header("X-Upload-Content-Type", "application/octet-stream")
-            .body(job_json)
-            .send()
-            .await
-            .map_err(|e| FaucetError::Sink(format!("resumable init failed: {e}")))?;
+        let calls = self.calls.get();
+        let resp = call_once(&calls, "load", async {
+            http.post(&url)
+                .bearer_auth(&token)
+                .header(
+                    reqwest::header::CONTENT_TYPE,
+                    "application/json; charset=UTF-8",
+                )
+                .header("X-Upload-Content-Type", "application/octet-stream")
+                .body(job_json)
+                .send()
+                .await
+                .map_err(|e| FaucetError::Sink(format!("resumable init failed: {e}")))
+        })
+        .await?;
         let status = resp.status();
         if !status.is_success() {
             let t = resp.text().await.unwrap_or_default();
@@ -1569,6 +1662,7 @@ impl BigQuerySink {
                 flate2::Compression::default(),
             )),
             http,
+            calls,
             finalized: false,
             appending: write_disposition == "WRITE_APPEND",
             chunk_threshold: self.config.resumable_chunk.unwrap_or(RESUMABLE_CHUNK),
@@ -1769,12 +1863,15 @@ impl BigQuerySink {
         if let Some(sess) = sess
             && !sess.finalized
         {
-            let _ = sess
-                .http
-                .delete(&sess.session_uri)
-                .header(reqwest::header::CONTENT_LENGTH, "0")
-                .send()
-                .await;
+            let _ = call_once(&sess.calls, "load", async {
+                sess.http
+                    .delete(&sess.session_uri)
+                    .header(reqwest::header::CONTENT_LENGTH, "0")
+                    .send()
+                    .await
+                    .map_err(FaucetError::from)
+            })
+            .await;
         }
     }
 
@@ -1783,7 +1880,7 @@ impl BigQuerySink {
     /// failure to [`FaucetError::Sink`]. The configured `location` (if any) is
     /// applied so dataset/table creation lands in the intended region.
     async fn run_ddl(&self, sql: String) -> Result<(), FaucetError> {
-        let resp = retry_control_plane("jobs.query (DDL)", || {
+        let resp = retry_control_plane(&self.calls.get(), "jobs.query (DDL)", || {
             let mut req = QueryRequest::new(sql.clone());
             req.use_legacy_sql = false;
             req.location = self.config.location.clone();
@@ -1819,7 +1916,7 @@ impl BigQuerySink {
         // Request the `schema` field (as `fetch_schema_fields` does): the client's
         // `Table` type has a non-optional `schema`, so a narrower field mask would
         // yield a response it can't deserialize.
-        match retry_control_plane("tables.get (exists)", || {
+        match retry_control_plane(&self.calls.get(), "tables.get (exists)", || {
             faucet_common_bigquery::raw::tolerant_get_table(
                 &self.client,
                 self.raw_target(),
@@ -1928,12 +2025,14 @@ impl BigQuerySink {
         let mut req = QueryRequest::new(sql);
         req.use_legacy_sql = false;
         self.roundtrips.record("query");
-        let resp = self
-            .client
-            .job()
-            .query(&self.config.project_id, req)
-            .await
-            .map_err(|e| FaucetError::Sink(format!("BigQuery commit-table create failed: {e}")))?;
+        let resp = call_once(&self.calls.get(), "query", async {
+            self.client
+                .job()
+                .query(&self.config.project_id, req)
+                .await
+                .map_err(|e| FaucetError::Sink(format!("BigQuery commit-table create failed: {e}")))
+        })
+        .await?;
         self.await_query_complete(resp).await
     }
 
@@ -1978,17 +2077,17 @@ impl BigQuerySink {
                     max_results: Some(0),
                     ..Default::default()
                 };
-                let resp = self
-                    .client
-                    .job()
-                    .get_query_results(&self.config.project_id, &job_id, params)
-                    .await
-                    .map_err(|e| {
-                        (
-                            FaucetError::Sink(format!("BigQuery jobs.getQueryResults failed: {e}")),
-                            false,
-                        )
-                    })?;
+                let resp = call_once(&self.calls.get(), "poll", async {
+                    self.client
+                        .job()
+                        .get_query_results(&self.config.project_id, &job_id, params)
+                        .await
+                        .map_err(|e| {
+                            FaucetError::Sink(format!("BigQuery jobs.getQueryResults failed: {e}"))
+                        })
+                })
+                .await
+                .map_err(|e| (e, false))?;
                 if resp.job_complete.unwrap_or(false) {
                     break;
                 }
@@ -2004,7 +2103,10 @@ impl BigQuerySink {
                 // The server long-poll normally blocks until completion, but if
                 // it returns early, back off so a still-running job can't turn
                 // this into a tight request-hammering loop.
-                tokio::time::sleep(Duration::from_millis(250)).await;
+                self.calls
+                    .wait(Duration::from_millis(250))
+                    .await
+                    .map_err(|e| (e, false))?;
             }
         }
 
@@ -2016,20 +2118,19 @@ impl BigQuerySink {
         // (returning `Ok` here would advance the bookmark over data that may
         // never have landed, the silent-data-loss failure mode).
         self.roundtrips.record("job");
-        let job = faucet_common_bigquery::raw::tolerant_get_job(
-            &self.client,
-            self.raw_target(),
-            &self.config.project_id,
-            &job_id,
-            location.as_deref(),
-        )
-        .await
-        .map_err(|e| {
-            (
-                FaucetError::Sink(format!("BigQuery jobs.get failed: {e}")),
-                false,
+        let job = call_once(&self.calls.get(), "job", async {
+            faucet_common_bigquery::raw::tolerant_get_job(
+                &self.client,
+                self.raw_target(),
+                &self.config.project_id,
+                &job_id,
+                location.as_deref(),
             )
-        })?;
+            .await
+            .map_err(|e| FaucetError::Sink(format!("BigQuery jobs.get failed: {e}")))
+        })
+        .await
+        .map_err(|e| (e, false))?;
         if let Some(b) = job
             .statistics
             .as_ref()
@@ -2082,12 +2183,15 @@ impl BigQuerySink {
             // A transaction that aborts inside `jobs.query`'s wait window comes
             // back as an HTTP error rather than a failed job; it committed
             // nothing either, so it is retried the same way.
-            let outcome = match self
-                .client
-                .job()
-                .query(&self.config.project_id, req.clone())
-                .await
-            {
+            let sent = call_once_bq(
+                &self.calls.get(),
+                "query",
+                self.client
+                    .job()
+                    .query(&self.config.project_id, req.clone()),
+            )
+            .await;
+            let outcome = match sent {
                 Ok(resp) => self.await_query_job_classified(resp).await,
                 Err(e) => {
                     let text = e.to_string();
@@ -2104,7 +2208,7 @@ impl BigQuerySink {
                         what, attempt, error = %e,
                         "BigQuery aborted the transaction for a concurrent update; retrying"
                     );
-                    tokio::time::sleep(delay + txn_jitter(delay)).await;
+                    self.calls.wait(delay + txn_jitter(delay)).await?;
                     delay = (delay * 2).min(Duration::from_secs(10));
                     req.request_id = base_id.as_ref().map(|id| format!("{id}-r{attempt}"));
                 }
@@ -2285,8 +2389,14 @@ impl faucet_core::Sink for BigQuerySink {
         &self,
         recorder: std::sync::Arc<faucet_core::observability::RoundtripRecorder>,
     ) {
-        self.roundtrips.install(recorder);
+        self.roundtrips.install(recorder.clone());
+        self.calls.install_recorder(recorder);
     }
+
+    fn set_call_context(&self, ctx: CallContext) {
+        self.calls.install(ctx);
+    }
+
     fn connector_name(&self) -> &'static str {
         "bigquery"
     }
@@ -2295,6 +2405,16 @@ impl faucet_core::Sink for BigQuerySink {
     /// (#528). Advertise the `staging` capability.
     fn supports_staged_load(&self) -> bool {
         true
+    }
+
+    /// Adds what no trait method expresses: a windowed `overwrite.scope`
+    /// (#518) and a staging-free overwrite driven by `_overwrite_staging`.
+    fn capabilities(&self) -> faucet_core::Capabilities {
+        faucet_core::Capabilities::of_sink(self)
+            .to_builder()
+            .scoped_overwrite(true)
+            .direct_overwrite(true)
+            .build()
     }
 
     fn config_schema(&self) -> serde_json::Value {
@@ -2333,11 +2453,15 @@ impl faucet_core::Sink for BigQuerySink {
 
         let result = tokio::time::timeout(
             ctx.timeout,
-            self.client.table().get(
-                &self.config.project_id,
-                &self.config.dataset_id,
-                &self.config.table_id,
-                Some(vec!["tableReference"]),
+            call_once_bq(
+                &self.calls.get(),
+                "control",
+                self.client.table().get(
+                    &self.config.project_id,
+                    &self.config.dataset_id,
+                    &self.config.table_id,
+                    Some(vec!["tableReference"]),
+                ),
             ),
         )
         .await;
@@ -2865,12 +2989,14 @@ impl faucet_core::Sink for BigQuerySink {
 
         self.roundtrips.record("query");
 
-        let resp = self
-            .client
-            .job()
-            .query(&self.config.project_id, req)
-            .await
-            .map_err(|e| FaucetError::Sink(format!("BigQuery token read failed: {e}")))?;
+        let resp = call_once(&self.calls.get(), "query", async {
+            self.client
+                .job()
+                .query(&self.config.project_id, req)
+                .await
+                .map_err(|e| FaucetError::Sink(format!("BigQuery token read failed: {e}")))
+        })
+        .await?;
 
         // The watermark is a single tiny row, so `jobs.query` returns it inline.
         // If BigQuery did not complete the read synchronously, fail safe: a
@@ -3091,8 +3217,14 @@ impl faucet_core::Sink for BigQuerySink {
                 ));
             }
             self.roundtrips.record("load");
-            return crate::load::write_columnar(&self.client, &self.config, &self.gcs_store, batch)
-                .await;
+            return crate::load::write_columnar_in(
+                &self.calls.get(),
+                &self.client,
+                &self.config,
+                &self.gcs_store,
+                batch,
+            )
+            .await;
         }
         // One Parquet load per run; later batches take the row path (SQL-36).
         if self.columnar_loaded.swap(true, Ordering::AcqRel) {
@@ -3111,7 +3243,8 @@ impl faucet_core::Sink for BigQuerySink {
         } else {
             None
         };
-        crate::load::write_columnar_media_with_schema(
+        crate::load::write_columnar_media_in(
+            &self.calls.get(),
             &self.client,
             &self.config,
             self.upload_base(),
@@ -3127,6 +3260,30 @@ impl faucet_core::Sink for BigQuerySink {
 
 #[cfg(test)]
 mod tests {
+    #[tokio::test]
+    async fn call_once_never_resends_under_a_retrying_context() {
+        let fast = std::time::Duration::from_millis(1);
+        let calls = faucet_core::CallContext::new().with_retry(faucet_core::RetryPolicy {
+            max_attempts: 2,
+            base: fast,
+            max: fast,
+            jitter: false,
+            ..Default::default()
+        });
+        let attempts = std::sync::atomic::AtomicUsize::new(0);
+        let err = super::call_once::<(), _>(&calls, "insert", async {
+            attempts.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            Err(faucet_core::FaucetError::RateLimited(fast))
+        })
+        .await
+        .expect_err("the one attempt fails");
+        assert!(
+            matches!(err, faucet_core::FaucetError::RateLimited(_)),
+            "the attempt's own error surfaces: {err:?}"
+        );
+        assert_eq!(attempts.load(std::sync::atomic::Ordering::Relaxed), 1);
+    }
+
     #[test]
     fn concurrent_update_aborts_are_recognised_and_jitter_is_bounded() {
         use gcp_bigquery_client::model::error_proto::ErrorProto;

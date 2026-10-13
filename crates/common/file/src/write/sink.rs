@@ -7,7 +7,7 @@
 use super::writer::FileWriter;
 use faucet_core::check::{CheckContext, CheckReport};
 use faucet_core::observability::RoundtripRecorder;
-use faucet_core::{FaucetError, FileFormat, Sink, WriteMode};
+use faucet_core::{Capabilities, FaucetError, FileFormat, SchemaReport, Sink, WriteMode};
 use serde_json::Value;
 use std::sync::Arc;
 
@@ -34,6 +34,9 @@ pub trait SinkIdentity: Send + Sync {
     /// Install the round-trip recorder the connector's client reports to.
     /// Default: the connector counts nothing.
     fn set_roundtrip_recorder(&self, _recorder: Arc<RoundtripRecorder>) {}
+    /// Install the run's call context (#880) the connector's requests run
+    /// through. Default: the connector has no backend calls.
+    fn set_call_context(&self, _ctx: faucet_core::io::CallContext) {}
 }
 
 /// A [`Sink`] over a [`FileWriter`]: batch writes, flush, the overwrite
@@ -84,6 +87,10 @@ impl Sink for WriterSink {
         self.identity.set_roundtrip_recorder(recorder);
     }
 
+    fn set_call_context(&self, ctx: faucet_core::io::CallContext) {
+        self.identity.set_call_context(ctx);
+    }
+
     async fn check(&self, ctx: &CheckContext) -> Result<CheckReport, FaucetError> {
         self.identity.check(ctx).await
     }
@@ -98,6 +105,23 @@ impl Sink for WriterSink {
 
     fn supported_write_modes(&self) -> &'static [WriteMode] {
         &[WriteMode::Append, WriteMode::Overwrite]
+    }
+
+    /// Derived, plus [`SchemaReport::DropsUnknownFields`] for CSV under
+    /// `csv.on_unknown_field: warn`, whose frozen header drops new fields.
+    fn capabilities(&self) -> Capabilities {
+        let settings = self.writer.settings();
+        let base = Capabilities::of_sink(self);
+        if crate::capabilities::drops_unknown_fields(
+            settings.format,
+            settings.opts.csv.on_unknown_field,
+        ) {
+            base.to_builder()
+                .schema_report(SchemaReport::DropsUnknownFields)
+                .build()
+        } else {
+            base
+        }
     }
 
     fn is_overwrite(&self) -> bool {
@@ -187,6 +211,9 @@ macro_rules! delegate_sink {
             ) {
                 $crate::__private::Sink::set_roundtrip_recorder(&self.$field, recorder)
             }
+            fn set_call_context(&self, ctx: $crate::__private::CallContext) {
+                $crate::__private::Sink::set_call_context(&self.$field, ctx)
+            }
             async fn check(
                 &self,
                 ctx: &$crate::__private::CheckContext,
@@ -204,6 +231,14 @@ macro_rules! delegate_sink {
             }
             fn supported_write_modes(&self) -> &'static [$crate::__private::WriteMode] {
                 $crate::__private::Sink::supported_write_modes(&self.$field)
+            }
+            fn capabilities(&self) -> $crate::__private::Capabilities {
+                let caps = $crate::__private::Sink::capabilities(&self.$field);
+                if cfg!(feature = "arrow") {
+                    caps
+                } else {
+                    caps.to_builder().columnar(false).build()
+                }
             }
             fn is_overwrite(&self) -> bool {
                 $crate::__private::Sink::is_overwrite(&self.$field)

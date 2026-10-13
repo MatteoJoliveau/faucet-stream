@@ -7,6 +7,7 @@
 use crate::config::PipelineConfig;
 use crate::expand::{ExpandedNode, expand};
 use crate::serve::error::ServeError;
+use faucet_core::resolve::{ReferencePolicy, ResourceKind};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
@@ -36,19 +37,69 @@ impl BodyOrigin {
     }
 }
 
-/// Source kinds whose query can reach host files; `faucet serve` sandboxes them.
-pub const SANDBOXED_SOURCE_KINDS: &[&str] = &["duckdb", "sqlite"];
-/// Sink kinds `faucet serve` sandboxes.
-pub const SANDBOXED_SINK_KINDS: &[&str] = &["duckdb"];
+/// The sandbox switches (fields annotated `x-faucet-sandbox`, see
+/// [`faucet_core::resolve::sandbox_fields`]) a connector's config schema
+/// declares — empty for a connector that has none or an unknown kind. Read
+/// from the same schema `faucet schema` prints, so a plugin connector that
+/// declares one is confined like a built-in.
+pub fn sandbox_fields(is_source: bool, kind: &str) -> std::sync::Arc<[String]> {
+    type Cache =
+        std::sync::RwLock<std::collections::HashMap<(bool, String), std::sync::Arc<[String]>>>;
+    static CACHE: std::sync::OnceLock<Cache> = std::sync::OnceLock::new();
+    let cache = CACHE.get_or_init(Default::default);
+    let key = (is_source, kind.to_string());
+    if let Some(hit) = cache.read().ok().and_then(|c| c.get(&key).cloned()) {
+        return hit;
+    }
+    let schema = if is_source {
+        crate::registry::source_schema(kind)
+    } else {
+        crate::registry::sink_schema(kind)
+    };
+    let Ok(schema) = schema else {
+        return std::sync::Arc::from(Vec::new());
+    };
+    let fields: std::sync::Arc<[String]> = faucet_core::resolve::sandbox_fields(&schema).into();
+    if let Ok(mut c) = cache.write() {
+        c.insert(key, std::sync::Arc::clone(&fields));
+    }
+    fields
+}
 
-fn force_sandbox(config: &mut Value) {
+/// Whether `faucet serve` confines a source of this kind.
+pub fn source_is_sandboxed(kind: &str) -> bool {
+    !sandbox_fields(true, kind).is_empty()
+}
+
+/// Whether `faucet serve` confines a sink of this kind.
+pub fn sink_is_sandboxed(kind: &str) -> bool {
+    !sandbox_fields(false, kind).is_empty()
+}
+
+fn force_fields(config: &mut Value, fields: &[String]) {
     if let Value::Object(map) = config {
-        map.insert("sandbox".into(), Value::Bool(true));
+        for f in fields {
+            map.insert(f.clone(), Value::Bool(true));
+        }
     }
 }
 
-fn force_sandbox_override(config: &mut Option<Value>) {
-    force_sandbox(config.get_or_insert_with(|| Value::Object(Default::default())));
+fn force_source(config: &mut Value, kind: &str) {
+    force_fields(config, &sandbox_fields(true, kind));
+}
+
+fn force_sink(config: &mut Value, kind: &str) {
+    force_fields(config, &sandbox_fields(false, kind));
+}
+
+fn force_override(config: &mut Option<Value>, is_source: bool, kind: &str) {
+    let fields = sandbox_fields(is_source, kind);
+    if !fields.is_empty() {
+        force_fields(
+            config.get_or_insert_with(|| Value::Object(Default::default())),
+            &fields,
+        );
+    }
 }
 
 fn template_kind<'a>(
@@ -73,23 +124,15 @@ fn template_kind<'a>(
 /// snapshot, partition bound probes, `verify.destination` and DLQ sinks are
 /// all covered; a submitted `sandbox: false` is overwritten.
 pub fn confine_sql(cfg: &mut PipelineConfig) {
-    let source_kind = |k: &str| SANDBOXED_SOURCE_KINDS.contains(&k);
-    let sink_kind = |k: &str| SANDBOXED_SINK_KINDS.contains(&k);
     let p = &mut cfg.pipeline;
     for spec in p.source.iter_mut().chain(p.sources.values_mut()) {
-        if source_kind(&spec.kind) {
-            force_sandbox(&mut spec.config);
-        }
+        force_source(&mut spec.config, &spec.kind);
     }
     for spec in p.sink.iter_mut().chain(p.sinks.values_mut()) {
-        if sink_kind(&spec.kind) {
-            force_sandbox(&mut spec.config);
-        }
+        force_sink(&mut spec.config, &spec.kind);
     }
-    if let Some(d) = p.dlq.as_mut()
-        && sink_kind(&d.sink.kind)
-    {
-        force_sandbox(&mut d.sink.config);
+    if let Some(d) = p.dlq.as_mut() {
+        force_sink(&mut d.sink.config, &d.sink.kind);
     }
     let (sources, source, sinks, sink) = (&p.sources, &p.source, &p.sinks, &p.sink);
     for node in p.nodes.values_mut() {
@@ -99,11 +142,11 @@ pub fn confine_sql(cfg: &mut PipelineConfig) {
                 kind,
                 config,
             } => {
-                let k = kind
+                if let Some(k) = kind
                     .as_deref()
-                    .or_else(|| template_kind(sources, source, template.as_deref()));
-                if k.is_some_and(source_kind) {
-                    force_sandbox_override(config);
+                    .or_else(|| template_kind(sources, source, template.as_deref()))
+                {
+                    force_override(config, true, k);
                 }
             }
             crate::config::NodeSpec::Sink {
@@ -111,11 +154,11 @@ pub fn confine_sql(cfg: &mut PipelineConfig) {
                 kind,
                 config,
             } => {
-                let k = kind
+                if let Some(k) = kind
                     .as_deref()
-                    .or_else(|| template_kind(sinks, sink, template.as_deref()));
-                if k.is_some_and(sink_kind) {
-                    force_sandbox_override(config);
+                    .or_else(|| template_kind(sinks, sink, template.as_deref()))
+                {
+                    force_override(config, false, k);
                 }
             }
             _ => {}
@@ -134,30 +177,20 @@ pub fn confine_sql(cfg: &mut PipelineConfig) {
         ];
         for (over, templates, legacy, is_source) in rows {
             let Some(over) = over else { continue };
-            let k = over
+            if let Some(k) = over
                 .kind
                 .as_deref()
-                .or_else(|| template_kind(templates, legacy, over.r#ref.as_deref()));
-            if k.is_some_and(|k| {
-                if is_source {
-                    source_kind(k)
-                } else {
-                    sink_kind(k)
-                }
-            }) {
-                force_sandbox_override(&mut over.config);
+                .or_else(|| template_kind(templates, legacy, over.r#ref.as_deref()))
+            {
+                force_override(&mut over.config, is_source, k);
             }
         }
-        if let Some(Some(d)) = row.dlq.as_mut()
-            && sink_kind(&d.sink.kind)
-        {
-            force_sandbox(&mut d.sink.config);
+        if let Some(Some(d)) = row.dlq.as_mut() {
+            force_sink(&mut d.sink.config, &d.sink.kind);
         }
     }
-    if let Some(r) = cfg.replication.as_mut()
-        && source_kind(&r.snapshot.source.kind)
-    {
-        force_sandbox(&mut r.snapshot.source.config);
+    if let Some(r) = cfg.replication.as_mut() {
+        force_source(&mut r.snapshot.source.config, &r.snapshot.source.kind);
     }
     let probes = cfg
         .partition
@@ -165,36 +198,23 @@ pub fn confine_sql(cfg: &mut PipelineConfig) {
         .chain(cfg.matrix.iter_mut().filter_map(|r| r.partition.as_mut()))
         .filter_map(crate::partition::PartitionSpec::probe_mut);
     for probe in probes {
-        if source_kind(&probe.from_source.kind) {
-            force_sandbox(&mut probe.from_source.config);
-        }
+        force_source(&mut probe.from_source.config, &probe.from_source.kind);
     }
-    if let Some(dest) = cfg.verify.as_mut().and_then(|v| v.destination.as_mut())
-        && source_kind(&dest.kind)
-    {
-        force_sandbox(&mut dest.config);
+    if let Some(dest) = cfg.verify.as_mut().and_then(|v| v.destination.as_mut()) {
+        force_source(&mut dest.config, &dest.kind);
     }
 }
 
 /// [`confine_sql`] over expanded rows: the merged configs each row builds.
 pub fn confine_sql_nodes(nodes: &mut [ExpandedNode]) {
     for n in nodes {
-        if SANDBOXED_SOURCE_KINDS.contains(&n.source.kind.as_str()) {
-            force_sandbox(&mut n.source.config);
-        }
-        if SANDBOXED_SINK_KINDS.contains(&n.sink.kind.as_str()) {
-            force_sandbox(&mut n.sink.config);
-        }
-        if let Some(d) = n.dlq.as_mut()
-            && SANDBOXED_SINK_KINDS.contains(&d.sink.kind.as_str())
-        {
-            force_sandbox(&mut d.sink.config);
+        force_source(&mut n.source.config, &n.source.kind);
+        force_sink(&mut n.sink.config, &n.sink.kind);
+        if let Some(d) = n.dlq.as_mut() {
+            force_sink(&mut d.sink.config, &d.sink.kind);
         }
     }
 }
-
-/// Connector kinds that spawn a program named in their config.
-pub const SUBPROCESS_CONNECTOR_KINDS: &[&str] = &["singer"];
 
 /// Environment variables `faucet serve` reads its own credentials from. A
 /// loaded config can never resolve them through `${env:}` / `${secret:}`.
@@ -608,43 +628,61 @@ fn local_path(value: &str) -> Option<&str> {
 /// values come from the clock or the config itself, never from records.
 const STATIC_PATH_TOKENS: &[&str] = &["now", "backfill", "partition"];
 
-fn check_local_paths(config: &Value, access: Access, caller: bool, found: &mut Vec<String>) {
+/// What a screening pass refused: paths that reach the server's credentials
+/// or a system tree, and resources the reference policy does not allow.
+#[derive(Default)]
+struct Findings {
+    protected: Vec<String>,
+    policy: Vec<String>,
+}
+
+/// Whether a local path a caller supplied takes a value from records.
+fn takes_record_value(path: &str) -> bool {
+    use crate::interpolate::{Directive, iter_directives};
+    iter_directives(path).any(|(_, d)| match d {
+        Directive::Deferred { id, .. } => !STATIC_PATH_TOKENS.contains(&id),
+        Directive::LoadTime { .. } => false,
+    })
+}
+
+const RECORD_PATH: &str = "(a local path in a submitted config may not take a value from records)";
+
+fn check_local_paths(
+    config: &Value,
+    access: Access,
+    caller: bool,
+    policy: Option<&ReferencePolicy>,
+    found: &mut Findings,
+) {
     fn walk(
         v: &Value,
         under_path_key: bool,
         access: Access,
         caller: bool,
-        found: &mut Vec<String>,
+        policy: Option<&ReferencePolicy>,
+        found: &mut Findings,
     ) {
         match v {
             Value::String(s) if under_path_key => {
                 let Some(path) = local_path(s) else {
                     return;
                 };
-                if caller {
-                    use crate::interpolate::{Directive, iter_directives};
-                    let dynamic = iter_directives(path).any(|(_, d)| match d {
-                        Directive::Deferred { id, .. } => !STATIC_PATH_TOKENS.contains(&id),
-                        Directive::LoadTime { .. } => false,
-                    });
-                    if dynamic {
-                        found.push(format!(
-                            "{s} (a local path in a submitted config may not take a value \
-                             from records)"
-                        ));
-                        return;
-                    }
+                if caller && takes_record_value(path) {
+                    found.protected.push(format!("{s} {RECORD_PATH}"));
+                    return;
                 }
                 if data_path_is_protected(path, access) {
-                    found.push(s.clone());
+                    found.protected.push(s.clone());
+                } else if let Some(Err(e)) = policy.map(|p| p.check_path(path)) {
+                    found.policy.push(format!("{s} ({})", e.reason));
                 }
             }
             Value::Array(items) => items
                 .iter()
-                .for_each(|i| walk(i, under_path_key, access, caller, found)),
+                .for_each(|i| walk(i, under_path_key, access, caller, policy, found)),
             Value::Object(map) => {
                 for (k, child) in map {
-                    walk(child, is_path_key(k), access, caller, found);
+                    walk(child, is_path_key(k), access, caller, policy, found);
                 }
             }
             _ => {}
@@ -656,7 +694,55 @@ fn check_local_paths(config: &Value, access: Access, caller: bool, found: &mut V
         },
         Access::Write => Access::Write,
     };
-    walk(config, false, access, caller, found);
+    walk(config, false, access, caller, policy, found);
+}
+
+/// Check every resource a `kind` connector's `config` names through its
+/// schema's `x-faucet-resource` annotations (#881): a local path against the
+/// server's credential files and system trees, and every resource against the
+/// reference policy.
+fn check_connector(
+    kind: &str,
+    config: &Value,
+    access: Access,
+    caller: bool,
+    policy: Option<&ReferencePolicy>,
+    found: &mut Findings,
+) {
+    if LOCAL_PATH_KINDS.contains(&kind) {
+        check_local_paths(config, access, caller, policy, found);
+    }
+    for r in crate::serve::references::connector_resources(kind, config) {
+        if r.kind == ResourceKind::Path
+            && let Some(path) = local_path(&r.value)
+        {
+            if caller && takes_record_value(path) {
+                found.protected.push(format!("{} {RECORD_PATH}", r.value));
+                continue;
+            }
+            if data_path_is_protected(path, access) {
+                found.protected.push(r.value.clone());
+                continue;
+            }
+        }
+        if caller
+            && (r.kind == ResourceKind::Url
+                || (r.kind == ResourceKind::Path && local_path(&r.value).is_none()))
+            && faucet_core::resolve::url_hosts(&r.value)
+                .iter()
+                .any(|h| takes_record_value(h))
+        {
+            found.policy.push(format!(
+                "{kind}{}: {} (a URL host in a submitted config may not take a value from \
+                 records — it cannot be checked)",
+                r.pointer, r.value
+            ));
+            continue;
+        }
+        if let Some(Err(e)) = policy.map(|p| p.check(&r)) {
+            found.policy.push(format!("{} ({})", r.value, e.reason));
+        }
+    }
 }
 
 /// The access a document position implies: under a `sink` / `sinks` / `dlq` /
@@ -676,7 +762,17 @@ fn access_under(key: &str, inherited: Access) -> Access {
 /// and the file-backed relations of a `sql` transform — that would read or
 /// write a system tree or a server credential file.
 pub fn server_data_paths(doc: &Value, caller: bool) -> Vec<String> {
-    fn walk(v: &Value, access: Access, caller: bool, found: &mut Vec<String>) {
+    data_path_findings(doc, caller, None).protected
+}
+
+fn data_path_findings(doc: &Value, caller: bool, policy: Option<&ReferencePolicy>) -> Findings {
+    fn walk(
+        v: &Value,
+        access: Access,
+        caller: bool,
+        policy: Option<&ReferencePolicy>,
+        found: &mut Findings,
+    ) {
         match v {
             Value::Object(map) => {
                 let access = match map.get("kind").and_then(Value::as_str) {
@@ -685,27 +781,37 @@ pub fn server_data_paths(doc: &Value, caller: bool) -> Vec<String> {
                     _ => access,
                 };
                 match (map.get("type").and_then(Value::as_str), map.get("config")) {
-                    (Some(t), Some(cfg)) if LOCAL_PATH_KINDS.contains(&t) => {
-                        check_local_paths(cfg, access, caller, found);
-                    }
+                    (Some(t), Some(cfg)) => check_connector(t, cfg, access, caller, policy, found),
                     (Some("csv" | "jsonl"), None) => {
                         if let Some(path) = map.get("path") {
                             let wrapped = serde_json::json!({ "path": path });
-                            check_local_paths(&wrapped, access, caller, found);
+                            check_local_paths(&wrapped, access, caller, policy, found);
                         }
                     }
                     _ => {}
                 }
                 for (k, c) in map {
-                    walk(c, access_under(k, access), caller, found);
+                    walk(c, access_under(k, access), caller, policy, found);
                 }
             }
-            Value::Array(items) => items.iter().for_each(|c| walk(c, access, caller, found)),
+            Value::Array(items) => items
+                .iter()
+                .for_each(|c| walk(c, access, caller, policy, found)),
             _ => {}
         }
     }
-    let mut found = Vec::new();
-    walk(doc, Access::Read { recursive: false }, caller, &mut found);
+    let mut found = Findings::default();
+    walk(
+        doc,
+        Access::Read { recursive: false },
+        caller,
+        policy,
+        &mut found,
+    );
+    for list in [&mut found.protected, &mut found.policy] {
+        let mut seen = std::collections::HashSet::new();
+        list.retain(|f| seen.insert(f.clone()));
+    }
     found
 }
 
@@ -808,6 +914,58 @@ fn override_connectors(cfg: &PipelineConfig) -> Vec<(String, Value, Access)> {
     out
 }
 
+/// Refuse a server-local path a request names outside a config (a DLQ
+/// location): like a connector path in a submitted config, it may not reach a
+/// system tree or the server's credentials, and must pass the caller
+/// reference policy — for a tenant, confined to the tenant's path root.
+/// `write` is a path the request writes, archives or deletes.
+pub fn refuse_request_path(
+    field: &str,
+    path: &str,
+    write: bool,
+    tenant: Option<&str>,
+) -> Result<(), ServeError> {
+    let policy = crate::serve::references::installed().for_origin(
+        BodyOrigin::Caller {
+            allow_subprocess: false,
+        },
+        tenant,
+    );
+    refuse_request_path_with(field, path, write, tenant.is_some(), &policy)
+}
+
+/// [`refuse_request_path`] under an explicit caller policy.
+pub fn refuse_request_path_with(
+    field: &str,
+    path: &str,
+    write: bool,
+    for_tenant: bool,
+    policy: &ReferencePolicy,
+) -> Result<(), ServeError> {
+    let local = local_path(path).unwrap_or(path);
+    let protected = data_path_is_protected(local, Access::Read { recursive: true })
+        || (write && data_path_is_protected(local, Access::Write));
+    if protected {
+        return Err(ServeError::Forbidden(format!(
+            "`{field}` ({path}) reaches a location a request to `faucet serve` may not touch — \
+             a system tree ({}) or a file holding the server's own credentials",
+            SYSTEM_DIRS.join(", ")
+        )));
+    }
+    policy.check_path(path).map_err(|e| {
+        ServeError::Forbidden(format!(
+            "`{field}` ({path}) is not allowed under the server's reference policy: {}; the \
+             operator can allow it with --allow-path-root{}",
+            e.reason,
+            if for_tenant {
+                " (a tenant is confined to --tenant-path-root/<tenant>)"
+            } else {
+                ""
+            }
+        ))
+    })
+}
+
 /// Refuse a config whose local-file connectors, state store or DLQ point at
 /// a system tree or a file the server keeps its credentials in. Run it before
 /// anything in the config executes (bound probes, discovery) and again over
@@ -817,15 +975,27 @@ pub fn refuse_server_paths(
     nodes: &[ExpandedNode],
     origin: BodyOrigin,
 ) -> Result<(), ServeError> {
+    let policy = crate::serve::references::installed().for_origin(origin, None);
+    refuse_server_paths_with(cfg, nodes, origin, &policy)
+}
+
+/// [`refuse_server_paths`] under an explicit reference policy (#881): every
+/// path, URL and command a connector names through an annotated schema field
+/// must also be allowed by `policy`.
+pub fn refuse_server_paths_with(
+    cfg: &PipelineConfig,
+    nodes: &[ExpandedNode],
+    origin: BodyOrigin,
+    policy: &ReferencePolicy,
+) -> Result<(), ServeError> {
     let caller = matches!(origin, BodyOrigin::Caller { .. });
+    let policy = Some(policy);
     let mut found = match serde_json::to_value(cfg) {
-        Ok(doc) => server_data_paths(&doc, caller),
+        Ok(doc) => data_path_findings(&doc, caller, policy),
         Err(e) => return Err(ServeError::Internal(format!("serializing config: {e}"))),
     };
     let mut check = |kind: &str, config: &Value, access: Access| {
-        if LOCAL_PATH_KINDS.contains(&kind) {
-            check_local_paths(config, access, caller, &mut found);
-        }
+        check_connector(kind, config, access, caller, policy, &mut found);
     };
     let read = Access::Read { recursive: false };
     for (kind, config, access) in override_connectors(cfg) {
@@ -841,26 +1011,37 @@ pub fn refuse_server_paths(
             check(&d.sink.kind, &d.sink.config, Access::Write);
         }
     }
-    if found.is_empty() {
-        return Ok(());
+    for list in [&mut found.protected, &mut found.policy] {
+        list.sort();
+        list.dedup();
     }
-    found.sort();
-    found.dedup();
-    Err(ServeError::Forbidden(format!(
-        "the config reads or writes local paths a config loaded by `faucet serve` may not \
-         touch — system trees ({}) or files holding the server's own credentials: {}",
-        SYSTEM_DIRS.join(", "),
-        found.join(", ")
-    )))
+    if !found.protected.is_empty() {
+        return Err(ServeError::Forbidden(format!(
+            "the config reads or writes local paths a config loaded by `faucet serve` may not \
+             touch — system trees ({}) or files holding the server's own credentials: {}",
+            SYSTEM_DIRS.join(", "),
+            found.protected.join(", ")
+        )));
+    }
+    if !found.policy.is_empty() {
+        return Err(ServeError::Forbidden(format!(
+            "the config names resources a submitted config may not reach under the server's \
+             reference policy: {}; the operator can allow them with --allow-path-root / \
+             --allow-url-host / --allow-url-scheme, or register the pipeline as a template",
+            found.policy.join(", ")
+        )));
+    }
+    Ok(())
 }
 
-/// The subprocess connector kinds `doc` names anywhere as a `type:`.
+/// The connector kinds `doc` names anywhere as a `type:` whose schema declares
+/// a `command` field (`x-faucet-resource: command`): they run a program.
 pub fn subprocess_kinds_in(doc: &Value) -> std::collections::BTreeSet<String> {
     fn walk(v: &Value, out: &mut std::collections::BTreeSet<String>) {
         match v {
             Value::Object(map) => {
                 if let Some(Value::String(t)) = map.get("type")
-                    && SUBPROCESS_CONNECTOR_KINDS.contains(&t.as_str())
+                    && crate::serve::references::runs_program(t)
                 {
                     out.insert(t.clone());
                 }
@@ -876,16 +1057,85 @@ pub fn subprocess_kinds_in(doc: &Value) -> std::collections::BTreeSet<String> {
 }
 
 /// Refuse a submitted document that reads the server's own credentials.
+/// The reference resolver under an open policy: only the server's own
+/// credentials are out of reach.
 pub fn refuse_server_secrets(doc: &Value) -> Result<(), ServeError> {
+    screen_references(doc, &ReferencePolicy::open())
+}
+
+/// Refuse a document whose `${env:}` / `${secret:}` / `${file:}` /
+/// secret-manager references read the server's own credentials, or reach
+/// anything `policy` does not allow (#881).
+pub fn screen_references(doc: &Value, policy: &ReferencePolicy) -> Result<(), ServeError> {
+    screen_references_except(doc, policy, &std::collections::BTreeSet::new())
+}
+
+/// The `${…}` load-time references in `doc`, as written.
+fn load_time_tokens(doc: &Value) -> std::collections::BTreeSet<String> {
+    use crate::interpolate::{Directive, iter_directives};
+    let mut out = std::collections::BTreeSet::new();
+    for_each_string(doc, &mut |s| {
+        for (token, dir) in iter_directives(s) {
+            if matches!(dir, Directive::LoadTime { .. }) {
+                out.insert(token.to_string());
+            }
+        }
+    });
+    out
+}
+
+fn screen_references_except(
+    doc: &Value,
+    policy: &ReferencePolicy,
+    skip: &std::collections::BTreeSet<String>,
+) -> Result<(), ServeError> {
+    use crate::interpolate::{Directive, iter_directives};
     let refs = server_secret_refs(doc);
-    if refs.is_empty() {
+    if !refs.is_empty() {
+        return Err(ServeError::Forbidden(format!(
+            "the config references the server's own credentials ({}); a config loaded by \
+             `faucet serve` may not read them",
+            refs.join(", ")
+        )));
+    }
+    let mut refused = std::collections::BTreeSet::new();
+    for_each_string(doc, &mut |s| {
+        for (token, dir) in iter_directives(s) {
+            let Directive::LoadTime { prefix, body } = dir else {
+                continue;
+            };
+            if skip.contains(token) {
+                continue;
+            }
+            let checked = match prefix {
+                "env" | "secret" => policy.check_env(body),
+                "file" => policy.check_file(body),
+                p if crate::secrets::SECRET_SCHEMES.contains(&p) => policy.check_secret(p, body),
+                _ => Ok(()),
+            };
+            if let Err(e) = checked {
+                refused.insert(format!("{token}: {}", e.reason));
+            }
+        }
+    });
+    if refused.is_empty() {
         return Ok(());
     }
     Err(ServeError::Forbidden(format!(
-        "the config references the server's own credentials ({}); a config loaded by \
-         `faucet serve` may not read them",
-        refs.join(", ")
+        "the config references what a submitted config may not read under the server's \
+         reference policy ({}); the operator can allow them with --allow-env / \
+         --allow-path-root / --allow-secret-scheme, or register the pipeline as a template",
+        refused.into_iter().collect::<Vec<_>>().join("; ")
     )))
+}
+
+/// Screen a caller-supplied document the way the loader does: its
+/// references and its subprocess connectors, under the installed reference
+/// policy for `origin`.
+pub fn screen_document(doc: &Value, origin: BodyOrigin) -> Result<(), ServeError> {
+    let policy = crate::serve::references::installed().for_origin(origin, None);
+    screen_subprocess(doc, &policy, false)?;
+    screen_references(doc, &policy)
 }
 
 /// Refuse subprocess connectors in a document the caller supplied, unless the
@@ -895,10 +1145,52 @@ pub fn refuse_subprocess(
     origin: BodyOrigin,
     for_tenant: bool,
 ) -> Result<(), ServeError> {
-    let BodyOrigin::Caller { allow_subprocess } = origin else {
+    let policy = crate::serve::references::installed().for_origin(origin, for_tenant.then_some(""));
+    screen_subprocess(doc, &policy, for_tenant)
+}
+
+/// Keys of a shared auth provider's config that name an endpoint it calls.
+const AUTH_URL_KEYS: &[&str] = &["token_url", "url", "authorization_url"];
+
+/// Refuse a shared auth provider (`auth:` catalog) whose token endpoint the
+/// reference policy does not allow.
+pub fn screen_auth_catalog(
+    cfg: &PipelineConfig,
+    policy: &ReferencePolicy,
+) -> Result<(), ServeError> {
+    let mut refused = Vec::new();
+    for (name, spec) in cfg.auth.iter().flatten() {
+        let Some(config) = spec.get("config") else {
+            continue;
+        };
+        for key in AUTH_URL_KEYS {
+            if let Some(Value::String(url)) = config.get(*key)
+                && let Err(e) = policy.check_url(url)
+            {
+                refused.push(format!("auth.{name}.config.{key}: {url} ({})", e.reason));
+            }
+        }
+    }
+    if refused.is_empty() {
         return Ok(());
-    };
-    if allow_subprocess && !for_tenant {
+    }
+    refused.sort();
+    Err(ServeError::Forbidden(format!(
+        "the config's auth providers call endpoints a submitted config may not reach under \
+         the server's reference policy: {}; the operator can allow them with \
+         --allow-url-host / --allow-url-scheme",
+        refused.join(", ")
+    )))
+}
+
+/// Refuse the connectors in `doc` that run a program (#881: a `command`
+/// field in their schema) unless `policy` allows it.
+pub fn screen_subprocess(
+    doc: &Value,
+    policy: &ReferencePolicy,
+    for_tenant: bool,
+) -> Result<(), ServeError> {
+    if policy.allows_subprocess() {
         return Ok(());
     }
     let kinds = subprocess_kinds_in(doc);
@@ -1098,6 +1390,33 @@ pub async fn load_submission_scoped(
     origin: BodyOrigin,
     tenant: Option<std::sync::Arc<TenantScope>>,
 ) -> Result<LoadedSubmission, ServeError> {
+    let references = crate::serve::references::installed();
+    load_submission_with(
+        body,
+        format,
+        default_base,
+        policy,
+        origin,
+        tenant,
+        &references,
+    )
+    .await
+}
+
+/// [`load_submission_scoped`] under an explicit reference policy (#881):
+/// every `${env:}` / `${file:}` / `${secret:}` / secret-manager reference and
+/// every path, URL and command a connector names is resolved through
+/// `references` for the body's origin and tenant.
+pub async fn load_submission_with(
+    body: &str,
+    format: ConfigFormat,
+    default_base: Option<&Value>,
+    policy: Option<&ServerPolicy>,
+    origin: BodyOrigin,
+    tenant: Option<std::sync::Arc<TenantScope>>,
+    references: &crate::serve::references::ServeReferencePolicy,
+) -> Result<LoadedSubmission, ServeError> {
+    let refs = references.for_origin(origin, tenant.as_deref().map(|t| t.values.id.as_str()));
     // 1. Parse to a Value per the declared format.
     let mut submitted: Value = match format {
         ConfigFormat::Yaml => serde_yaml::from_str(body)
@@ -1106,7 +1425,7 @@ pub async fn load_submission_scoped(
             .map_err(|e| ServeError::BadConfig(format!("invalid JSON: {e}")))?,
     };
 
-    refuse_server_secrets(&submitted)?;
+    screen_references(&submitted, &refs)?;
 
     // 2. ${env}/${file}/${secret} interpolation against the server's env/fs,
     // resolved INTO the parsed tree (post-parse) so a resolved value can never
@@ -1146,8 +1465,9 @@ pub async fn load_submission_scoped(
         details: None,
     })?;
 
-    refuse_subprocess(&merged, origin, tenant.is_some())?;
-    refuse_server_secrets(&merged)?;
+    screen_subprocess(&merged, &refs, tenant.is_some())?;
+    let operator_tokens = default_base.map(load_time_tokens).unwrap_or_default();
+    screen_references_except(&merged, &refs, &operator_tokens)?;
 
     // 4. Version gate + structural-ref resolution.
     let mut cfg = PipelineConfig::from_value(merged).map_err(|e| ServeError::Unprocessable {
@@ -1188,6 +1508,8 @@ pub async fn load_submission_scoped(
         .await
         .map_err(resolution_error)?;
 
+    screen_auth_catalog(&cfg, &refs)?;
+
     // 5a. A tenant's connections join the auth catalog (#709), after secrets
     // resolution so an unsealed credential is never scanned for directives.
     if let Some(t) = &tenant {
@@ -1203,7 +1525,7 @@ pub async fn load_submission_scoped(
     // materializes into one row per object at trigger time. This is the one
     // network call in the submit path, so it runs under a hard timeout — a
     // hung upstream describe endpoint must not wedge `POST /v1/runs`.
-    refuse_server_paths(&cfg, &[], origin)?;
+    refuse_server_paths_with(&cfg, &[], origin, &refs)?;
     let auth =
         build_catalog(tenant.as_deref(), &cfg).map_err(|e| ServeError::BadConfig(e.to_string()))?;
     tokio::time::timeout(
@@ -1241,7 +1563,7 @@ pub async fn load_submission_scoped(
             message: e.to_string(),
             details: None,
         })?;
-        refuse_server_paths(&cfg, &[], origin)?;
+        refuse_server_paths_with(&cfg, &[], origin, &refs)?;
         return Ok(LoadedSubmission {
             cfg,
             nodes: Vec::new(),
@@ -1258,7 +1580,7 @@ pub async fn load_submission_scoped(
         confine_sql_nodes(&mut nodes);
     }
 
-    refuse_server_paths(&cfg, &nodes, origin)?;
+    refuse_server_paths_with(&cfg, &nodes, origin, &refs)?;
 
     if let Some(t) = &tenant {
         t.check_refs(&cfg, &nodes)?;
@@ -1271,6 +1593,81 @@ pub async fn load_submission_scoped(
 mod tests {
     use super::*;
 
+    /// A path a request names directly (a DLQ location) is held to the
+    /// caller policy, the system trees and a tenant's root.
+    #[test]
+    fn a_request_path_is_screened_like_a_connector_path() {
+        let base = tempfile::tempdir().unwrap();
+        let tenants = base.path().join("tenants");
+        std::fs::create_dir_all(tenants.join("acme")).unwrap();
+        std::fs::create_dir_all(tenants.join("other")).unwrap();
+        let args = crate::cli::ReferenceArgs {
+            allow_path_root: vec![base.path().to_path_buf()],
+            tenant_path_root: Some(tenants.clone()),
+            ..Default::default()
+        };
+        let refs = crate::serve::references::ServeReferencePolicy::from_args(&args).unwrap();
+        let caller = BodyOrigin::Caller {
+            allow_subprocess: false,
+        };
+        let acme = refs.for_origin(caller, Some("acme"));
+        let own = tenants.join("acme/dlq.jsonl").display().to_string();
+        let theirs = tenants.join("other/dlq.jsonl").display().to_string();
+        assert!(refuse_request_path_with("from", &own, true, true, &acme).is_ok());
+        let err = refuse_request_path_with("from", &theirs, false, true, &acme).unwrap_err();
+        assert!(
+            matches!(&err, ServeError::Forbidden(m) if m.contains("`from`") && m.contains("--tenant-path-root")),
+            "{err:?}"
+        );
+        let open = ReferencePolicy::open();
+        for bad in ["/proc/self/environ", "/sys/kernel", "/dev/sda"] {
+            let err = refuse_request_path_with("location", bad, false, false, &open).unwrap_err();
+            assert!(
+                matches!(&err, ServeError::Forbidden(m) if m.contains("system tree")),
+                "{bad}"
+            );
+        }
+        let operator = refs.for_origin(caller, None);
+        let outside = "/var/tmp-faucet-not-a-root/dlq.jsonl";
+        let err =
+            refuse_request_path_with("location", outside, true, false, &operator).unwrap_err();
+        assert!(
+            matches!(&err, ServeError::Forbidden(m) if m.contains("--allow-path-root") && !m.contains("tenant")),
+            "{err:?}"
+        );
+        assert!(refuse_request_path("location", "/etc/shadow", true, None).is_err());
+    }
+
+    /// The sandbox switches come from the connector's schema (#876).
+    #[cfg(all(feature = "source-sqlite", feature = "sink-sqlite"))]
+    #[test]
+    fn sandboxed_kinds_are_read_from_the_schema() {
+        assert_eq!(&*sandbox_fields(true, "sqlite"), &["sandbox".to_string()]);
+        assert!(source_is_sandboxed("sqlite"));
+        assert!(
+            !sink_is_sandboxed("sqlite"),
+            "the sqlite sink runs no caller SQL"
+        );
+        assert!(!source_is_sandboxed("no-such-kind"));
+        let mut cfg = json!({});
+        force_override_value(&mut cfg);
+        assert!(cfg.as_object().unwrap().is_empty());
+    }
+
+    fn force_override_value(cfg: &mut Value) {
+        let mut opt = Some(cfg.clone());
+        force_override(&mut opt, true, "no-such-kind");
+        *cfg = opt.unwrap();
+        let mut none = None;
+        force_override(&mut none, true, "no-such-kind");
+        assert!(none.is_none(), "an unconfined kind gets no override block");
+    }
+
+    #[cfg(all(
+        feature = "source-duckdb",
+        feature = "sink-duckdb",
+        feature = "source-sqlite"
+    ))]
     #[test]
     fn every_sql_connector_position_is_sandboxed() {
         let doc = json!({
@@ -1344,6 +1741,11 @@ mod tests {
         assert!(on(&b.dlq.as_ref().unwrap().sink.config));
     }
 
+    #[cfg(all(
+        feature = "source-duckdb",
+        feature = "sink-duckdb",
+        feature = "source-sqlite"
+    ))]
     #[test]
     fn topology_nodes_fan_out_sources_and_the_mirror_snapshot_are_sandboxed() {
         let topo = json!({
@@ -1418,6 +1820,11 @@ mod tests {
         assert!(!BodyOrigin::ServerFile.confines_sql());
     }
 
+    #[cfg(all(
+        feature = "source-duckdb",
+        feature = "sink-duckdb",
+        feature = "source-sqlite"
+    ))]
     #[tokio::test]
     async fn a_loaded_submission_is_sandboxed_unless_it_came_from_a_server_file() {
         let body = json!({
@@ -1845,6 +2252,11 @@ schedule:
         assert!(refuse_server_paths(&fine, &[], caller).is_ok());
     }
 
+    #[cfg(all(
+        feature = "source-duckdb",
+        feature = "sink-duckdb",
+        feature = "source-sqlite"
+    ))]
     #[test]
     fn bound_probes_and_the_verify_destination_are_sandboxed() {
         let mut cfg = cfg_of(
@@ -1956,6 +2368,7 @@ schedule:
         assert!(matches!(resolution_error(absent), ServeError::BadConfig(_)));
     }
 
+    #[cfg(any(feature = "source-singer", feature = "sink-singer"))]
     #[test]
     fn subprocess_kinds_are_found_anywhere() {
         let doc = json!({
@@ -2018,6 +2431,168 @@ schedule:
                     "{e:?}"
                 );
             }
+        }
+    }
+
+    #[test]
+    fn references_go_through_the_policy_after_the_credential_overlay() {
+        let deny = ReferencePolicy::deny_all();
+        let doc = serde_json::json!({"a": "${env:SOME_VAR}", "b": "$${env:ESCAPED}"});
+        let err = screen_references(&doc, &deny).unwrap_err().to_string();
+        assert!(
+            err.contains("${env:SOME_VAR}") && err.contains("--allow-env"),
+            "{err}"
+        );
+        assert!(!err.contains("ESCAPED"), "{err}");
+        screen_references(&doc, &ReferencePolicy::open()).unwrap();
+        let skip: std::collections::BTreeSet<String> =
+            ["${env:SOME_VAR}".to_string()].into_iter().collect();
+        screen_references_except(&doc, &deny, &skip).unwrap();
+        let err = screen_references(
+            &serde_json::json!(["${file:/etc/hosts}", "${vault:a/b}"]),
+            &deny,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(
+            err.contains("${file:/etc/hosts}") && err.contains("${vault:a/b}"),
+            "{err}"
+        );
+        let overlay = screen_references(
+            &serde_json::json!("${env:FAUCET_VAULT_KEY}"),
+            &ReferencePolicy::open(),
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(overlay.contains("server's own credentials"), "{overlay}");
+        refuse_server_secrets(&serde_json::json!("${env:ANY}")).unwrap();
+        assert_eq!(
+            load_time_tokens(&serde_json::json!({"x": "${env:A} ${row.b}"})),
+            ["${env:A}".to_string()].into_iter().collect()
+        );
+    }
+
+    #[test]
+    fn auth_catalog_endpoints_follow_the_url_policy() {
+        let mut cfg = PipelineConfig::from_value(serde_json::json!({
+            "version": 1,
+            "auth": {
+                "idp": {"type": "oauth2", "config": {"token_url": "https://idp.example.com/t"}},
+                "meta": {"type": "token_endpoint", "config": {"url": "http://169.254.169.254/x"}},
+                "plain": {"type": "static"}
+            },
+            "pipeline": {"source": {"type": "rest", "config": {}}, "sink": {"type": "stdout", "config": {}}}
+        }))
+        .unwrap();
+        let open = ReferencePolicy::open();
+        let err = screen_auth_catalog(&cfg, &open).unwrap_err().to_string();
+        assert!(
+            err.contains("auth.meta.config.url") && !err.contains("idp"),
+            "{err}"
+        );
+        cfg.auth.as_mut().unwrap().remove("meta");
+        screen_auth_catalog(&cfg, &open).unwrap();
+        let hosts = ReferencePolicy::open().with_url_hosts(["other.example.com"]);
+        assert!(screen_auth_catalog(&cfg, &hosts).is_err());
+    }
+
+    #[test]
+    fn subprocess_screening_follows_origin_and_tenant() {
+        let doc = serde_json::json!({"pipeline": {"source": {"type": "singer", "config": {}}}});
+        refuse_subprocess(&doc, BodyOrigin::Trusted, true).unwrap();
+        let allowed = BodyOrigin::Caller {
+            allow_subprocess: true,
+        };
+        refuse_subprocess(&doc, allowed, false).unwrap();
+        let err = refuse_subprocess(&doc, allowed, true)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("tenant"), "{err}");
+        let err = screen_document(
+            &doc,
+            BodyOrigin::Caller {
+                allow_subprocess: false,
+            },
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("--allow-subprocess-connectors"), "{err}");
+        screen_document(&serde_json::json!({}), allowed).unwrap();
+    }
+
+    #[test]
+    fn policy_refusals_name_the_flags() {
+        let cfg = PipelineConfig::from_value(serde_json::json!({
+            "version": 1,
+            "pipeline": {
+                "source": {"type": "csv", "config": {"path": "/srv/elsewhere/in.csv"}},
+                "sink": {"type": "jsonl", "config": {"path": "/srv/elsewhere/out.jsonl"}},
+                "state": {"type": "file", "config": {"path": "/srv/elsewhere/state"}}
+            }
+        }))
+        .unwrap();
+        let caller = BodyOrigin::Caller {
+            allow_subprocess: false,
+        };
+        let policy = ReferencePolicy::deny_all().with_path_roots(["/srv/data"]);
+        let err = refuse_server_paths_with(&cfg, &[], caller, &policy)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("/srv/elsewhere/state") && err.contains("--allow-path-root"),
+            "{err}"
+        );
+        refuse_server_paths_with(&cfg, &[], BodyOrigin::Trusted, &ReferencePolicy::open()).unwrap();
+        let rows = PipelineConfig::from_value(serde_json::json!({
+            "version": 1,
+            "pipeline": {
+                "source": {"type": "csv", "config": {"path": "/srv/data/${row.id}.csv"}},
+                "sink": {"type": "jsonl", "config": {"path": "/srv/data/out.jsonl"}}
+            }
+        }))
+        .unwrap();
+        let err = refuse_server_paths_with(&rows, &[], caller, &policy)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("from records"), "{err}");
+    }
+
+    /// A URL host a submitted config takes from records cannot be checked
+    /// against any list, so it is refused for a caller even when the host
+    /// policy is open; a host fixed in the config, or a token in the path,
+    /// still passes.
+    #[cfg(all(feature = "source-rest", feature = "sink-stdout"))]
+    #[test]
+    fn a_caller_url_host_may_not_come_from_records() {
+        let cfg = |base: &str| {
+            PipelineConfig::from_value(serde_json::json!({
+                "version": 1,
+                "pipeline": {
+                    "source": {"type": "rest", "config": {"base_url": base}},
+                    "sink": {"type": "stdout", "config": {}}
+                }
+            }))
+            .unwrap()
+        };
+        let caller = BodyOrigin::Caller {
+            allow_subprocess: false,
+        };
+        let open = ReferencePolicy::open();
+        for bad in ["https://${parent.host}/v1", "${parent.next_url}"] {
+            let err = refuse_server_paths_with(&cfg(bad), &[], caller, &open)
+                .unwrap_err()
+                .to_string();
+            assert!(
+                err.contains("rest/base_url") && err.contains("may not take a value from records"),
+                "{bad}: {err}"
+            );
+            refuse_server_paths_with(&cfg(bad), &[], BodyOrigin::Trusted, &open).unwrap();
+        }
+        for ok in [
+            "https://api.example.com/items/${parent.id}",
+            "https://api.example.com/${now.date}",
+        ] {
+            refuse_server_paths_with(&cfg(ok), &[], caller, &open).unwrap();
         }
     }
 }

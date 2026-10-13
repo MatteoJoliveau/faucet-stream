@@ -17,3 +17,46 @@ fn conformance_config_schema_valid() {
     .unwrap();
     assert_config_schema_valid_value(&schema, "faucet-source-redshift");
 }
+
+#[tokio::test]
+async fn descriptor_matches_the_built_source() {
+    let v = serde_json::json!({
+        "host": "localhost",
+        "database": "db",
+        "user": "u",
+        "credentials": {"type": "password", "config": {"password": "pw"}},
+        "query": "SELECT 1"
+    });
+    let cfg: faucet_source_redshift::RedshiftSourceConfig =
+        serde_json::from_value(v.clone()).unwrap();
+    let built = faucet_source_redshift::RedshiftSource::new(cfg).expect("source");
+    faucet_conformance::assert_descriptor_matches_source(
+        &faucet_source_redshift::DESCRIPTOR,
+        "redshift",
+        &v,
+        &built,
+    );
+}
+
+// ── Check: backend calls honour the call deadline and cancel (#880) ──────────
+
+#[tokio::test]
+async fn conformance_call_deadline() {
+    let hung = faucet_conformance::hung::SilentListener::start()
+        .await
+        .expect("listener");
+    let v = serde_json::json!({
+        "host": "127.0.0.1",
+        "port": hung.port(),
+        "database": "db",
+        "user": "u",
+        "credentials": {"type": "password", "config": {"password": "pw"}},
+        "tls_mode": "disable",
+        "query": "SELECT 1"
+    });
+    faucet_conformance::calls::assert_source_call_deadline(|| {
+        faucet_source_redshift::RedshiftSource::new(serde_json::from_value(v.clone()).unwrap())
+            .unwrap()
+    })
+    .await;
+}

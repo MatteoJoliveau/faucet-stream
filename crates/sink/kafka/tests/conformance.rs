@@ -165,4 +165,66 @@ mod idempotent {
         })
         .await;
     }
+
+    /// #878: the write report accounts for every record produced, and a
+    /// cancelled run still flushes the producer's queue.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn conformance_declared_capabilities() {
+        let (_container, brokers, sink) = fresh_sink().await;
+        let count = || {
+            let brokers = brokers.clone();
+            async move { distinct_ids(&brokers, "conformance_dest").await }
+        };
+        faucet_conformance::assert_reported_rows_truthful(&sink, count).await;
+        faucet_conformance::assert_cancellation_flushes(&sink, count).await;
+    }
+}
+
+/// The static descriptor answers exactly what the built sink declares (RFC 0013).
+#[tokio::test(flavor = "multi_thread")]
+async fn conformance_descriptor_matches_built_sink() {
+    #[allow(unused_mut)]
+    let mut configs =
+        vec![r#"{"brokers": "127.0.0.1:1", "topic": {"type": "fixed", "name": "t"}}"#];
+    #[cfg(feature = "schema-registry")]
+    configs.push(
+        r#"{"brokers": "127.0.0.1:1", "topic": {"type": "fixed", "name": "t"}, "value_format": {"type": "confluent_avro", "schema_registry": {"url": "http://127.0.0.1:1"}}, "value_schema": "{\"type\":\"record\",\"name\":\"R\",\"fields\":[{\"name\":\"id\",\"type\":\"long\"}]}"}"#,
+    );
+    for raw in configs {
+        let v: faucet_core::Value = faucet_core::serde_json::from_str(raw).expect("json");
+        let cfg: faucet_sink_kafka::KafkaSinkConfig =
+            faucet_core::serde_json::from_value(v.clone()).expect("config");
+        let built = faucet_sink_kafka::KafkaSink::new(cfg)
+            .await
+            .expect("offline build");
+        faucet_conformance::assert_descriptor_matches_sink(
+            &faucet_sink_kafka::DESCRIPTOR,
+            "kafka",
+            &v,
+            &built,
+        );
+    }
+}
+
+/// A broker that cannot be reached stands in for a hung backend (#880): the
+/// delivery of a produced record waits until the deadline or the cancel.
+#[tokio::test(flavor = "multi_thread")]
+async fn conformance_call_deadline() {
+    let raw = r#"{"brokers": "127.0.0.1:1", "topic": {"type": "fixed", "name": "t"}}"#;
+    let mut built = Vec::new();
+    for _ in 0..2 {
+        let cfg: faucet_sink_kafka::KafkaSinkConfig =
+            faucet_core::serde_json::from_str(raw).expect("config");
+        built.push(
+            faucet_sink_kafka::KafkaSink::new(cfg)
+                .await
+                .expect("offline build"),
+        );
+    }
+    let built = std::sync::Mutex::new(built);
+    faucet_conformance::calls::assert_sink_call_deadline(
+        || built.lock().unwrap().pop().unwrap(),
+        &[faucet_core::serde_json::json!({"id": 1})],
+    )
+    .await;
 }

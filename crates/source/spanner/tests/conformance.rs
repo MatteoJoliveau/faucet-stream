@@ -164,3 +164,73 @@ async fn conformance_errors_not_panics() {
 
     assert_errors_not_panics(&source).await;
 }
+
+// ── Descriptor agreement (RFC 0013, Docker) ─────────────────────────────────
+
+/// `new()` opens a session pool, so the built source needs the emulator.
+#[tokio::test(flavor = "multi_thread")]
+async fn conformance_descriptor_matches_built_source() {
+    let Some(emu) = support::start_emulator().await else {
+        return;
+    };
+    support::create_database(&emu.host, "descriptor", &[]).await;
+    let base = serde_json::json!({
+        "project_id": support::PROJECT,
+        "instance": support::INSTANCE,
+        "database": "descriptor",
+        "emulator_host": emu.host,
+        "query": "SELECT 1",
+    });
+    let mut sharded = base.clone();
+    sharded["shard"] = serde_json::json!({"key": "id"});
+    for v in [base, sharded] {
+        let cfg: SpannerSourceConfig = serde_json::from_value(v.clone()).unwrap();
+        let built = SpannerSource::new(cfg).await.expect("source");
+        faucet_conformance::assert_descriptor_matches_source(
+            &faucet_source_spanner::DESCRIPTOR,
+            "spanner",
+            &v,
+            &built,
+        );
+    }
+}
+
+// ── Check: backend calls honour the call deadline and cancel (#880) ──────────
+
+fn block_on<F: std::future::Future>(f: F) -> F::Output {
+    tokio::task::block_in_place(|| tokio::runtime::Handle::current().block_on(f))
+}
+
+/// The client opens its session pool while it is built, so the backend hangs
+/// only once the source exists: a proxy forwards to the emulator during
+/// `new()` and then stops answering.
+#[tokio::test(flavor = "multi_thread")]
+async fn conformance_call_deadline() {
+    let Some(emu) = support::start_emulator().await else {
+        return;
+    };
+    support::create_database(
+        &emu.host,
+        "deadline",
+        &["CREATE TABLE t (id INT64 NOT NULL) PRIMARY KEY (id)"],
+    )
+    .await;
+    let proxy = faucet_conformance::hung::HangingProxy::start(&emu.host)
+        .await
+        .expect("proxy");
+    let host = proxy.addr().to_string();
+    faucet_conformance::calls::assert_source_call_deadline(|| {
+        proxy.resume();
+        let mut cfg = SpannerSourceConfig::new(
+            support::PROJECT,
+            support::INSTANCE,
+            "deadline",
+            "SELECT id FROM t",
+        );
+        cfg.connection = support::connection(&host, "deadline");
+        let source = block_on(SpannerSource::new(cfg)).expect("source builds");
+        proxy.hang();
+        source
+    })
+    .await;
+}

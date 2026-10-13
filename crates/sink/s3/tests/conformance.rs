@@ -155,3 +155,168 @@ async fn conformance_capabilities_truthful() {
     assert!(!sink.supports_idempotent_writes());
     assert!(!sink.dedups_by_key());
 }
+
+// ── Descriptor (RFC 0013): agrees with the built sink ───────────────────────
+
+fn descriptor_config(base: serde_json::Value, extra: serde_json::Value) -> serde_json::Value {
+    let mut v = base;
+    for (k, x) in extra.as_object().unwrap() {
+        v[k] = x.clone();
+    }
+    v
+}
+
+#[tokio::test]
+async fn descriptor_matches_built_sink() {
+    let base = serde_json::json!({"bucket": "b", "region": "us-east-1", "endpoint_url": "http://127.0.0.1:1"});
+    let mut cases = vec![
+        serde_json::json!({}),
+        serde_json::json!({"format": "raw_text"}),
+        serde_json::json!({"format": "auto", "path": "x.json"}),
+        serde_json::json!({"format": "auto", "file_extension": ".txt"}),
+    ];
+    #[cfg(feature = "file-format-csv")]
+    cases.extend([
+        serde_json::json!({"format": "csv", "csv": {"on_unknown_field": "warn"}}),
+        serde_json::json!({"format": "csv", "csv": {"on_unknown_field": "error"}}),
+    ]);
+    #[cfg(feature = "arrow")]
+    cases.push(serde_json::json!({"format": "auto", "path": "x-{part}.parquet"}));
+    for extra in cases {
+        let v = descriptor_config(base.clone(), extra);
+        let cfg: S3SinkConfig = serde_json::from_value(v.clone()).unwrap();
+        let built = S3Sink::new(cfg).await.expect("sink builds offline");
+        faucet_conformance::assert_descriptor_matches_sink(
+            &faucet_sink_s3::DESCRIPTOR,
+            "s3",
+            &v,
+            &built,
+        );
+    }
+}
+
+// ── Check: backend calls honour the call deadline and cancel (#880) ──────────
+
+fn block_on<F: std::future::Future>(f: F) -> F::Output {
+    tokio::task::block_in_place(|| tokio::runtime::Handle::current().block_on(f))
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn conformance_call_deadline() {
+    let hung = faucet_conformance::hung::SilentListener::start()
+        .await
+        .expect("listener");
+    let endpoint = hung.http_url();
+    // SAFETY: the same constants every other test here sets.
+    unsafe {
+        std::env::set_var("AWS_ACCESS_KEY_ID", ACCESS_KEY);
+        std::env::set_var("AWS_SECRET_ACCESS_KEY", SECRET_KEY);
+        std::env::set_var("AWS_DEFAULT_REGION", REGION);
+    }
+    faucet_conformance::calls::assert_sink_call_deadline(
+        || {
+            let config = S3SinkConfig::new("hung")
+                .endpoint_url(endpoint.clone())
+                .region(REGION.to_string());
+            block_on(S3Sink::new(config)).expect("sink builds offline")
+        },
+        &[serde_json::json!({"id": 1})],
+    )
+    .await;
+}
+
+// ── #878: declared capabilities against MinIO ─────────────────────────────────
+
+/// Records in the objects under `prefix` a reader of the destination sees: the
+/// overwrite swap area (`.faucet-overwrite-…/`) and its markers are not part of
+/// it.
+async fn visible_records(client: &Client, prefix: &str) -> usize {
+    let resp = client
+        .list_objects_v2()
+        .bucket(TEST_BUCKET)
+        .prefix(prefix)
+        .send()
+        .await
+        .expect("list objects");
+    let mut total = 0usize;
+    for key in resp.contents().iter().filter_map(|o| o.key()) {
+        if key.contains("/.faucet-") {
+            continue;
+        }
+        let obj = client
+            .get_object()
+            .bucket(TEST_BUCKET)
+            .key(key)
+            .send()
+            .await
+            .expect("get object");
+        let bytes = obj.body.collect().await.expect("collect body").into_bytes();
+        total += String::from_utf8_lossy(&bytes)
+            .lines()
+            .filter(|l| !l.trim().is_empty())
+            .count();
+    }
+    total
+}
+
+/// The object is uploaded when the sink flushes, so a cancelled run must
+/// still flush; and `write_mode: overwrite` stages in a swap area until
+/// commit, leaving the previous objects in place on abort.
+///
+/// The SDK's upload futures are deep, so the body runs on a large stack.
+#[test]
+fn conformance_declared_capabilities() {
+    faucet_conformance::block_on_large_stack(declared_capabilities());
+}
+
+async fn declared_capabilities() {
+    let (_container, endpoint) = start_minio().await;
+    let admin = admin_client(&endpoint).await;
+    admin
+        .create_bucket()
+        .bucket(TEST_BUCKET)
+        .send()
+        .await
+        .expect("create bucket");
+    // SAFETY: constants; overlapping tests write the same values.
+    unsafe {
+        std::env::set_var("AWS_ACCESS_KEY_ID", ACCESS_KEY);
+        std::env::set_var("AWS_SECRET_ACCESS_KEY", SECRET_KEY);
+        std::env::set_var("AWS_DEFAULT_REGION", REGION);
+    }
+    let admin_ref = &admin;
+
+    let sink = S3Sink::new(
+        S3SinkConfig::new(TEST_BUCKET)
+            .prefix("cancel/")
+            .endpoint_url(endpoint.clone())
+            .region(REGION.to_string()),
+    )
+    .await
+    .expect("S3Sink::new");
+    faucet_conformance::assert_cancellation_flushes(&sink, || async move {
+        visible_records(admin_ref, "cancel/").await
+    })
+    .await;
+
+    admin
+        .put_object()
+        .bucket(TEST_BUCKET)
+        .key("ovw/out-00001.jsonl")
+        .body(aws_sdk_s3::primitives::ByteStream::from_static(
+            b"{\"id\":-1}\n{\"id\":-2}\n{\"id\":-3}\n",
+        ))
+        .send()
+        .await
+        .expect("seed object");
+    let mut cfg = S3SinkConfig::new(TEST_BUCKET)
+        .endpoint_url(endpoint.clone())
+        .region(REGION.to_string());
+    cfg.path = Some("ovw/out-{part}.jsonl".into());
+    cfg.write_mode = faucet_common_file::write::FileWriteMode::Overwrite;
+    let overwrite = S3Sink::new(cfg).await.expect("overwrite sink");
+    faucet_conformance::assert_overwrite_lifecycle(&overwrite, || async move {
+        visible_records(admin_ref, "ovw/").await
+    })
+    .await;
+}

@@ -80,7 +80,7 @@ impl PipelineTarget {
                 .into_iter()
                 .map(|(id, kind, config)| RowTarget {
                     atomic_watermark: atomic
-                        && crate::registry::sink_supports_idempotent_writes(&kind),
+                        && crate::registry::sink_capabilities(&kind, &config).idempotent_writes(),
                     overwrite: is_overwrite(&config),
                     id,
                     role: RowRole::TopologySink,
@@ -178,7 +178,7 @@ impl PipelineTarget {
 
     /// The invocation key of a row (`{name}::{row}`).
     pub fn base_key(&self, row: &str) -> String {
-        crate::executor::build_state_key(&self.pipeline, row, None)
+        faucet_core::StateKey::invocation(self.pipeline.as_str(), row).render()
     }
 }
 

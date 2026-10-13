@@ -464,6 +464,14 @@ This crate has no optional features of its own; enable it in the CLI/umbrella vi
 and `sla.max_lag_*` thresholds turn it into an SLA. A failing lag query is
 logged once and reported as no lag — it never fails a run.
 
+## Capabilities
+
+Declares `exactly_once` (deterministic replay from the binlog bookmark) and `reports_lag` (binlog distance in bytes). `faucet list --json` prints the declaration.
+
+## Timeouts, cancellation and retries
+
+The connect, the binlog-position queries, the start of the binlog stream and the waits on it run through the pipeline's `CallContext` (#880): the run's deadline and cancel token end a hung connect or an idle stream promptly with an error (the pipeline has already stopped reading and flushed what it took). Each call counts as one round trip (`connect`, `query`, `start`) in `faucet_source_roundtrips_total`. Nothing is retried: the next run resumes from the last persisted bookmark.
+
 ## License
 
 Licensed under either of [Apache License, Version 2.0](https://www.apache.org/licenses/LICENSE-2.0) or [MIT license](https://opensource.org/licenses/MIT) at your option.

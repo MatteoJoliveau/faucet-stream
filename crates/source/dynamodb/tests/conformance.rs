@@ -89,3 +89,46 @@ async fn conformance_streams_bookmark_roundtrip() {
     assert_preflight_check_wellformed(&source, &faucet_core::check::CheckContext::default()).await;
     assert_bookmark_roundtrip(&source).await;
 }
+
+/// The static descriptor answers exactly what the built source declares (RFC 0013).
+#[tokio::test(flavor = "multi_thread")]
+async fn conformance_descriptor_matches_built_source() {
+    #[allow(unused_mut)]
+    let configs = vec![
+        r#"{"table_name": "t", "region": "us-east-1", "endpoint_url": "http://127.0.0.1:1", "credentials": {"type": "access_key", "config": {"access_key_id": "t", "secret_access_key": "t"}}}"#,
+        r#"{"table_name": "t", "mode": "query", "key_condition_expression": "pk = :p", "expression_attribute_values": {":p": "x"}, "region": "us-east-1", "endpoint_url": "http://127.0.0.1:1", "credentials": {"type": "access_key", "config": {"access_key_id": "t", "secret_access_key": "t"}}}"#,
+        r#"{"table_name": "t", "mode": "streams", "idle_termination_secs": 1, "region": "us-east-1", "endpoint_url": "http://127.0.0.1:1", "credentials": {"type": "access_key", "config": {"access_key_id": "t", "secret_access_key": "t"}}}"#,
+    ];
+    for raw in configs {
+        let v: faucet_core::Value = faucet_core::serde_json::from_str(raw).expect("json");
+        let cfg: faucet_source_dynamodb::DynamoDbSourceConfig =
+            faucet_core::serde_json::from_value(v.clone()).expect("config");
+        let built = faucet_source_dynamodb::DynamoDbSource::new(cfg)
+            .await
+            .expect("offline build");
+        faucet_conformance::assert_descriptor_matches_source(
+            &faucet_source_dynamodb::DESCRIPTOR,
+            "dynamodb",
+            &v,
+            &built,
+        );
+    }
+}
+
+// ── Check: backend calls honour the call deadline and cancel (#880) ──────────
+
+#[tokio::test(flavor = "multi_thread")]
+async fn conformance_call_deadline() {
+    let hung = faucet_conformance::hung::SilentListener::start()
+        .await
+        .expect("listener");
+    let endpoint = hung.http_url();
+    let make = || {
+        let cfg = config(&endpoint, "hung");
+        tokio::task::block_in_place(|| {
+            tokio::runtime::Handle::current().block_on(DynamoDbSource::new(cfg))
+        })
+        .expect("source builds offline")
+    };
+    faucet_conformance::calls::assert_source_call_deadline(make).await;
+}

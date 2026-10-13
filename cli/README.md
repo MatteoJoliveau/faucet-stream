@@ -315,6 +315,11 @@ Auth is mandatory: without `--auth-token`/`FAUCET_SERVE_AUTH_TOKEN` **and** with
 | `--allow-unauthenticated-network` | With `--no-auth`, allow a non-loopback `--listen` (`0.0.0.0`, `::`, a LAN address). Without it that combination refuses to start; with it the server logs a warning. Env: `FAUCET_SERVE_ALLOW_UNAUTHENTICATED_NETWORK`. |
 | `--auth-config <path>` | RBAC principals file (`{ name, token, role }`; roles `viewer`/`operator`/`admin`) — role enforcement + admin-only `GET /v1/audit`. Tokens resolve `${env:}` / `${file:}` / secret-manager references at startup. Mutually exclusive with `--auth-token`/`--no-auth`. |
 | `--allow-subprocess-connectors` | Let a config submitted over HTTP / MCP use `singer` (it runs a program on the host). Off by default; tenant configs are refused regardless; registered templates are always allowed. |
+| `--allow-path-root <dir>` | Directory a config submitted over HTTP or MCP may read or write local files under (connector paths, `${file:}`, state / DLQ / lineage files). Repeatable. Default: the working directory and the system temp directory. See [Reference policy](http-api.md#reference-policy). |
+| `--allow-url-scheme <scheme>` / `--allow-url-host <host>` | Restrict the URLs a submitted config may connect to (repeatable or comma-separated; `*.example.com` matches subdomains). Default: any, except link-local and cloud-metadata hosts, which are reachable only when listed. |
+| `--allow-env <name>` | Environment variable a submitted config may read through `${env:}` / `${secret:}` (`NAME` or `PREFIX*`). Default: none. |
+| `--allow-secret-scheme <scheme>` | Secret-manager scheme (`vault`, `aws-sm`, `gcp-sm`, `azure-kv`) a submitted config may resolve with the server's credentials. Default: none. |
+| `--tenant-path-root <dir>` | Confine the local paths of a config submitted for a tenant to `<dir>/<tenant id>`. |
 | `--max-concurrent-runs` / `--max-queued-runs` | Concurrency + queue caps (submit past the queue → 429 + `Retry-After`). |
 | `--history <url>` | `postgres://…` / `sqlite:…` for durable history (`serve-history-postgres` / `serve-history-sqlite`; default in-memory). |
 | `--default-config <path>` | Workspace defaults merged **under** every submitted run. |
@@ -1142,6 +1147,14 @@ Sibling of `source`, `sink`, `transforms`, `state` under `pipeline:`.
 Matrix rows can override the inherited `dlq:` wholesale, or disable
 inherited DLQ for that row with `dlq: null`.
 
+The DLQ is a governed destination (#870): rows quarantined by any pass are
+checked against `policy:` with the DLQ sink's own `attributes`, masked by
+masking rules whose `applies_to` names `dlq`, counted against `budget:`,
+metered into the usage record and retried under `resilience:` when the DLQ
+sink's write is replay-safe. `faucet dlq replay` runs under the config's
+`budget:` and `resilience:`; `faucet run` prints each row's account of where
+every offered row went (#879).
+
 Example:
 
 ```yaml
@@ -1680,6 +1693,17 @@ every command (`run`, `validate`, `schema`, `list`, `preview`, `serve`, …).
 - Use `register_source_with` / `register_sink_with` to also supply a config
   JSON-Schema closure and a one-line description for `faucet list` / `faucet
   schema`.
+- Use `register_source_described` / `register_sink_described` to also hand the
+  CLI the connector's `ConnectorDescriptor` — a pure
+  `fn(&Value) -> faucet_core::Capabilities` that says, from the config alone,
+  which write modes, exactly-once, cleanup, rollback, discovery and so on the
+  connector supports. Every load-time gate (`faucet validate`, upsert /
+  overwrite / exactly-once / cleanup / schema drift) reads it, exactly as for a
+  built-in. A connector registered without one is treated as append-only and
+  capability-free, so a `write_mode: upsert` against it is refused. Pin the
+  descriptor to the connector with
+  `faucet_conformance::assert_descriptor_matches_source` / `_sink` in its
+  tests.
 - Registering a name that collides with a built-in (or a duplicate) is rejected
   at startup with a clear error.
 - Custom connectors receive their `config` verbatim; the shared top-level

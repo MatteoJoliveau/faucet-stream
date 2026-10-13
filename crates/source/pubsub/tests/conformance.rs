@@ -106,8 +106,16 @@ async fn conformance_bounded_memory() {
     cfg.idle_termination_secs = Some(5);
     cfg.max_messages = Some(150);
     cfg.batch_size = 30;
+    let cfg_value = faucet_core::serde_json::to_value(&cfg).expect("config serializes");
     let source = PubsubSource::new(cfg).await.expect("source builds");
     assert!(source.consumes_destructively());
+    // RFC 0013: the static descriptor answers what the built source declares.
+    faucet_conformance::assert_descriptor_matches_source(
+        &faucet_source_pubsub::DESCRIPTOR,
+        "pubsub",
+        &cfg_value,
+        &source,
+    );
 
     // Check 10: connector_name is non-empty (metric-cardinality contract).
     faucet_conformance::assert_connector_name_nonempty(&source);
@@ -120,4 +128,25 @@ async fn conformance_bounded_memory() {
     .await;
 
     faucet_conformance::assert_bounded_memory(&source, 30, 150).await;
+}
+
+// ── Check: backend calls honour the call deadline and cancel (#880) ──────────
+
+fn block_on<F: std::future::Future>(f: F) -> F::Output {
+    tokio::task::block_in_place(|| tokio::runtime::Handle::current().block_on(f))
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn conformance_call_deadline() {
+    let hung = faucet_conformance::hung::SilentListener::start()
+        .await
+        .expect("listener");
+    let host = hung.addr().to_string();
+    faucet_conformance::calls::assert_source_call_deadline(|| {
+        let mut cfg = PubsubSourceConfig::new("hung-s");
+        cfg.connection = conn(&host);
+        cfg.max_messages = Some(1);
+        block_on(PubsubSource::new(cfg)).expect("source builds offline")
+    })
+    .await;
 }

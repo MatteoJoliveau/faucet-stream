@@ -39,9 +39,65 @@ async fn conformance_capabilities_truthful() {
     .await;
 
     let url = broker.url.clone();
-    faucet_conformance::assert_capabilities_truthful(&sink, move || {
+    let count = move || {
         let url = url.clone();
         async move { common::ready_count(&url, "conformance").await as usize }
-    })
+    };
+    faucet_conformance::assert_capabilities_truthful(&sink, count.clone()).await;
+    // #878: per-message confirm outcomes are truthful.
+    faucet_conformance::assert_partial_outcomes_truthful(&sink, count).await;
+}
+
+/// The static descriptor answers exactly what the built sink declares (RFC 0013).
+#[tokio::test(flavor = "multi_thread")]
+async fn conformance_descriptor_matches_built_sink() {
+    #[allow(unused_mut)]
+    let configs =
+        vec![r#"{"url": "amqp://127.0.0.1:1/%2f", "exchange": "x", "routing_key": "rk"}"#];
+    for raw in configs {
+        let v: faucet_core::Value = faucet_core::serde_json::from_str(raw).expect("json");
+        let cfg: faucet_sink_rabbitmq::RabbitMqSinkConfig =
+            faucet_core::serde_json::from_value(v.clone()).expect("config");
+        let built = faucet_sink_rabbitmq::RabbitMqSink::new(cfg)
+            .await
+            .expect("offline build");
+        faucet_conformance::assert_descriptor_matches_sink(
+            &faucet_sink_rabbitmq::DESCRIPTOR,
+            "rabbitmq",
+            &v,
+            &built,
+        );
+    }
+}
+
+/// A server that accepts TCP connections and never answers stands in for a
+/// hung backend (#880): the lazy connect waits on it.
+async fn silent_server() -> String {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        let mut held = Vec::new();
+        while let Ok((stream, _)) = listener.accept().await {
+            held.push(stream);
+        }
+    });
+    format!("amqp://{addr}/%2f")
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn conformance_call_deadline() {
+    let url = silent_server().await;
+    let mut built = Vec::new();
+    for _ in 0..2 {
+        let mut cfg = RabbitMqSinkConfig::to_queue("events");
+        cfg.connection = RabbitMqConnectionConfig::from_url(&url);
+        cfg.connection.connect_timeout_secs = 60;
+        built.push(RabbitMqSink::new(cfg).await.expect("lazy construction"));
+    }
+    let built = std::sync::Mutex::new(built);
+    faucet_conformance::calls::assert_sink_call_deadline(
+        || built.lock().unwrap().pop().unwrap(),
+        &[serde_json::json!({"id": 1})],
+    )
     .await;
 }

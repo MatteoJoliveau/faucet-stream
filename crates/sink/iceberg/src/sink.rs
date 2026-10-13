@@ -48,6 +48,7 @@
 //! When `create_if_missing: false` the table is loaded at `new()` time; a
 //! missing table produces a `FaucetError::Sink` immediately.
 
+use faucet_core::CallExt as _;
 use std::str::FromStr;
 use std::sync::Arc;
 
@@ -174,6 +175,9 @@ pub struct IcebergSink {
     config: IcebergSinkConfig,
     catalog: Arc<dyn Catalog>,
     state: Mutex<SinkState>,
+    /// Backend-call context (#880): catalog calls, data-file writes and the
+    /// snapshot commit run through it, once.
+    calls: faucet_core::CallSlot,
 }
 
 impl std::fmt::Debug for IcebergSink {
@@ -217,6 +221,11 @@ impl IcebergSink {
             config,
             catalog,
             state: Mutex::new(SinkState::new(preloaded)),
+            calls: faucet_core::CallSlot::new(
+                faucet_core::CallContext::new()
+                    .without_timeout()
+                    .without_retry(),
+            ),
         })
     }
 
@@ -278,7 +287,17 @@ impl IcebergSink {
         if let Some(ref table) = state.table {
             return Ok(table.clone());
         }
+        let table = self
+            .calls
+            .call_once("catalog", self.load_or_create_table(records))
+            .await?;
+        state.table = Some(table.clone());
+        Ok(table)
+    }
 
+    /// Load the target table, creating it (and its namespace) from `records`
+    /// when it does not exist.
+    async fn load_or_create_table(&self, records: &[Value]) -> Result<Table, FaucetError> {
         // Table not yet resolved — infer + create.
         let arrow_schema = infer_arrow_schema(records, records.len().min(100))?;
         let iceberg_schema = arrow_to_iceberg_schema(&arrow_schema)?;
@@ -348,8 +367,6 @@ impl IcebergSink {
                     .await
                     .map_err(|e| FaucetError::Sink(format!("iceberg: create_table failed: {e}")))?
             };
-
-        state.table = Some(table.clone());
         Ok(table)
     }
 
@@ -358,8 +375,13 @@ impl IcebergSink {
     async fn ensure_writer(&self, state: &mut SinkState, table: &Table) -> Result<(), FaucetError> {
         if state.writer.is_none() {
             let compression = compression_from_str(&self.config.parquet.compression)?;
-            let writer =
-                TableWriter::new(table, compression, self.config.target_file_size_mb).await?;
+            let writer = self
+                .calls
+                .call_once(
+                    "write",
+                    TableWriter::new(table, compression, self.config.target_file_size_mb),
+                )
+                .await?;
             state.writer = Some(writer);
         }
         Ok(())
@@ -396,7 +418,7 @@ impl IcebergSink {
         for batch in batches {
             row_count += batch.num_rows();
             let writer = state.writer.as_mut().expect("writer is set above");
-            if let Err(e) = writer.write(batch).await {
+            if let Err(e) = self.calls.call_once("write", writer.write(batch)).await {
                 state.poison(&e);
                 return Err(e);
             }
@@ -420,6 +442,12 @@ impl IcebergSink {
     /// data has been written), `Ok(Some(table))` if it exists, or `Err` on a
     /// catalog communication failure.
     async fn load_table_readonly(&self) -> Result<Option<Table>, FaucetError> {
+        self.calls
+            .call_once("catalog", self.read_table_readonly())
+            .await
+    }
+
+    async fn read_table_readonly(&self) -> Result<Option<Table>, FaucetError> {
         let ns = NamespaceIdent::from_strs(self.config.namespace.iter().map(String::as_str))
             .map_err(|e| FaucetError::Sink(format!("iceberg: invalid namespace: {e}")))?;
         let tid = TableIdent::new(ns, self.config.table.clone());
@@ -501,63 +529,42 @@ impl IcebergSink {
             action = action.set_snapshot_properties(props);
         }
 
-        let tx = match carried {
-            Some((scope, token)) => match tx
+        // Building the transaction fails locally, so its data files were
+        // uploaded but definitively never committed.
+        let prepared = match carried {
+            Some((scope, token)) => tx
                 .update_table_properties()
                 .set(token_property(&scope), token)
                 .apply(tx)
-            {
-                Ok(tx) => tx,
-                Err(e) => {
-                    maybe_cleanup_orphans(
-                        table.file_io(),
-                        &self.config.table,
-                        self.config.cleanup_orphans_on_failure,
-                        true,
-                        &file_paths,
-                    )
-                    .await;
-                    return Err(FaucetError::Sink(format!(
-                        "iceberg: recording the commit token as a table property failed: {e}"
-                    )));
-                }
-            },
-            None => tx,
+                .map_err(|e| format!("recording the commit token as a table property failed: {e}")),
+            None => Ok(tx),
+        }
+        .and_then(|tx| {
+            action
+                .apply(tx)
+                .map_err(|e| format!("fast_append apply failed: {e}"))
+        });
+        let outcome = match prepared {
+            Ok(tx) => commit_outcome(
+                tx.commit(self.catalog.as_ref())
+                    .within(&self.calls, "commit")
+                    .await,
+            ),
+            Err(e) => Err((FaucetError::Sink(format!("iceberg: {e}")), true)),
         };
-        let tx = match action.apply(tx) {
-            Ok(tx) => tx,
-            Err(e) => {
-                // Building the append failed locally — the data files were
-                // uploaded but definitively never committed.
-                maybe_cleanup_orphans(
-                    table.file_io(),
-                    &self.config.table,
-                    self.config.cleanup_orphans_on_failure,
-                    true,
-                    &file_paths,
-                )
-                .await;
-                return Err(FaucetError::Sink(format!(
-                    "iceberg: fast_append apply failed: {e}"
-                )));
-            }
-        };
-
-        let updated_table = match tx.commit(self.catalog.as_ref()).await {
+        let updated_table = match outcome {
             Ok(updated_table) => updated_table,
-            Err(e) => {
+            Err((err, definite_loss)) => {
                 maybe_cleanup_orphans(
+                    &self.calls,
                     table.file_io(),
                     &self.config.table,
                     self.config.cleanup_orphans_on_failure,
-                    commit_failure_is_definite_loss(e.kind()),
+                    definite_loss,
                     &file_paths,
                 )
                 .await;
-                return Err(FaucetError::Sink(format!(
-                    "iceberg: transaction commit failed ({}): {e}",
-                    e.kind()
-                )));
+                return Err(err);
             }
         };
 
@@ -568,13 +575,33 @@ impl IcebergSink {
     }
 }
 
+/// A commit attempt's result, or the error to return with whether its data
+/// files are definitely orphaned. A spent call context is never a definite
+/// loss: the commit may have landed.
+fn commit_outcome<T>(
+    committed: Result<Result<T, iceberg::Error>, FaucetError>,
+) -> Result<T, (FaucetError, bool)> {
+    match committed {
+        Ok(Ok(table)) => Ok(table),
+        Err(spent) => Err((spent, false)),
+        Ok(Err(e)) => Err((
+            FaucetError::Sink(format!(
+                "iceberg: transaction commit failed ({}): {e}",
+                e.kind()
+            )),
+            commit_failure_is_definite_loss(e.kind()),
+        )),
+    }
+}
+
 /// Best-effort orphan cleanup after a failed snapshot commit.
 ///
 /// No-op (with a one-line warning) when cleanup is disabled (`enabled == false`)
 /// or the failure is ambiguous (`definite_loss == false`); otherwise deletes
-/// `file_paths` via `file_io`. Errors are logged, never propagated — the caller
-/// still returns the original commit error.
+/// `file_paths` via `file_io`, each delete under `calls`. Errors are logged,
+/// never propagated — the caller still returns the original commit error.
 pub(crate) async fn maybe_cleanup_orphans(
+    calls: &faucet_core::CallSlot,
     file_io: &FileIO,
     table_name: &str,
     enabled: bool,
@@ -605,7 +632,7 @@ pub(crate) async fn maybe_cleanup_orphans(
         return;
     }
 
-    let (deleted, failed) = delete_data_files(file_io, file_paths).await;
+    let (deleted, failed) = delete_data_files(calls, file_io, file_paths).await;
     tracing::info!(
         table = %table_name,
         deleted,
@@ -671,15 +698,28 @@ where
 
 /// Delete each path in `paths` via `file_io`, returning `(deleted, failed)`.
 ///
-/// Best-effort: a delete error is logged and counted as `failed` but does not
-/// stop the remaining deletes. The data files written by this sink have unique
+/// Best-effort: a delete error — including one that hits the call deadline or
+/// a cancel — is logged and counted as `failed` but does not stop the
+/// remaining deletes. The data files written by this sink have unique
 /// (UUID-based) names, so deleting them can never remove a file a concurrent
 /// writer references.
-pub(crate) async fn delete_data_files(file_io: &FileIO, paths: &[String]) -> (usize, usize) {
+pub(crate) async fn delete_data_files(
+    calls: &faucet_core::CallSlot,
+    file_io: &FileIO,
+    paths: &[String],
+) -> (usize, usize) {
     let mut deleted = 0usize;
     let mut failed = 0usize;
     for path in paths {
-        match file_io.delete(path).await {
+        let outcome = calls
+            .call_once("delete", async {
+                file_io
+                    .delete(path)
+                    .await
+                    .map_err(|e| FaucetError::Sink(e.to_string()))
+            })
+            .await;
+        match outcome {
             Ok(()) => deleted += 1,
             Err(e) => {
                 failed += 1;
@@ -700,6 +740,17 @@ impl faucet_core::Sink for IcebergSink {
 
     fn connector_name(&self) -> &'static str {
         "iceberg"
+    }
+
+    fn set_call_context(&self, ctx: faucet_core::io::CallContext) {
+        self.calls.install(ctx);
+    }
+
+    fn set_roundtrip_recorder(
+        &self,
+        recorder: std::sync::Arc<faucet_core::observability::RoundtripRecorder>,
+    ) {
+        self.calls.install_recorder(recorder);
     }
 
     fn config_schema(&self) -> Value {
@@ -750,7 +801,18 @@ impl faucet_core::Sink for IcebergSink {
             Ok(t) => t,
         };
 
-        let probe_result = tokio::time::timeout(ctx.timeout, self.catalog.table_exists(&tid)).await;
+        let probe_result = tokio::time::timeout(
+            ctx.timeout,
+            self.catalog
+                .table_exists(&tid)
+                .within(&self.calls, "catalog"),
+        )
+        .await
+        .map(|r| match r {
+            Ok(Ok(exists)) => Ok(exists),
+            Ok(Err(e)) => Err(e.to_string()),
+            Err(spent) => Err(spent.to_string()),
+        });
 
         let probe = match probe_result {
             // The catalog responded — it's reachable, so the probe passes
@@ -852,7 +914,9 @@ impl faucet_core::Sink for IcebergSink {
             .commit(self.catalog.as_ref())
             .await
             .map_err(evolve_schema_err)?;
-        Self::close_writer(&mut state).await?;
+        self.calls
+            .call_once("write", Self::close_writer(&mut state))
+            .await?;
         state.table = Some(evolved);
         Ok(())
     }
@@ -969,7 +1033,9 @@ impl faucet_core::Sink for IcebergSink {
         state.check_poisoned()?;
 
         // Step 1: close the open writer and collect its data files.
-        Self::close_writer(&mut state).await?;
+        self.calls
+            .call_once("write", Self::close_writer(&mut state))
+            .await?;
 
         // Step 2 + 3: commit pending files (or no-op when empty).
         self.commit_pending(&mut state).await?;
@@ -1218,6 +1284,28 @@ mod tests {
         ));
     }
 
+    #[test]
+    fn commit_outcome_classifies_each_result() {
+        assert_eq!(commit_outcome::<u8>(Ok(Ok(7))).ok(), Some(7));
+        let (err, definite) = commit_outcome::<u8>(Err(FaucetError::Timeout {
+            operation: "commit call (deadline)".into(),
+            after: std::time::Duration::from_secs(1),
+        }))
+        .unwrap_err();
+        assert!(matches!(err, FaucetError::Timeout { .. }), "{err:?}");
+        assert!(!definite, "a spent context may have landed the commit");
+        let (err, definite) = commit_outcome::<u8>(Ok(Err(iceberg::Error::new(
+            ErrorKind::CatalogCommitConflicts,
+            "lost the race",
+        ))))
+        .unwrap_err();
+        assert!(
+            err.to_string().contains("transaction commit failed"),
+            "{err}"
+        );
+        assert!(definite);
+    }
+
     /// Write `n` files via `io` under `dir`, returning their `file://` paths.
     async fn seed_files(io: &FileIO, dir: &std::path::Path, n: usize) -> Vec<String> {
         let mut paths = Vec::new();
@@ -1244,7 +1332,8 @@ mod tests {
         let io = FileIO::new_with_fs();
         let paths = seed_files(&io, dir.path(), 3).await;
 
-        let (deleted, failed) = delete_data_files(&io, &paths).await;
+        let (deleted, failed) =
+            delete_data_files(&faucet_core::CallSlot::default(), &io, &paths).await;
         assert_eq!(deleted, 3);
         assert_eq!(failed, 0);
         for p in &paths {
@@ -1268,7 +1357,8 @@ mod tests {
             dir.path().display()
         ));
 
-        let (deleted, failed) = delete_data_files(&io, &paths).await;
+        let (deleted, failed) =
+            delete_data_files(&faucet_core::CallSlot::default(), &io, &paths).await;
         assert_eq!(
             failed, 0,
             "idempotent delete of a missing file is not a failure"
@@ -1280,6 +1370,28 @@ mod tests {
         );
     }
 
+    // A delete runs under the call context: once it is cancelled the delete
+    // ends as a counted failure and the file stays (#880).
+    #[tokio::test]
+    async fn delete_data_files_honours_the_call_context() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let io = FileIO::new_with_fs();
+        let paths = seed_files(&io, dir.path(), 2).await;
+        let token = faucet_core::CancellationToken::new();
+        token.cancel();
+        let calls = faucet_core::CallSlot::default();
+        calls.install(faucet_core::CallContext::new().with_cancel(token));
+
+        let (deleted, failed) = delete_data_files(&calls, &io, &paths).await;
+        assert_eq!((deleted, failed), (0, 2));
+        for p in &paths {
+            assert!(
+                io.exists(p).await.expect("exists check"),
+                "cancelled → kept"
+            );
+        }
+    }
+
     // Cleanup is a no-op when disabled: files survive.
     #[tokio::test]
     async fn maybe_cleanup_disabled_keeps_files() {
@@ -1288,7 +1400,12 @@ mod tests {
         let paths = seed_files(&io, dir.path(), 2).await;
 
         maybe_cleanup_orphans(
-            &io, "t", /*enabled=*/ false, /*definite=*/ true, &paths,
+            &faucet_core::CallSlot::default(),
+            &io,
+            "t",
+            /*enabled=*/ false,
+            /*definite=*/ true,
+            &paths,
         )
         .await;
 
@@ -1306,7 +1423,12 @@ mod tests {
         let paths = seed_files(&io, dir.path(), 2).await;
 
         maybe_cleanup_orphans(
-            &io, "t", /*enabled=*/ true, /*definite=*/ false, &paths,
+            &faucet_core::CallSlot::default(),
+            &io,
+            "t",
+            /*enabled=*/ true,
+            /*definite=*/ false,
+            &paths,
         )
         .await;
 
@@ -1326,7 +1448,12 @@ mod tests {
         let paths = seed_files(&io, dir.path(), 2).await;
 
         maybe_cleanup_orphans(
-            &io, "t", /*enabled=*/ true, /*definite=*/ true, &paths,
+            &faucet_core::CallSlot::default(),
+            &io,
+            "t",
+            /*enabled=*/ true,
+            /*definite=*/ true,
+            &paths,
         )
         .await;
 

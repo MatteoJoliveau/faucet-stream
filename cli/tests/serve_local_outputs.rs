@@ -14,6 +14,7 @@
 //!    never the directory.
 //! 5. RBAC: a viewer can look but not delete.
 #![cfg(all(feature = "catalog", feature = "source-csv", feature = "sink-jsonl"))]
+#![allow(clippy::disallowed_methods)] // tests drive time and raw clients directly
 
 use serde_json::Value;
 use std::time::Duration;
@@ -93,6 +94,7 @@ fn serve_args_with_retention(
         vault_previous_key: Vec::new(),
         connect_providers: None,
         allow_subprocess_connectors: false,
+        references: Default::default(),
     }
 }
 

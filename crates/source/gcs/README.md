@@ -472,6 +472,16 @@ cluster coordinator a run reads every object, unchanged.
 > *total* object set (matching single-worker semantics) rather than
 > multiplying by the shard count.
 
+## Timeouts, cancellation and retries
+
+Every object-store request — listings, object and metadata reads, each ranged
+Parquet read — runs through the pipeline's `CallContext` (#880): the run's
+cancel token stops an in-flight request, any caller deadline ends it, and round
+trips are still metered as `list` / `get` (see Usage signals). The object body
+is read under the same context, so a body that stops arriving mid-stream ends at
+the deadline or on cancel too. The client's own timeouts and retry are
+unchanged.
+
 ## License
 
 Licensed under either of [Apache License, Version 2.0](https://www.apache.org/licenses/LICENSE-2.0) or [MIT license](https://opensource.org/licenses/MIT) at your option.
@@ -484,3 +494,7 @@ meter as a source round trip. Reads and metadata reads are priced as GCS
 class-B requests (`usage.pricing.object_storage.read_per_1k_requests`), a
 listing as class A (`write_per_1k_requests`); see the
 [usage cookbook](https://faucet-hq.github.io/faucet-stream/cookbook/usage.html).
+
+## Capabilities
+
+Shardable (hash of object key) and discoverable; columnar (with `arrow`) for `file_format: parquet`, and for `avro` / `orc` with their format features. Not exactly-once. `faucet list --json` prints the declaration.

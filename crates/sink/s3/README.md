@@ -489,6 +489,14 @@ is refused on a best-effort configuration unless the `dlq:` block sets
 already landed a second time). See
 [batch atomicity](https://faucet-hq.github.io/faucet-stream/cookbook/dlq.html#batch-atomicity-and-dlq_all).
 
+## Timeouts, cancellation and retries
+
+Every object-store request — uploads and multipart parts, listings, copies,
+deletes — runs through the pipeline's `CallContext` (#880): each is sent once,
+any caller deadline ends it, and round trips are still metered as `put` /
+`list` / `head` / `get` / `copy` / `delete`. The SDK's own timeouts and retry
+are unchanged.
+
 ## License
 
 Licensed under either of [Apache License, Version 2.0](https://www.apache.org/licenses/LICENSE-2.0) or [MIT license](https://opensource.org/licenses/MIT) at your option.
@@ -519,3 +527,7 @@ A request that fails with HTTP 429 or a 5xx (`SlowDown`,
 `ServiceUnavailable`, …) is reported as a typed `HttpStatus` error, so a
 pipeline [`resilience:`](https://faucet-hq.github.io/faucet-stream/cookbook/resilience.html)
 policy retries it; any other failure is a plain sink error.
+
+## Capabilities
+
+Write modes `append` and `overwrite`; no exactly-once or keyed upsert. Columnar for Parquet and Avro output (with the `arrow` feature). For CSV output under `csv.on_unknown_field: warn` it declares that it drops fields outside the frozen header (`schema_report: drops_unknown_fields`), so `schema.on_drift: fail` is refused at load time. `faucet list --json` prints the declaration.

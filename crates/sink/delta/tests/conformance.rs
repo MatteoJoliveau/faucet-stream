@@ -39,6 +39,21 @@ async fn conformance_connector_name_nonempty() {
     );
 }
 
+// ── Descriptor agreement (RFC 0013) ───────────────────────────────────────────
+#[tokio::test(flavor = "multi_thread")]
+async fn conformance_descriptor_matches_built_sink() {
+    let dir = tempfile::tempdir().unwrap();
+    let v = serde_json::json!({ "table_uri": table_uri(&dir, "descriptor") });
+    let cfg: DeltaSinkConfig = serde_json::from_value(v.clone()).unwrap();
+    let built = DeltaSink::new(cfg).await.expect("sink");
+    faucet_conformance::assert_descriptor_matches_sink(
+        &faucet_sink_delta::DESCRIPTOR,
+        "delta",
+        &v,
+        &built,
+    );
+}
+
 // ── Check 11: preflight check() is well-formed ────────────────────────────────
 /// A reachable local warehouse makes the metadata-open probe pass (the table
 /// need not exist yet); the check must return Ok(report) with a well-formed
@@ -53,6 +68,43 @@ async fn conformance_preflight_check_wellformed() {
     faucet_conformance::assert_sink_preflight_check_wellformed(
         &sink,
         &faucet_core::check::CheckContext::default(),
+    )
+    .await;
+}
+
+// ── Check: backend calls honour the call deadline and cancel (#880) ──────────
+
+fn block_on<F: std::future::Future>(f: F) -> F::Output {
+    tokio::task::block_in_place(|| tokio::runtime::Handle::current().block_on(f))
+}
+
+fn hung_table(endpoint: &str) -> serde_json::Value {
+    serde_json::json!({
+        "table_uri": "s3://hung/table",
+        "storage_options": {
+            "AWS_ENDPOINT_URL": endpoint,
+            "AWS_ACCESS_KEY_ID": "k",
+            "AWS_SECRET_ACCESS_KEY": "s",
+            "AWS_REGION": "us-east-1",
+            "AWS_ALLOW_HTTP": "true",
+            "AWS_S3_ALLOW_UNSAFE_RENAME": "true"
+        }
+    })
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn conformance_call_deadline() {
+    let hung = faucet_conformance::hung::SilentListener::start()
+        .await
+        .expect("listener");
+    let v = hung_table(&hung.http_url());
+    faucet_conformance::calls::assert_sink_call_deadline(
+        || {
+            let cfg: faucet_sink_delta::DeltaSinkConfig =
+                serde_json::from_value(v.clone()).expect("config");
+            block_on(faucet_sink_delta::DeltaSink::new(cfg)).expect("sink")
+        },
+        &[serde_json::json!({"id": 1})],
     )
     .await;
 }

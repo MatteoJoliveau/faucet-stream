@@ -92,6 +92,82 @@ name — it is the `connector` metric label) and `dataset_uri` (the lineage
 identity; credential-free — `faucet_core::redact_uri_credentials` strips
 userinfo from a URL).
 
+### Wrapping another connector
+
+A **wrapper** holds an inner source or sink and changes part of its behaviour:
+it stamps a column, caps the row count, samples records, overrides the state
+key. Every hook the wrapper does not define falls back to its trait default,
+which turns the feature behind it off for everything the wrapper holds:
+exactly-once, upsert, the columnar fast path, multi-table routing. Don't write
+the pass-throughs by hand. `forward_source!` / `forward_sink!` generate the
+forwarding body of every hook, so you write only the hooks you change, and a
+hook added to the trait in a later release reaches the inner connector without
+any change to your wrapper:
+
+```rust,ignore
+use faucet_core::{async_trait, forward_sink, FaucetError, Sink, Value};
+
+struct Counted {
+    inner: Box<dyn Sink>,
+    rows: std::sync::atomic::AtomicUsize,
+}
+
+#[async_trait]
+impl Sink for Counted {
+    async fn write_batch(&self, records: &[Value]) -> Result<usize, FaucetError> {
+        let n = self.inner.write_batch(records).await?;
+        self.rows.fetch_add(n, std::sync::atomic::Ordering::Relaxed);
+        Ok(n)
+    }
+    // The other write paths must be counted too, so they take the trait
+    // default (which calls `write_batch` above) instead of being forwarded.
+    forward_sink!(inner; except write_batch, write_batch_partial,
+        write_batch_idempotent, supports_idempotent_writes,
+        supports_columnar, write_batch_columnar,
+        native_load_capabilities, load_native);
+}
+```
+
+The list after `except` is exact. A name that is not a hook of the trait does
+not compile, and a hook you define without listing it is a duplicate
+definition. A listed hook you don't define takes the trait default, which is
+how you switch a path off.
+
+Forwarding is verbatim. That includes the convenience hooks whose default calls
+another hook (`fetch_all`, `stream_pages`, `check`, `write_batch_partial`,
+`write_batch_idempotent`). If your wrapper changes a hook, list the other hooks
+that must go through the change rather than straight to the inner connector.
+One exception is automatic: a wrapper that lists `write_batch` does not forward
+`write_batch_reported` either, so the pipeline's reported write goes through
+your `write_batch` (#879). Define `write_batch_reported` yourself to pass the
+inner sink's coalescing / skip report through. The same holds for the
+exactly-once write: a wrapper that lists `write_batch_idempotent` does not
+forward `write_batch_idempotent_reported`; define it to pass the inner report
+through.
+
+Then prove it with the forwarding harness from `faucet-conformance`.
+`HookSource` / `HookSink` answer every hook differently from the default and
+record which hooks were reached. The assertion calls every hook through your
+wrapper and names any that never got to the inner connector, except the ones
+you list as deliberately not forwarded:
+
+```rust,ignore
+use faucet_conformance::forwarding::{HookSink, assert_sink_forwards_every_hook};
+
+#[tokio::test]
+async fn counted_forwards_every_hook_it_does_not_count() {
+    let probe = HookSink::default();
+    let wrapped = Counted { inner: Box::new(probe.clone()), rows: Default::default() };
+    assert_sink_forwards_every_hook(
+        &wrapped,
+        &probe,
+        &["supports_idempotent_writes", "supports_columnar", "write_batch_columnar",
+          "native_load_capabilities", "load_native"],
+    )
+    .await;
+}
+```
+
 ## Crate layout
 
 Follow the same module layout as the built-in connectors:
@@ -157,6 +233,35 @@ bookmark. The bookmark never moves ahead of durable data, which asks of you:
   re-read on the next run. Default delivery is at-least-once, so every sink must
   tolerate seeing a page twice. An empty slice is a cheap `Ok(0)`.
 
+**Row accounting.** The pipeline checks that every row it offers a sink is
+accounted for (#879): it calls `write_batch_reported` and fails the page with
+`RowsUnaccounted` when the report covers fewer rows than were offered — so
+`write_batch` must return the number of rows it wrote, not the number of
+requests or a count the backend may lower. The default report wraps that
+count, and for a sink configured to merge rows by key (`dedups_by_key()`)
+credits the shortfall as coalesced. Override `write_batch_reported` when the
+sink declines rows **by design of its configuration** (a key policy that
+skips records, a preview cap) and report them as skipped:
+
+```rust,ignore
+async fn write_batch_reported(&self, records: &[Value]) -> Result<WriteReport, FaucetError> {
+    let (written, skipped) = self.produce(records).await?;
+    Ok(WriteReport::accepted(written).with_skipped(skipped))
+}
+```
+
+A row the sink could not write is never "skipped": return it as a per-row
+`Err` from `write_batch_partial` (it goes to the DLQ) or fail the batch.
+
+The exactly-once path is held to the same rule. It calls
+`write_batch_idempotent_reported`, whose default wraps
+`write_batch_idempotent`'s count the same way; a page whose report is short
+fails with `RowsUnaccounted` after the sink committed its token but before the
+bookmark is persisted, so the run is red and the next run resumes from the
+sink's watermark. An idempotent sink that declines rows by design inside the
+atomic commit overrides `write_batch_idempotent_reported` and reports them as
+skipped (the kafka sink does this for `on_key_error: skip`).
+
 **Per-row outcomes.** Override `write_batch_partial` when the backend reports
 per-row results or a row is invalid before sending (a missing key): one outcome
 per input row, in order; an outer `Err` means the whole call failed. Declare
@@ -182,6 +287,57 @@ goes for every `supports_*` probe and for `supported_write_modes()` — the CLI
 gates configs on them. A sink that lists `Upsert` but can't apply a
 `delete_marker` rejects it as a `Config` error rather than ignoring it.
 
+### Declaring capabilities
+
+The CLI checks a config before it builds anything, so it cannot ask a built
+connector what it supports. Each connector therefore ships a static
+`faucet_core::ConnectorDescriptor` next to its factory: its `type:` name and a
+pure `fn(&Value) -> Capabilities` that answers from the config alone (RFC 0013).
+Every load-time gate — write mode, exactly-once, cleanup, rollback, schema drift,
+`faucet verify` range mode, `faucet discover` — reads it, and `faucet list --json`
+prints it.
+
+```rust
+use faucet_core::capabilities::config;
+use faucet_core::{Capabilities, ConnectorDescriptor, Value, WriteMode};
+
+pub const DESCRIPTOR: ConnectorDescriptor = ConnectorDescriptor::new("acme", capabilities);
+
+fn capabilities(cfg: &Value) -> Capabilities {
+    let modes = [WriteMode::Append, WriteMode::Upsert, WriteMode::Delete];
+    Capabilities::builder()
+        .write_modes(modes)
+        .keyed_upsert(true)
+        // A config fact: true only when *this* config upserts by a key.
+        .keyed_dedup(!cfg.is_null() && config::dedups_by_key(cfg))
+        .build()
+}
+```
+
+- Called with a config object, the function must return exactly what
+  `Sink::capabilities()` / `Source::capabilities()` of a connector built from
+  that config returns. The trait method is defaulted and derives every field
+  from the per-capability methods above, so most connectors only write the
+  descriptor. Override `capabilities()` for what no method expresses —
+  `range_read` / `range_digest` / `reports_lag` / `table_routing` (your
+  source implements `record_table`) / `read_side_effects` (reading creates a
+  slot, joins a consumer group or opens a listener) on a source,
+  `scoped_overwrite` / `schema_report` on a sink — starting from
+  `Capabilities::of_source(self)` / `of_sink(self)`.
+- Called with `Value::Null`, it returns the kind-level view: every capability
+  some valid config enables (`keyed_dedup` stays `false`).
+- Read fields leniently (`faucet_core::capabilities::config`): a config may still
+  hold `${…}` tokens, and the function must never fail.
+- A sink that silently drops record fields its destination lacks declares
+  `schema_report(SchemaReport::DropsUnknownFields)`: a drift policy cannot see
+  those fields, so `schema.on_drift: fail` is refused at load time
+  ([Feature compatibility](../reference/compatibility.md)).
+- In `tests/conformance.rs`, build the connector from a few configs and call
+  `faucet_conformance::assert_descriptor_matches_source` / `_sink` with each.
+- A custom binary registers it with `register_source_described` /
+  `register_sink_described`; a connector registered without one is treated as
+  append-only with no capabilities.
+
 ### Multi-table mirror hooks
 
 A CDC source joins a multi-table `faucet mirror` (`mirror.tables`) through four
@@ -196,11 +352,108 @@ applied part of it:
 | `position_min(positions)` | The earliest position every table can resume from. Override it when positions are only partially ordered (one cursor per capture instance). |
 | `record_covered(&record, &position)` | Whether a run resumed from `position` would not deliver `record` again. **Implement it**: pages are cut differently on replay, so a page can straddle a table's committed position, and only this per-record test drops what that table already applied. Returning `None` (the default) re-delivers those changes — duplicates on an append destination; the mirror logs a warning when it happens. |
 
-## Retries
+## Backend calls: `CallContext`, `http::Client`, batching
 
-- **Reads and other idempotent calls** inside your connector retry transient
-  failures with `faucet_core::execute_with_retry`, which retries only errors
-  whose `is_retriable()` is true, with capped exponential backoff and jitter.
+Every call a connector makes to its backend goes through
+[`faucet_core::io::CallContext`](https://docs.rs/faucet-core/latest/faucet_core/io/struct.CallContext.html)
+(RFC 0013, #880). One `ctx.call(op, || fut)` applies the per-call timeout, the
+run's deadline, classified retry (a `FaucetError::RateLimited(wait)` waits the
+time it states), prompt cancellation, round-trip metering and redaction of the
+error it returns. Don't write a retry loop, a timeout or a backoff sleep.
+
+Keep one in a `CallSlot`, built in `new()` from what your config documents,
+and let the pipeline install the run's part:
+
+```rust
+use faucet_core::io::{CallContext, CallSlot};
+
+pub struct AcmeSource {
+    client: faucet_core::http::Client,
+    calls: CallSlot,
+}
+
+impl AcmeSource {
+    pub fn new(config: AcmeConfig) -> Result<Self, FaucetError> {
+        let client = faucet_core::http::Client::builder()
+            .timeout(config.timeout)
+            .sensitive_header("x-api-key")
+            .build()?;
+        let calls = CallSlot::new(
+            CallContext::new()
+                .with_timeout(config.timeout)
+                .with_retry(faucet_core::RetryPolicy {
+                    max_attempts: config.max_retries + 1,
+                    ..Default::default()
+                }),
+        );
+        Ok(Self { client, calls })
+    }
+
+    async fn page(&self, url: &str) -> Result<Value, FaucetError> {
+        let resp = self
+            .client
+            .execute(&self.calls.get(), "page", || self.client.get(url))
+            .await?;
+        self.client.json(resp).await
+    }
+}
+
+#[async_trait]
+impl Source for AcmeSource {
+    fn set_call_context(&self, ctx: CallContext) {
+        self.calls.install(ctx);
+    }
+    fn set_roundtrip_recorder(&self, r: Arc<RoundtripRecorder>) {
+        self.calls.install_recorder(r);
+    }
+    // …
+}
+```
+
+What you get, and who sets it:
+
+| Setting | Set by | Default |
+|---|---|---|
+| attempt timeout (`with_timeout` / `without_timeout`) | the connector, from its config; else the caller | `DEFAULT_CALL_TIMEOUT` (300 s) |
+| retry policy (`with_retry`) | the connector | one attempt |
+| rate-limit budget (`with_rate_limit_retries`) | the connector | a rate limit is an ordinary attempt |
+| deadline | the caller (`Pipeline::with_call_context`) | none |
+| cancel token | the pipeline, **sources only** | none |
+| round-trip recorder | the pipeline | none |
+| redactor | the caller | the process-wide `faucet_core::redact` hook |
+
+`ctx.call` counts every attempt as a round trip labelled `op` (a closed,
+connector-defined set — `query`, `page`, `put`). Use `ctx.wait(d)` for a pause
+that is not a retry (a poll interval, a pacing delay): it ends early on cancel
+and at the deadline.
+
+`ctx.call_once(op, fut)` runs a call that cannot be rebuilt — a statement on a
+borrowed transaction or connection, a step of a cursor or row stream, a
+non-idempotent write — in exactly one attempt, with the same timeout, deadline,
+cancel, metering and redaction. When the backend's client is not cancel-safe
+(a TDS connection dropped mid-response, a query running on a blocking thread),
+check whether the call was cut short (`FaucetError::Timeout` / `Cancelled`) and
+repair what it left behind: replace the connection, interrupt the query.
+
+A sink's context never carries the run's cancel token — a cancelled run still
+flushes its sinks — and neither side gets a retry policy from the pipeline.
+
+When a call cannot be rebuilt for a retry (a write, a request that consumes a
+body, an SDK future), use the one-shot forms. They apply the timeout, the
+deadline and the cancel token and count the round trip, but never retry:
+
+- `slot.call_once("put", fut)` / `ctx.call_once("put", fut)` for a future
+  returning `Result<T, FaucetError>`;
+- `fut.within(&slot, "put")` / `fut.within_ctx(&ctx, "put")`
+  (`faucet_core::CallExt`) for any other future — an SDK call whose error you
+  map afterwards;
+- `ctx.reader(inner)` wraps an `AsyncRead` (a streamed object body, a child
+  process pipe) so a read that stalls ends at the deadline (`TimedOut`) or on
+  cancel (`Interrupted`) instead of hanging.
+
+### Retries and writes
+
+- **Reads and other idempotent calls** retry through your context's policy.
   Expose the retry count in config.
 - **Sink writes** are retried by the pipeline (under a `resilience:` policy),
   and a plain `write_batch` only when `write_batch_is_replay_safe()` is true —
@@ -210,22 +463,67 @@ applied part of it:
   `PUT`).
 - Never retry a non-idempotent write inside your own `write_batch`: if the
   server committed and the response was lost, the retry duplicates every row.
-  Let the error propagate; the page is replayed from the last checkpoint.
+  Give such a call `without_retry()` and let the error propagate; the page is
+  replayed from the last checkpoint ([ADR 0007](https://github.com/faucet-hq/faucet-stream/blob/main/docs/adr/0007-retries.md)).
+
+### HTTP connectors
+
+Build clients with `faucet_core::http::Client`, never `reqwest::Client`
+directly. It follows redirects itself so a hop to another origin drops
+`Authorization`, cookies, every header marked sensitive and every header named
+with `sensitive_header`, and never replays a request body to another origin. It
+refuses a buffered body above `max_response_bytes` (1 GiB by default), turns a
+non-2xx response into `FaucetError::HttpStatus` (a `429`/`503` with
+`Retry-After` into `RateLimited`), and strips credentials from the URLs errors
+carry. `client.execute(&ctx, op, || request)` runs a request under a context;
+`client.send(request)` sends one attempt when you classify the response
+yourself. reqwest options it does not name (compression, mutual TLS) go
+through `ClientBuilder::configure`.
+
+### Batching
+
+`faucet_core::batching::chunks(records, batch_size)` re-chunks a page under the
+`batch_size` contract (`0` = one request for the whole page);
+`map_concurrent` / `for_each_concurrent` run work with at most `n` in flight
+and stop at the first error, and `ConcurrencyLimit` bounds work spread over
+separate calls.
+
+### The lint
+
+The workspace `clippy.toml` disallows `reqwest::Client::new`,
+`reqwest::Client::builder`, `reqwest::ClientBuilder::new`,
+`tokio::time::sleep`, `tokio::time::sleep_until` and `std::thread::sleep`, and
+CI runs clippy with `-D warnings`. A site that genuinely needs one — a
+test driving time, a server-side timer that is not a backend wait — carries
+`#[allow(clippy::disallowed_methods)] // <reason>`. A third-party connector in
+its own repository can copy the same `clippy.toml`.
+
+Prove it: call
+`faucet_conformance::calls::assert_source_call_deadline` (or
+`assert_sink_call_deadline`) from your `tests/conformance.rs` against a backend
+that never answers (a wiremock server with a long `set_delay`); it checks the
+call ends at the deadline and on cancel. For a non-HTTP protocol,
+`faucet_conformance::hung::SilentListener` accepts connections and never
+writes a byte, and `HangingProxy` forwards to a real backend (an emulator)
+until you call `hang()`, so a client that connects in `new()` can be built
+first and then stalled. A connector with no backend round trip (a local file)
+is listed with its reason in `crates/conformance/call-deadline-exempt.txt`.
 
 ## Make it fast
 
 Performance is the project's first principle, and none of this may trade away
 the ordering rules above:
 
-- Build HTTP clients, pools and producers once in `new()` and store them; never
-  per call, page or record. Bound database pools with a `max_connections`
+- Build HTTP clients (`faucet_core::http::Client`), pools and producers once
+  in `new()` and store them; never per call, page or record. Bound database pools with a `max_connections`
   field.
 - Use bulk APIs: multi-row `INSERT … VALUES (…), (…)` or `COPY` per batch inside
   a transaction, a bulk HTTP endpoint per chunk, pipelining for key-value
   stores. One statement per record is a defect. Make the per-request limit a
   config field with a safe default.
-- Bound parallel I/O (`buffer_unordered(concurrency)` or a semaphore) and expose
-  `concurrency`; concurrency must never reorder emitted pages.
+- Bound parallel I/O (`faucet_core::batching::map_concurrent`, or
+  `ConcurrencyLimit` across calls) and expose `concurrency`; concurrency must
+  never reorder emitted pages.
 - Put blocking or CPU-heavy work (synchronous drivers, encoding, compression)
   on `tokio::task::spawn_blocking`; buffer file and socket writers.
 - Don't log or meter per record. The pipeline already records metrics and spans
@@ -391,8 +689,14 @@ each one's exact signature for your version):
 | a discoverable source | discover round-trips (integration-level) |
 | every sink | config schema valid, connector name non-empty, capabilities truthful, well-formed `check()` probe |
 | a keyed or idempotent sink | idempotent replay, write modes truthful |
-| a sink with schema evolution / a declared batch atomicity | schema evolution effective / batch atomicity declared |
+| a sink with schema evolution | schema evolution effective |
+| a sink declaring atomic batches | batch atomicity truthful (pass a page holding a row the sink rejects) |
+| a sink overriding `write_batch_partial` | partial outcomes truthful |
+| a sink overriding `write_batch_reported` | reported rows truthful |
+| a keyed (replay-safe) sink | replay safe |
+| a sink with `write_mode: overwrite` | overwrite lifecycle (seed the destination first) |
 | a buffering sink | cancellation flushes (integration-level) |
+| a connector with backend calls | call deadline (see [Backend calls](#backend-calls-callcontext-httpclient-batching)) |
 
 The sink checks write rows keyed on `"id"` with a `"v"` column, so configure
 the sink under test `write_mode: upsert`, `key: ["id"]` for the keyed checks.
@@ -400,6 +704,26 @@ They measure row-count deltas through your `distinct_count` closure, so give
 each check its own fresh destination (a new mock server, table or container).
 `faucet_conformance::doubles` has a counting source and a test sink for testing
 your own wrappers.
+
+**A declared capability needs its check.** `faucet_conformance::required::REQUIREMENTS`
+is the table behind the rows above: each capability, how a connector declares
+it (a descriptor flag, a write mode, a trait-method override, a buffering
+`flush`, a declared `BatchAtomicity`) and the assertions that prove it. For the
+built-in connectors CI enforces it: `scripts/conformance-coverage.py` (the
+`Doc counts` job) reads the committed snapshot
+`crates/conformance/declared-capabilities.json` plus each crate's `src/` and
+`tests/conformance.rs`, and fails when a declared capability has no matching
+assertion call. A check that genuinely cannot run in CI (no emulator for the
+backend) goes in `crates/conformance/conformance-coverage-exempt.txt` with the
+reason; an exemption that no longer applies fails the run too. When a
+connector's declared capabilities change, regenerate the snapshot with
+`cargo test -p faucet-cli --features full --test declared_capabilities -- --ignored regenerate`.
+
+A check that needs a second connector — a sink counted back through its own
+source — lives in `crates/interop-tests/tests/<kind>_conformance.rs` (or
+`<kind>_<role>_conformance.rs`), which the script reads as well. A cloud client
+whose futures overflow the default test stack in a debug build runs its test
+body through `faucet_conformance::block_on_large_stack`.
 
 The full contract is the
 [Faucet Connector Protocol (FCP v0)](../spec/faucet-connector-spec-v0.md).

@@ -4,6 +4,7 @@
 //! they don't depend on being the first installer of the Prometheus recorder.
 //! Requires the `serve` feature.
 #![cfg(feature = "serve")]
+#![allow(clippy::disallowed_methods)] // tests drive time and raw clients directly
 
 use faucet_cli::cli::ServeArgs;
 use faucet_cli::serve::ServeConfig;
@@ -66,6 +67,7 @@ fn args_on(port: u16, token: Option<&str>) -> ServeArgs {
         vault_previous_key: Vec::new(),
         connect_providers: None,
         allow_subprocess_connectors: false,
+        references: Default::default(),
     }
 }
 
@@ -218,8 +220,17 @@ async fn doctor_first_rejects_bad_connector() {
     let client = reqwest::Client::new();
     let base = format!("http://127.0.0.1:{port}");
 
+    // Inside the temp dir, so the reference policy (#881) admits the paths and
+    // the missing file is left for doctor to catch.
+    let tmp = std::env::temp_dir();
+    let missing = tmp.join("faucet-no-such-file.csv");
+    let out = tmp.join("faucet-doctor-first-out.jsonl");
     let body = serde_json::json!({
-        "config": "version: 1\npipeline:\n  source: { type: csv, config: { path: /no/such/file.csv } }\n  sink: { type: jsonl, config: { path: /tmp/out.jsonl } }\n",
+        "config": format!(
+            "version: 1\npipeline:\n  source: {{ type: csv, config: {{ path: {} }} }}\n  sink: {{ type: jsonl, config: {{ path: {} }} }}\n",
+            missing.display(),
+            out.display()
+        ),
         "doctor_first": true
     });
     let resp = client
@@ -505,4 +516,49 @@ async fn cancel_of_queued_run_transitions_to_cancelled() {
         status, "cancelled",
         "a queued run must cancel promptly without waiting for a permit (#146 R E6)"
     );
+}
+
+/// A finished run's detail carries each invocation's row account (#879).
+#[tokio::test(flavor = "multi_thread")]
+async fn run_detail_carries_the_row_account() {
+    let port = free_port();
+    spawn_server(port, None).await;
+    let client = reqwest::Client::new();
+    let base = format!("http://127.0.0.1:{port}");
+
+    let dir = tempfile::tempdir().unwrap();
+    let input = dir.path().join("in.csv");
+    std::fs::write(&input, "name\nalice\nbob\ncarol\n").unwrap();
+    let output = dir.path().join("out.jsonl");
+    let submit: serde_json::Value = client
+        .post(format!("{base}/v1/runs"))
+        .json(&serde_json::json!({ "config": csv_to_jsonl_yaml(&input, &output) }))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let run_id = submit["run_id"].as_str().unwrap().to_string();
+
+    let mut rec = serde_json::Value::Null;
+    for _ in 0..800 {
+        rec = client
+            .get(format!("{base}/v1/runs/{run_id}"))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        if rec["status"] == "completed" || rec["status"] == "failed" {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    assert_eq!(rec["status"], "completed", "{rec:#}");
+    let rows = &rec["invocations"][0]["rows"];
+    assert_eq!(rows["offered"], 3, "{rec:#}");
+    assert_eq!(rows["accepted"], 3, "{rec:#}");
+    assert_eq!(rows["unaccounted"], 0, "{rec:#}");
 }

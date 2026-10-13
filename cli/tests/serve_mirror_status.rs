@@ -2,6 +2,7 @@
 //! its state store on a real RBAC server — viewers may read it, the config must
 //! name the mirror, a mirror that never ran is a 422, and every read is audited.
 #![cfg(all(feature = "serve", feature = "source-csv", feature = "sink-jsonl"))]
+#![allow(clippy::disallowed_methods)] // tests drive time and raw clients directly
 
 use faucet_core::{FileStateStore, StateStore};
 use serde_json::{Value, json};
@@ -74,6 +75,7 @@ async fn spawn_server(port: u16, dir: &Path) {
         vault_previous_key: Vec::new(),
         connect_providers: None,
         allow_subprocess_connectors: false,
+        references: Default::default(),
     };
     let mut config = faucet_cli::serve::ServeConfig::from_args(args).unwrap();
     config.log_level = "warn".into();

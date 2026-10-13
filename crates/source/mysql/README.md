@@ -271,6 +271,8 @@ alias the columns.
 | Compression | ❌ | No `compression` feature. |
 | Per-record (matrix) queries | ✅ | `${parent.field}` → SQL bind parameters. |
 
+Declared capabilities: `discover`, `range_read` and `range_digest` (`faucet verify` reads and digests one integer-key range server-side), and `shardable` when a `shard:` block is set. `faucet list --json` prints the declaration.
+
 ## Config loading
 
 Load a config from a JSON file, environment variables, or a `.env` file via the helpers in `faucet_core::config`:
@@ -433,6 +435,10 @@ where its previous owner left off.
 
 Outside the cluster coordinator the `shard` config has **no effect** — a plain
 `faucet run` streams the whole query.
+
+## Timeouts, cancellation and retries
+
+Every query runs through the pipeline's `CallContext` (#880): the run's deadline and cancel token end an in-flight query, or a stalled row read, promptly; `read_timeout_secs` still bounds each server read. Each query counts as one `query` round trip in `faucet_source_roundtrips_total` (`describe` for the charset probe, `discover` for catalog reads). Reads are not retried.
 
 ## License
 

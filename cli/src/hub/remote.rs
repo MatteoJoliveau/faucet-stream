@@ -134,9 +134,10 @@ impl GithubHub {
                 "GithubHub::new called with a local hub location".into(),
             ));
         };
-        let client = reqwest::Client::builder()
+        let client = faucet_core::http::Client::builder()
             .user_agent(concat!("faucet-stream/", env!("CARGO_PKG_VERSION")))
-            .build()
+            .sensitive_header("authorization")
+            .build_reqwest()
             .map_err(|e| net_err("building HTTP client", e))?;
         let token = github_token(repo);
         Ok(Self {

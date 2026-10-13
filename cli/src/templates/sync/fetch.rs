@@ -343,9 +343,9 @@ impl GithubFetcher {
                 cfg.repo
             )));
         }
-        let client = reqwest::Client::builder()
+        let client = faucet_core::http::Client::builder()
             .user_agent(concat!("faucet-stream/", env!("CARGO_PKG_VERSION")))
-            .build()
+            .build_reqwest()
             .map_err(|e| io_err("github", format!("building HTTP client: {e}")))?;
         Ok(Self {
             client,

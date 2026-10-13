@@ -163,3 +163,74 @@ async fn start_sftp() -> Option<(ContainerAsync<GenericImage>, u16)> {
     }
     started
 }
+
+// ── Descriptor (RFC 0013): agrees with the built source ─────────────────────
+
+fn descriptor_config(base: serde_json::Value, extra: serde_json::Value) -> serde_json::Value {
+    let mut v = base;
+    for (k, x) in extra.as_object().unwrap() {
+        v[k] = x.clone();
+    }
+    v
+}
+
+#[test]
+fn descriptor_matches_built_source() {
+    let base = serde_json::to_value(SftpSourceConfig::new(
+        SftpConnectionConfig {
+            host: "127.0.0.1".to_string(),
+            port: 1,
+            username: "nobody".to_string(),
+            auth: SftpAuth::Password {
+                password: "x".to_string(),
+            },
+            known_hosts: HostKeyPolicy::Insecure,
+            connect_timeout_secs: 30,
+            keepalive_interval_secs: 15,
+        },
+        "/data",
+    ))
+    .unwrap();
+    let mut cases = vec![
+        serde_json::json!({}),
+        serde_json::json!({"format": "json_array"}),
+        serde_json::json!({"format": "raw_text"}),
+    ];
+    #[cfg(feature = "arrow")]
+    cases.push(serde_json::json!({"format": "parquet"}));
+    #[cfg(feature = "file-format-avro")]
+    cases.push(serde_json::json!({"format": "avro"}));
+    #[cfg(feature = "file-format-orc")]
+    cases.push(serde_json::json!({"format": "orc"}));
+    for extra in cases {
+        let v = descriptor_config(base.clone(), extra);
+        let cfg: SftpSourceConfig = serde_json::from_value(v.clone()).unwrap();
+        let built = SftpSource::new(cfg).expect("source builds lazily");
+        faucet_conformance::assert_descriptor_matches_source(
+            &faucet_source_sftp::DESCRIPTOR,
+            "sftp",
+            &v,
+            &built,
+        );
+    }
+}
+
+// ── Check: backend calls honour the call deadline and cancel (#880) ──────────
+
+fn hung_connection(port: u16) -> SftpConnectionConfig {
+    SftpConnectionConfig::with_password("127.0.0.1", "u", "p")
+        .port(port)
+        .known_hosts(HostKeyPolicy::Insecure)
+}
+
+#[tokio::test]
+async fn conformance_call_deadline() {
+    let hung = faucet_conformance::hung::SilentListener::start()
+        .await
+        .expect("listener");
+    let port = hung.port();
+    faucet_conformance::calls::assert_source_call_deadline(|| {
+        SftpSource::new(SftpSourceConfig::new(hung_connection(port), "/data")).unwrap()
+    })
+    .await;
+}

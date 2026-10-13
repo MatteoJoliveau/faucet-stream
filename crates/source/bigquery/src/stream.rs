@@ -52,6 +52,10 @@ pub struct BigQuerySource {
     /// `query` (`jobs.query`), `poll` (`jobs.getQueryResults`), `job`
     /// (`jobs.get`). Cost signal: `bytes_processed` (bytes) per query.
     roundtrips: faucet_core::observability::RecorderSlot,
+    /// Backend-call context (#880): every request runs through it for the
+    /// run's timeout, deadline and cancel. Round trips stay counted by
+    /// `roundtrips`, so the slot does not meter them a second time.
+    calls: faucet_core::CallSlot,
     /// The client's token provider, when the source built the client.
     tokens: Option<TokenProvider>,
     /// `jobs.getQueryResults` reader with integer-microsecond timestamps,
@@ -59,7 +63,35 @@ pub struct BigQuerySource {
     results: tokio::sync::OnceCell<QueryResultsReader>,
 }
 
+/// The source's call slot: the default attempt timeout, no retry, and no
+/// round-trip metering (the `roundtrips` slot counts them).
+fn call_slot() -> faucet_core::CallSlot {
+    faucet_core::CallSlot::new(faucet_core::CallContext::new().with_roundtrip_metering(false))
+}
+
 impl BigQuerySource {
+    /// The effective call context (#880), for the Storage Read path.
+    #[cfg(feature = "arrow")]
+    pub(crate) fn call_context(&self) -> faucet_core::CallContext {
+        self.calls.get()
+    }
+
+    /// `jobs.query` for `req` as one backend call.
+    async fn run_query(&self, req: &QueryRequest) -> Result<QueryResponse, FaucetError> {
+        self.calls
+            .call("query", || async {
+                faucet_common_bigquery::raw::tolerant_query(
+                    &self.client,
+                    self.raw_target(),
+                    &self.config.project_id,
+                    req.clone(),
+                )
+                .await
+                .map_err(|e| FaucetError::Source(format!("BigQuery jobs.query failed: {e}")))
+            })
+            .await
+    }
+
     /// Where schema-tolerant fallback requests go (SQL-172).
     fn raw_target(&self) -> faucet_common_bigquery::raw::RawTarget<'_> {
         faucet_common_bigquery::raw::RawTarget {
@@ -95,6 +127,7 @@ impl BigQuerySource {
             config,
             client,
             roundtrips: faucet_core::observability::RecorderSlot::new(),
+            calls: call_slot(),
             tokens: Some(tokens),
             results: tokio::sync::OnceCell::new(),
         })
@@ -150,14 +183,7 @@ impl BigQuerySource {
         let (query, bindings) = self.resolve_query(context);
         let req = self.build_query_request(query, &bindings);
         self.roundtrips.record("query");
-        let initial = faucet_common_bigquery::raw::tolerant_query(
-            &self.client,
-            self.raw_target(),
-            &self.config.project_id,
-            req,
-        )
-        .await
-        .map_err(|e| FaucetError::Source(format!("BigQuery jobs.query failed: {e}")))?;
+        let initial = self.run_query(&req).await?;
         self.signal_bytes_processed(&initial);
         let job_ref = initial.job_reference.as_ref().ok_or_else(|| {
             FaucetError::Source("BigQuery jobs.query returned no jobReference".into())
@@ -168,15 +194,20 @@ impl BigQuerySource {
         let poll_started = std::time::Instant::now();
         let job = loop {
             self.roundtrips.record("job");
-            let job = faucet_common_bigquery::raw::tolerant_get_job(
-                &self.client,
-                self.raw_target(),
-                &self.config.project_id,
-                job_id,
-                job_ref.location.as_deref(),
-            )
-            .await
-            .map_err(|e| FaucetError::Source(format!("BigQuery jobs.get failed: {e}")))?;
+            let job = self
+                .calls
+                .call("job", || async {
+                    faucet_common_bigquery::raw::tolerant_get_job(
+                        &self.client,
+                        self.raw_target(),
+                        &self.config.project_id,
+                        job_id,
+                        job_ref.location.as_deref(),
+                    )
+                    .await
+                    .map_err(|e| FaucetError::Source(format!("BigQuery jobs.get failed: {e}")))
+                })
+                .await?;
             if job_finished(job.status.as_ref(), job_id)? {
                 break job;
             }
@@ -187,7 +218,7 @@ impl BigQuerySource {
                     poll_timeout.as_secs()
                 )));
             }
-            tokio::time::sleep(Duration::from_millis(200)).await;
+            self.calls.wait(Duration::from_millis(200)).await?;
         };
         let dest = job
             .configuration
@@ -235,6 +266,7 @@ impl BigQuerySource {
             config,
             client,
             roundtrips: faucet_core::observability::RecorderSlot::new(),
+            calls: call_slot(),
             tokens: None,
             results: tokio::sync::OnceCell::new(),
         }
@@ -275,10 +307,16 @@ impl BigQuerySource {
                 QueryResultsReader::new(tokens, self.config.api_host.clone())
             })
             .await?;
-        reader
-            .get(&self.config.project_id, job_id, params)
+        self.calls
+            .call("poll", || async {
+                reader
+                    .get(&self.config.project_id, job_id, params.clone())
+                    .await
+                    .map_err(|e| {
+                        FaucetError::Source(format!("BigQuery jobs.getQueryResults failed: {e}"))
+                    })
+            })
             .await
-            .map_err(|e| FaucetError::Source(format!("BigQuery jobs.getQueryResults failed: {e}")))
     }
 
     /// Resolve the final SQL statement and ordered bind values for a given
@@ -319,16 +357,21 @@ impl BigQuerySource {
         let mut dataset_ids: Vec<String> = Vec::new();
         let mut page_token: Option<String> = None;
         loop {
-            let mut opts = DatasetListOptions::default();
-            if let Some(t) = page_token.take() {
-                opts = opts.page_token(t);
-            }
+            let token = page_token.take();
             let resp = self
-                .client
-                .dataset()
-                .list(project, opts)
-                .await
-                .map_err(discovery_err)?;
+                .calls
+                .call("discover", || async {
+                    let mut opts = DatasetListOptions::default();
+                    if let Some(t) = token.clone() {
+                        opts = opts.page_token(t);
+                    }
+                    self.client
+                        .dataset()
+                        .list(project, opts)
+                        .await
+                        .map_err(discovery_err)
+                })
+                .await?;
             dataset_ids.extend(
                 resp.datasets
                     .iter()
@@ -346,16 +389,21 @@ impl BigQuerySource {
         'datasets: for dataset_id in &dataset_ids {
             let mut page_token: Option<String> = None;
             loop {
-                let mut opts = TableListOptions::default();
-                if let Some(t) = page_token.take() {
-                    opts = opts.page_token(t);
-                }
+                let token = page_token.take();
                 let resp = self
-                    .client
-                    .table()
-                    .list(project, dataset_id, opts)
-                    .await
-                    .map_err(discovery_err)?;
+                    .calls
+                    .call("discover", || async {
+                        let mut opts = TableListOptions::default();
+                        if let Some(t) = token.clone() {
+                            opts = opts.page_token(t);
+                        }
+                        self.client
+                            .table()
+                            .list(project, dataset_id, opts)
+                            .await
+                            .map_err(discovery_err)
+                    })
+                    .await?;
                 for table in resp.tables.unwrap_or_default() {
                     // Physical tables only — views / materialized views /
                     // external tables are not `SELECT *`-scannable datasets in
@@ -398,15 +446,20 @@ impl BigQuerySource {
         let mut out = Vec::with_capacity(refs.len());
         for (i, (dataset_id, table_id)) in refs.iter().enumerate() {
             if i < max_schema_fetches {
-                let table = faucet_common_bigquery::raw::tolerant_get_table(
-                    &self.client,
-                    self.raw_target(),
-                    project,
-                    dataset_id,
-                    table_id,
-                )
-                .await
-                .map_err(discovery_err)?;
+                let table = self
+                    .calls
+                    .call("discover", || async {
+                        faucet_common_bigquery::raw::tolerant_get_table(
+                            &self.client,
+                            self.raw_target(),
+                            project,
+                            dataset_id,
+                            table_id,
+                        )
+                        .await
+                        .map_err(discovery_err)
+                    })
+                    .await?;
                 let fields = table.schema.fields.unwrap_or_default();
                 out.push(table_descriptor(
                     project,
@@ -622,8 +675,14 @@ impl faucet_core::Source for BigQuerySource {
         &self,
         recorder: std::sync::Arc<faucet_core::observability::RoundtripRecorder>,
     ) {
-        self.roundtrips.install(recorder);
+        self.roundtrips.install(recorder.clone());
+        self.calls.install_recorder(recorder);
     }
+
+    fn set_call_context(&self, ctx: faucet_core::CallContext) {
+        self.calls.install(ctx);
+    }
+
     fn connector_name(&self) -> &'static str {
         "bigquery"
     }
@@ -673,14 +732,7 @@ impl faucet_core::Source for BigQuerySource {
 
         let probe = async {
             self.roundtrips.record("query");
-            match faucet_common_bigquery::raw::tolerant_query(
-                &self.client,
-                self.raw_target(),
-                &self.config.project_id,
-                req,
-            )
-            .await
-            {
+            match self.run_query(&req).await {
                 Ok(_) => Ok::<Probe, Probe>(Probe::pass("query", start.elapsed())),
                 Err(e) => Err(Probe::fail_hint(
                     "query",
@@ -711,14 +763,7 @@ impl faucet_core::Source for BigQuerySource {
 
         self.roundtrips.record("query");
 
-        let initial = faucet_common_bigquery::raw::tolerant_query(
-            &self.client,
-            self.raw_target(),
-            &self.config.project_id,
-            req,
-        )
-        .await
-        .map_err(|e| FaucetError::Source(format!("BigQuery jobs.query failed: {e}")))?;
+        let initial = self.run_query(&req).await?;
 
         self.signal_bytes_processed(&initial);
 
@@ -755,7 +800,7 @@ impl faucet_core::Source for BigQuerySource {
                         poll_timeout.as_secs()
                     )));
                 }
-                tokio::time::sleep(Duration::from_millis(200)).await;
+                self.calls.wait(Duration::from_millis(200)).await?;
                 continue;
             }
 
@@ -836,9 +881,7 @@ impl faucet_core::Source for BigQuerySource {
 
             self.roundtrips.record("query");
 
-            let initial = faucet_common_bigquery::raw::tolerant_query(&self.client, self.raw_target(), &self.config.project_id, req)
-                .await
-                .map_err(|e| FaucetError::Source(format!("BigQuery jobs.query failed: {e}")))?;
+            let initial = self.run_query(&req).await?;
 
             self.signal_bytes_processed(&initial);
 
@@ -889,7 +932,7 @@ impl faucet_core::Source for BigQuerySource {
                             poll_timeout.as_secs()
                         )))?;
                     }
-                    tokio::time::sleep(Duration::from_millis(200)).await;
+                    self.calls.wait(Duration::from_millis(200)).await?;
                     continue;
                 }
 
@@ -1235,5 +1278,114 @@ mod tests {
         bindings.extend(extra);
         assert_eq!(rewritten, "SELECT * FROM t WHERE id = ?");
         assert_eq!(bindings, vec![json!(7)]);
+    }
+
+    /// `read_api` over SQL polls the query job until it is DONE and reads its
+    /// destination table (#621), through the source's call context.
+    #[cfg(feature = "arrow")]
+    #[tokio::test]
+    async fn query_destination_table_polls_the_job_to_its_destination() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/token"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "access_token": "t", "token_type": "bearer", "expires_in": 3600
+            })))
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/projects/p/queries"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "jobComplete": false,
+                "jobReference": {"projectId": "p", "jobId": "j1"}
+            })))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/projects/p/jobs/j1"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "jobReference": {"projectId": "p", "jobId": "j1"},
+                "status": {"state": "RUNNING"}
+            })))
+            .up_to_n_times(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/projects/p/jobs/j1"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "jobReference": {"projectId": "p", "jobId": "j1"},
+                "status": {"state": "DONE"},
+                "configuration": {"query": {
+                    "query": "SELECT 1",
+                    "destinationTable": {"projectId": "p", "datasetId": "_anon", "tableId": "res"}
+                }}
+            })))
+            .mount(&server)
+            .await;
+        let sa = json!({
+            "type": "service_account",
+            "project_id": "dummy",
+            "private_key_id": "dummy",
+            "private_key": "-----BEGIN PRIVATE KEY-----\nMIIEvwIBADANBgkqhkiG9w0BAQEFAASCBKkwggSlAgEAAoIBAQDNk6cKkWP/4NMu\nWb3s24YHfM639IXzPtTev06PUVVQnyHmT1bZgQ/XB6BvIRaReqAqnQd61PAGtX3e\n8XocTw+u/ZfiPJOf+jrXMkRBpiBh9mbyEIqBy8BC20OmsUc+O/YYh/qRccvRfPI7\n3XMabQ8eFWhI6z/t35oRpvEVFJnSIgyV4JR/L/cjtoKnxaFwjBzEnxPiwtdy4olU\nKO/1maklXexvlO7onC7CNmPAjuEZKzdMLzFszikCDnoKJC8k6+2GZh0/JDMAcAF4\nwxlKNQ89MpHVRXZ566uKZg0MqZqkq5RXPn6u7yvNHwZ0oahHT+8ixPPrAEjuPEKM\nUPzVRz71AgMBAAECggEAfdbVWLW5Befkvam3hea2+5xdmeN3n3elrJhkiXxbAhf3\nE1kbq9bCEHmdrokNnI34vz0SWBFCwIiWfUNJ4UxQKGkZcSZto270V8hwWdNMXUsM\npz6S2nMTxJkdp0s7dhAUS93o9uE2x4x5Z0XecJ2ztFGcXY6Lupu2XvnW93V9109h\nkY3uICLdbovJq7wS/fO/AL97QStfEVRWW2agIXGvoQG5jOwfPh86GZZRYP9b8VNw\ntkAUJe4qpzNbWs9AItXOzL+50/wsFkD/iWMGWFuU8DY5ZwsL434N+uzFlaD13wtZ\n63D+tNAxCSRBfZGQbd7WxJVFfZe/2vgjykKWsdyNAQKBgQDnEBgSI836HGSRk0Ub\nDwiEtdfh2TosV+z6xtyU7j/NwjugTOJEGj1VO/TMlZCEfpkYPLZt3ek2LdNL66n8\nDyxwzTT5Q3D/D0n5yE3mmxy13Qyya6qBYvqqyeWNwyotGM7hNNOix1v9lEMtH5Rd\nUT0gkThvJhtrV663bcAWCALmtQKBgQDjw2rYlMUp2TUIa2/E7904WOnSEG85d+nc\norhzthX8EWmPgw1Bbfo6NzH4HhebTw03j3NjZdW2a8TG/uEmZFWhK4eDvkx+rxAa\n6EwamS6cmQ4+vdep2Ac4QCSaTZj02YjHb06Be3gptvpFaFrotH2jnpXxggdiv8ul\n6x+ooCffQQKBgQCR3ykzGoOI6K/c75prELyR+7MEk/0TzZaAY1cSdq61GXBHLQKT\nd/VMgAN1vN51pu7DzGBnT/dRCvEgNvEjffjSZdqRmrAVdfN/y6LSeQ5RCfJgGXSV\nJoWVmMxhCNrxiX3h01Xgp/c9SYJ3VD54AzeR/dwg32/j/oEAsDraLciXGQKBgQDF\nMNc8k/DvfmJv27R06Ma6liA6AoiJVMxgfXD8nVUDW3/tBCVh1HmkFU1p54PArvxe\nchAQqoYQ3dUMBHeh6ZRJaYp2ATfxJlfnM99P1/eHFOxEXdBt996oUMBf53bZ5cyJ\n/lAVwnQSiZy8otCyUDHGivJ+mXkTgcIq8BoEwERFAQKBgQDmImBaFqoMSVihqHIf\nDa4WZqwM7ODqOx0JnBKrKO8UOc51J5e1vpwP/qRpNhUipoILvIWJzu4efZY7GN5C\nImF9sN3PP6Sy044fkVPyw4SYEisxbvp9tfw8Xmpj/pbmugkB2ut6lz5frmEBoJSN\n3osZlZTgx+pM3sO6ITV6U4ID2Q==\n-----END PRIVATE KEY-----\n",
+            "client_email": "dummy@developer.gserviceaccount.com",
+            "client_id": "dummy",
+            "token_uri": format!("{}/token", server.uri()),
+        });
+        let sa_file = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(sa_file.path(), sa.to_string()).unwrap();
+        let client = gcp_bigquery_client::client_builder::ClientBuilder::new()
+            .with_auth_base_url(format!("{}/auth", server.uri()))
+            .with_v2_base_url(server.uri())
+            .build_from_service_account_key_file(sa_file.path().to_str().unwrap())
+            .await
+            .unwrap();
+        let mut config = BigQuerySourceConfig::new(
+            "p",
+            BigQueryCredentials::ServiceAccountKey {
+                json: sa.to_string(),
+            },
+            "SELECT 1",
+        );
+        config.api_host = Some(server.uri());
+        let src = BigQuerySource::from_parts(config, client);
+        let table = src
+            .query_destination_table(&HashMap::new())
+            .await
+            .expect("the destination table");
+        assert_eq!(table, "projects/p/datasets/_anon/tables/res");
+        let jobs_polled = server
+            .received_requests()
+            .await
+            .unwrap()
+            .iter()
+            .filter(|r| r.url.path() == "/projects/p/jobs/j1")
+            .count();
+        assert_eq!(jobs_polled, 2, "polled until DONE");
+    }
+
+    /// `new` builds a source from inline service-account credentials.
+    #[tokio::test]
+    async fn new_builds_from_an_inline_service_account_key() {
+        let sa = json!({
+            "type": "service_account",
+            "project_id": "dummy",
+            "private_key_id": "dummy",
+            "private_key": "-----BEGIN PRIVATE KEY-----\nMIIEvwIBADANBgkqhkiG9w0BAQEFAASCBKkwggSlAgEAAoIBAQDNk6cKkWP/4NMu\nWb3s24YHfM639IXzPtTev06PUVVQnyHmT1bZgQ/XB6BvIRaReqAqnQd61PAGtX3e\n8XocTw+u/ZfiPJOf+jrXMkRBpiBh9mbyEIqBy8BC20OmsUc+O/YYh/qRccvRfPI7\n3XMabQ8eFWhI6z/t35oRpvEVFJnSIgyV4JR/L/cjtoKnxaFwjBzEnxPiwtdy4olU\nKO/1maklXexvlO7onC7CNmPAjuEZKzdMLzFszikCDnoKJC8k6+2GZh0/JDMAcAF4\nwxlKNQ89MpHVRXZ566uKZg0MqZqkq5RXPn6u7yvNHwZ0oahHT+8ixPPrAEjuPEKM\nUPzVRz71AgMBAAECggEAfdbVWLW5Befkvam3hea2+5xdmeN3n3elrJhkiXxbAhf3\nE1kbq9bCEHmdrokNnI34vz0SWBFCwIiWfUNJ4UxQKGkZcSZto270V8hwWdNMXUsM\npz6S2nMTxJkdp0s7dhAUS93o9uE2x4x5Z0XecJ2ztFGcXY6Lupu2XvnW93V9109h\nkY3uICLdbovJq7wS/fO/AL97QStfEVRWW2agIXGvoQG5jOwfPh86GZZRYP9b8VNw\ntkAUJe4qpzNbWs9AItXOzL+50/wsFkD/iWMGWFuU8DY5ZwsL434N+uzFlaD13wtZ\n63D+tNAxCSRBfZGQbd7WxJVFfZe/2vgjykKWsdyNAQKBgQDnEBgSI836HGSRk0Ub\nDwiEtdfh2TosV+z6xtyU7j/NwjugTOJEGj1VO/TMlZCEfpkYPLZt3ek2LdNL66n8\nDyxwzTT5Q3D/D0n5yE3mmxy13Qyya6qBYvqqyeWNwyotGM7hNNOix1v9lEMtH5Rd\nUT0gkThvJhtrV663bcAWCALmtQKBgQDjw2rYlMUp2TUIa2/E7904WOnSEG85d+nc\norhzthX8EWmPgw1Bbfo6NzH4HhebTw03j3NjZdW2a8TG/uEmZFWhK4eDvkx+rxAa\n6EwamS6cmQ4+vdep2Ac4QCSaTZj02YjHb06Be3gptvpFaFrotH2jnpXxggdiv8ul\n6x+ooCffQQKBgQCR3ykzGoOI6K/c75prELyR+7MEk/0TzZaAY1cSdq61GXBHLQKT\nd/VMgAN1vN51pu7DzGBnT/dRCvEgNvEjffjSZdqRmrAVdfN/y6LSeQ5RCfJgGXSV\nJoWVmMxhCNrxiX3h01Xgp/c9SYJ3VD54AzeR/dwg32/j/oEAsDraLciXGQKBgQDF\nMNc8k/DvfmJv27R06Ma6liA6AoiJVMxgfXD8nVUDW3/tBCVh1HmkFU1p54PArvxe\nchAQqoYQ3dUMBHeh6ZRJaYp2ATfxJlfnM99P1/eHFOxEXdBt996oUMBf53bZ5cyJ\n/lAVwnQSiZy8otCyUDHGivJ+mXkTgcIq8BoEwERFAQKBgQDmImBaFqoMSVihqHIf\nDa4WZqwM7ODqOx0JnBKrKO8UOc51J5e1vpwP/qRpNhUipoILvIWJzu4efZY7GN5C\nImF9sN3PP6Sy044fkVPyw4SYEisxbvp9tfw8Xmpj/pbmugkB2ut6lz5frmEBoJSN\n3osZlZTgx+pM3sO6ITV6U4ID2Q==\n-----END PRIVATE KEY-----\n",
+            "client_email": "dummy@developer.gserviceaccount.com",
+            "client_id": "dummy",
+            "token_uri": "http://127.0.0.1:9/token",
+        });
+        let src = BigQuerySource::new(BigQuerySourceConfig::new(
+            "p",
+            BigQueryCredentials::ServiceAccountKey {
+                json: sa.to_string(),
+            },
+            "SELECT 1",
+        ))
+        .await
+        .expect("the source builds without a network round trip");
+        assert_eq!(src.config().project_id, "p");
     }
 }

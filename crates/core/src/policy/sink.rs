@@ -35,6 +35,9 @@ pub struct PolicySink {
     scope: PolicyScope,
     masking: Option<Arc<CompiledMasking>>,
     dlq: Option<SinkFacts>,
+    /// The wrapped sink is a DLQ: records are envelopes, the payload is
+    /// classified, and any violation fails the write (#870).
+    envelopes: bool,
 }
 
 impl PolicySink {
@@ -51,6 +54,24 @@ impl PolicySink {
             scope,
             masking: None,
             dlq: None,
+            envelopes: false,
+        }
+    }
+
+    /// Enforce the policy at a DLQ (#870): every envelope's payload is
+    /// classified against the DLQ's own `facts`, whichever pass quarantined it
+    /// (quality, contract, drift, policy, or a per-row sink failure). There is
+    /// no DLQ behind a DLQ, so any violation — `quarantine` rules included —
+    /// fails the write, and with it the run.
+    pub fn for_dlq(
+        inner: Box<dyn Sink>,
+        policy: Arc<CompiledPolicy>,
+        dlq: SinkFacts,
+        scope: PolicyScope,
+    ) -> Self {
+        Self {
+            envelopes: true,
+            ..Self::new(inner, policy, dlq, scope)
         }
     }
 
@@ -111,17 +132,38 @@ impl PolicySink {
         .increment(1);
     }
 
+    /// Screen an exactly-once page, which commits whole: any violation fails it.
+    fn screen_idempotent(&self, records: &[Value]) -> Result<(), FaucetError> {
+        match self.screen(records)?.first() {
+            Some((_, v)) => Err(FaucetError::PolicyViolation {
+                rule: v.rule.clone(),
+                column: v.column.clone(),
+                message: format!("{v} (exactly-once pages cannot be partially quarantined)"),
+            }),
+            None => Ok(()),
+        }
+    }
+
     /// Screen a page: `Ok(offending indexes with their first violation)` when
     /// every violated rule quarantines, `Err` when any asks to fail the run.
     fn screen(&self, records: &[Value]) -> Result<Vec<(usize, Violation)>, FaucetError> {
         let mut offending = Vec::new();
         let mut names = NameLabels::new();
         for (i, r) in records.iter().enumerate() {
+            let r = if self.envelopes {
+                r.get("payload").unwrap_or(r)
+            } else {
+                r
+            };
             let (columns, mut violations) = self.check_record(r, &mut names);
             if violations.is_empty() {
                 continue;
             }
-            let mut action = self.action_for(&violations);
+            let mut action = if self.envelopes {
+                RuntimeAction::Fail
+            } else {
+                self.action_for(&violations)
+            };
             if action == RuntimeAction::Quarantine
                 && let Some(dlq) = &self.dlq
             {
@@ -271,9 +313,28 @@ fn walk(
 
 #[async_trait]
 impl Sink for PolicySink {
-    async fn admit_page(&self, records: &[Value]) -> Result<(), FaucetError> {
-        self.inner.admit_page(records).await
+    // Classification needs parsed rows, so the native byte path stays off;
+    // everything else reaches the wrapped sink.
+    crate::forward_sink!(inner; except
+        write_batch, write_batch_reported, write_batch_partial, write_batch_idempotent,
+        write_batch_idempotent_reported,
+        write_batch_columnar, native_load_capabilities, load_native);
+
+    async fn write_batch_reported(
+        &self,
+        records: &[Value],
+    ) -> Result<crate::accounting::WriteReport, FaucetError> {
+        let offending = self.screen(records)?;
+        if let Some((_, v)) = offending.first() {
+            return Err(FaucetError::PolicyViolation {
+                rule: v.rule.clone(),
+                column: v.column.clone(),
+                message: format!("{v} (quarantine needs a `dlq:` block; none is attached)"),
+            });
+        }
+        self.inner.write_batch_reported(records).await
     }
+
     async fn write_batch(&self, records: &[Value]) -> Result<usize, FaucetError> {
         let offending = self.screen(records)?;
         if offending.is_empty() {
@@ -333,136 +394,24 @@ impl Sink for PolicySink {
         scope: &str,
         token: &str,
     ) -> Result<usize, FaucetError> {
-        let offending = self.screen(records)?;
-        if let Some((_, v)) = offending.first() {
-            return Err(FaucetError::PolicyViolation {
-                rule: v.rule.clone(),
-                column: v.column.clone(),
-                message: format!("{v} (exactly-once pages cannot be partially quarantined)"),
-            });
-        }
+        self.screen_idempotent(records)?;
         self.inner
             .write_batch_idempotent(records, scope, token)
             .await
     }
 
-    async fn flush(&self) -> Result<(), FaucetError> {
-        self.inner.flush().await
-    }
-    fn connector_name(&self) -> &'static str {
-        self.inner.connector_name()
-    }
-    fn dataset_uri(&self) -> String {
-        self.inner.dataset_uri()
-    }
-    async fn local_outputs(&self) -> Vec<crate::local_outputs::LocalOutput> {
-        self.inner.local_outputs().await
-    }
-    fn supports_idempotent_writes(&self) -> bool {
-        self.inner.supports_idempotent_writes()
-    }
-    fn sink_guarantee(&self) -> crate::idempotency::SinkGuarantee {
-        self.inner.sink_guarantee()
-    }
-    fn write_batch_is_replay_safe(&self) -> bool {
-        self.inner.write_batch_is_replay_safe()
-    }
-    fn dedups_by_key(&self) -> bool {
-        self.inner.dedups_by_key()
-    }
-    fn batch_atomicity(&self) -> crate::dlq::BatchAtomicity {
-        self.inner.batch_atomicity()
-    }
-    fn supported_write_modes(&self) -> &'static [crate::write_mode::WriteMode] {
-        self.inner.supported_write_modes()
-    }
-    async fn last_committed_token(&self, scope: &str) -> Result<Option<String>, FaucetError> {
-        self.inner.last_committed_token(scope).await
-    }
-    async fn current_schema(&self) -> Result<Option<Value>, FaucetError> {
-        self.inner.current_schema().await
-    }
-    fn supports_schema_evolution(&self) -> bool {
-        self.inner.supports_schema_evolution()
-    }
-    async fn evolve_schema(
+    async fn write_batch_idempotent_reported(
         &self,
-        evolution: &crate::drift::SchemaEvolution,
-    ) -> Result<(), FaucetError> {
-        self.inner.evolve_schema(evolution).await
-    }
-    fn supports_cleanup(&self) -> bool {
-        self.inner.supports_cleanup()
-    }
-    fn supports_staged_load(&self) -> bool {
-        self.inner.supports_staged_load()
-    }
-    async fn cleanup_scope(
-        &self,
-        scope: &BTreeMap<String, Value>,
-        seen: &crate::cleanup::SeenKeys,
-    ) -> Result<u64, FaucetError> {
-        self.inner.cleanup_scope(scope, seen).await
-    }
-    fn is_overwrite(&self) -> bool {
-        self.inner.is_overwrite()
-    }
-    async fn begin_overwrite(&self) -> Result<(), FaucetError> {
-        self.inner.begin_overwrite().await
-    }
-    async fn commit_overwrite(&self) -> Result<(), FaucetError> {
-        self.inner.commit_overwrite().await
-    }
-    async fn abort_overwrite(&self) -> Result<(), FaucetError> {
-        self.inner.abort_overwrite().await
-    }
-    async fn complete_run(&self) -> Result<(), FaucetError> {
-        self.inner.complete_run().await
-    }
-    async fn overwrite_staging_exists(&self) -> Result<Option<bool>, FaucetError> {
-        self.inner.overwrite_staging_exists().await
-    }
-    fn config_schema(&self) -> Value {
-        self.inner.config_schema()
-    }
-    fn supports_rollback(&self) -> bool {
-        self.inner.supports_rollback()
-    }
-    async fn rollback_run(
-        &self,
-        run_id: &str,
-        opts: &crate::rollback::RollbackOptions,
-    ) -> Result<crate::rollback::RollbackOutcome, FaucetError> {
-        self.inner.rollback_run(run_id, opts).await
-    }
-    async fn forget_run(&self, run_id: &str) -> Result<(), FaucetError> {
-        self.inner.forget_run(run_id).await
-    }
-    async fn rewind_commit_token(
-        &self,
+        records: &[Value],
         scope: &str,
-        token: Option<&str>,
-    ) -> Result<(), FaucetError> {
-        self.inner.rewind_commit_token(scope, token).await
+        token: &str,
+    ) -> Result<crate::accounting::WriteReport, FaucetError> {
+        self.screen_idempotent(records)?;
+        self.inner
+            .write_batch_idempotent_reported(records, scope, token)
+            .await
     }
-    fn readback_source(&self) -> Option<(String, Value)> {
-        self.inner.readback_source()
-    }
-    fn set_roundtrip_recorder(&self, recorder: Arc<crate::observability::RoundtripRecorder>) {
-        self.inner.set_roundtrip_recorder(recorder)
-    }
-    async fn check(
-        &self,
-        ctx: &crate::check::CheckContext,
-    ) -> Result<crate::check::CheckReport, FaucetError> {
-        self.inner.check(ctx).await
-    }
-    // Columnar batches are screened through a `Value` view; the native byte
-    // path is deliberately not forwarded (a policy needs parsed records).
-    #[cfg(feature = "arrow")]
-    fn supports_columnar(&self) -> bool {
-        self.inner.supports_columnar()
-    }
+
     #[cfg(feature = "arrow")]
     async fn write_batch_columnar(
         &self,
@@ -949,7 +898,7 @@ mod tests {
 
     #[tokio::test]
     async fn policy_sink_forwards_every_hook_but_native() {
-        let probe = crate::sink_forwarding::HookSink::default();
+        let probe = crate::forwarding::HookSink::default();
         let s = PolicySink::new(
             Box::new(probe.clone()),
             policy("fail"),
@@ -963,7 +912,7 @@ mod tests {
                 row: "r".into(),
             },
         );
-        crate::sink_forwarding::assert_forwards_every_hook(
+        crate::forwarding::assert_sink_forwards_every_hook(
             &s,
             &probe,
             &["native_load_capabilities", "load_native"],

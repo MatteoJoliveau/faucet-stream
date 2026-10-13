@@ -4,6 +4,7 @@
 //! entry run the node graph instead of a synthetic default row; a failed node is
 //! reported on every sink it feeds.
 #![cfg(all(feature = "source-csv", feature = "sink-jsonl", feature = "transforms"))]
+#![allow(clippy::disallowed_methods)] // tests drive time and raw clients directly
 
 use assert_cmd::Command;
 use faucet_cli::auth_catalog::build_auth_catalog;
@@ -433,6 +434,7 @@ mod serve {
             vault_previous_key: Vec::new(),
             connect_providers: None,
             allow_subprocess_connectors: false,
+            references: Default::default(),
         };
         let mut config = ServeConfig::from_args(args).unwrap();
         config.log_level = "warn".into();

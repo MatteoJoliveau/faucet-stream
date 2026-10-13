@@ -52,6 +52,13 @@ cardinality and never a Prometheus label.
   — one increment per sink write, `outcome` ∈ `committed` \| `dlq_partial` \|
   `dlq_all` \| `failed`; their sum is the writes attempted. See
   [batch atomicity](../cookbook/dlq.md#batch-atomicity-and-dlq_all).
+- **Row accounting** (#879): `faucet_rows_unaccounted_total{pipeline,row,connector}`
+  — rows a sink was offered but neither wrote, merged by key, declined by
+  design nor reported failed per row. Any increase means a run failed with
+  `RowsUnaccounted` before its bookmark advanced; `faucet run` prints each
+  row's account (offered / accepted / coalesced / skipped / failed to DLQ /
+  quarantined / dropped / filtered by transforms) and `--output json` carries
+  it as `rows`.
 - **Upstream round trips** (#638): `faucet_source_roundtrips_total{op}` and
   `faucet_sink_roundtrips_total{op}` — how many calls a connector actually made
   to its backend, with companion `*_roundtrip_duration_seconds{op}` histograms.
@@ -68,7 +75,9 @@ cardinality and never a Prometheus label.
   `faucet_transform_duration_seconds`.
 - **State:** `faucet_state_{get,put,delete}_total` (get carries
   `outcome=hit|miss`), `faucet_state_errors_total{op,kind}`, plus duration
-  histograms.
+  histograms; `faucet_state_key_migrations_total{outcome=moved|raced}` counts
+  bookmarks moved from a key an earlier release rendered (see
+  [State keys](../cookbook/state.md#key-migration)).
 - **Pipeline:** `faucet_pipeline_runs_total{status=ok|err,kind}`,
   `faucet_pipeline_run_duration_seconds`, `faucet_pipeline_in_flight`,
   `faucet_pipeline_seconds_since_last_bookmark`,
@@ -128,7 +137,9 @@ metrics for `faucet schedule` and `faucet serve`.
 
 - **Drop-guard timers** sample durations even when a task is cancelled.
 - **Panic isolation** — a panicking connector surfaces as a `Panic` error kind
-  rather than crashing the process.
+  rather than crashing the process, on the row path and on the columnar and
+  native fast paths alike: a panic while writing an Arrow batch, loading native
+  bytes, or opening or polling a fast-path stream fails that run only.
 - **Idempotent install** — installing the recorder/subscriber twice warns rather
   than panics.
 

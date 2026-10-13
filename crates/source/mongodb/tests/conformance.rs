@@ -131,3 +131,55 @@ async fn conformance_errors_not_panics() {
 
     faucet_conformance::assert_errors_not_panics(&source).await;
 }
+
+/// The static descriptor answers exactly what the built source declares (RFC 0013).
+#[tokio::test(flavor = "multi_thread")]
+async fn conformance_descriptor_matches_built_source() {
+    #[allow(unused_mut)]
+    let configs =
+        vec![r#"{"connection_uri": "mongodb://127.0.0.1:1", "database": "d", "collection": "c"}"#];
+    for raw in configs {
+        let v: faucet_core::Value = faucet_core::serde_json::from_str(raw).expect("json");
+        let cfg: faucet_source_mongodb::MongoSourceConfig =
+            faucet_core::serde_json::from_value(v.clone()).expect("config");
+        let built = faucet_source_mongodb::MongoSource::new(cfg)
+            .await
+            .expect("offline build");
+        faucet_conformance::assert_descriptor_matches_source(
+            &faucet_source_mongodb::DESCRIPTOR,
+            "mongodb",
+            &v,
+            &built,
+        );
+    }
+}
+
+/// A server that accepts TCP connections and never answers stands in for a
+/// hung backend (#880); returns a URI whose server selection waits a minute.
+async fn silent_uri() -> String {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        let mut held = Vec::new();
+        while let Ok((stream, _)) = listener.accept().await {
+            held.push(stream);
+        }
+    });
+    format!("mongodb://{addr}/?directConnection=true&serverSelectionTimeoutMS=60000")
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn conformance_call_deadline() {
+    let uri = silent_uri().await;
+    let mut built = Vec::new();
+    for _ in 0..2 {
+        let cfg: MongoSourceConfig = serde_json::from_value(serde_json::json!({
+            "connection_uri": uri, "database": "d", "collection": "c"
+        }))
+        .expect("config");
+        built.push(MongoSource::new(cfg).await.expect("lazy client"));
+    }
+    let built = std::sync::Mutex::new(built);
+    faucet_conformance::calls::assert_source_call_deadline(|| built.lock().unwrap().pop().unwrap())
+        .await;
+}

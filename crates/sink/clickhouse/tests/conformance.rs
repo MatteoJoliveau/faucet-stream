@@ -7,6 +7,7 @@
 //! idempotent-watermark / keyed-upsert mechanism), so check 5 takes the
 //! honest-`false` branch: Append works and no phantom commit token is recorded.
 //! Passing this battery in CI is the Tier-1 (supported) criterion.
+#![allow(clippy::disallowed_methods)] // tests drive time and raw clients directly
 
 mod common;
 
@@ -109,4 +110,76 @@ async fn conformance_capabilities_truthful() {
 
     assert!(!sink.supports_idempotent_writes());
     assert!(!sink.dedups_by_key());
+}
+
+// ── #878: declared capabilities (real backend, skip if no Docker) ──────────
+#[tokio::test(flavor = "multi_thread")]
+async fn conformance_declared_capabilities() {
+    let Some((_c, base)) = start_clickhouse().await else {
+        return;
+    };
+    http_exec(
+        &base,
+        "CREATE TABLE cap (id Int64, v String) ENGINE = MergeTree ORDER BY id",
+    )
+    .await;
+    let base_ref = base.as_str();
+    let count = move || async move { count_rows(base_ref).await };
+
+    let sink = ClickHouseSink::new(ClickHouseSinkConfig::new(&base, "cap")).expect("sink");
+    faucet_conformance::assert_partial_outcomes_truthful(&sink, count).await;
+    faucet_conformance::assert_cancellation_flushes(&sink, count).await;
+
+    // One INSERT per page: a page with a row ClickHouse cannot parse lands
+    // nothing.
+    let atomic: ClickHouseSinkConfig = serde_json::from_value(serde_json::json!({
+        "url": base, "table": "cap", "batch_size": 0
+    }))
+    .unwrap();
+    let atomic = ClickHouseSink::new(atomic).expect("sink");
+    faucet_conformance::assert_batch_atomicity_truthful(
+        &atomic,
+        count,
+        &[
+            serde_json::json!({"id": 954, "v": "kept only if the batch is torn"}),
+            serde_json::json!({"id": "not a number", "v": "x"}),
+        ],
+    )
+    .await;
+}
+
+#[test]
+fn descriptor_matches_the_built_sink() {
+    for v in [
+        serde_json::json!({"url": "http://localhost:8123", "table": "t"}),
+        serde_json::json!({
+            "url": "http://localhost:8123",
+            "table": "t",
+            "staging": {"location": "s3://bucket/stage", "format": "jsonl", "region": "us-east-1"}
+        }),
+    ] {
+        let cfg: ClickHouseSinkConfig = serde_json::from_value(v.clone()).unwrap();
+        let built = ClickHouseSink::new(cfg).expect("sink");
+        faucet_conformance::assert_descriptor_matches_sink(
+            &faucet_sink_clickhouse::DESCRIPTOR,
+            "clickhouse",
+            &v,
+            &built,
+        );
+    }
+}
+
+// ── Check: backend calls honour the call deadline and cancel (#880) ──────────
+
+#[tokio::test]
+async fn conformance_call_deadline() {
+    let hung = faucet_conformance::hung::SilentListener::start()
+        .await
+        .expect("listener");
+    let uri = hung.http_url();
+    faucet_conformance::calls::assert_sink_call_deadline(
+        || ClickHouseSink::new(ClickHouseSinkConfig::new(&uri, "db.events")).unwrap(),
+        &[serde_json::json!({"id": 1})],
+    )
+    .await;
 }

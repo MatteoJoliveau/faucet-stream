@@ -29,6 +29,7 @@ impl Default for DuckdbColumnMapping {
 pub struct DuckdbSinkConfig {
     /// Path to the DuckDB database file, or `:memory:`. A `duckdb://` /
     /// `duckdb:` scheme prefix is accepted and stripped.
+    #[schemars(extend("x-faucet-resource" = "path"))]
     pub database: String,
     /// Target table name.
     pub table_name: String,
@@ -54,6 +55,7 @@ pub struct DuckdbSinkConfig {
     /// forces it on for every config it did not load from its own triggers
     /// file.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    #[schemars(extend("x-faucet-sandbox" = true))]
     pub sandbox: bool,
 }
 

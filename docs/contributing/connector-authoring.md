@@ -73,6 +73,39 @@ override `stream_pages`** so memory stays O(batch_size). See
 `connector_name()` must return a non-empty `&'static str` — it becomes the
 `connector` metric label. Empty strings fall back to `"unknown"`.
 
+### Mark the fields that name a resource
+
+A config field that names a local path, a URL or a program the connector runs
+carries an `x-faucet-resource` annotation:
+
+```rust
+#[schemars(extend("x-faucet-resource" = "path"))]   // or "url" / "command"
+pub path: String,
+```
+
+`faucet serve` reads it from the schema and checks the value against the
+operator's [reference policy](../book/src/reference/http-api.md#reference-policy)
+before running a config a caller sent, so your connector is confined with no
+serve code. A field that only looks like a resource (an object key inside a
+configured bucket, a URL path appended to a checked `base_url`) goes in
+`scripts/resource-annotation-allow.txt` with a reason instead.
+`cli/tests/resource_annotations.rs` fails on an unannotated field whose name
+looks like a resource, and on an allow-list entry that no longer matches one.
+After adding an annotation, regenerate `schemas/faucet.schema.json`.
+
+A connector whose own input can reach past its declared resources — a SQL
+engine whose query can `ATTACH` a file or `read_csv` a path — needs a boolean
+switch that confines it, marked so the server can find it:
+
+```rust
+#[schemars(extend("x-faucet-sandbox" = true))]
+pub sandbox: bool,
+```
+
+`faucet serve` forces every field marked this way to `true` in a config it did
+not load from its own triggers file, wherever the connector appears (template,
+row override, topology node, fan-out source, DLQ sink, …).
+
 ### Resumability
 
 If your source can resume, implement two methods:
@@ -98,6 +131,14 @@ durably wrote and flushed the page. You never call `StateStore::put` yourself.
 Every one of these has a default implementation, so existing connectors never
 break when a new capability lands. That is the whole point of the
 [progressive-trait design](../adr/0003-builder-pattern.md).
+
+### Backend calls
+
+Route every backend call through a `faucet_core::io::CallSlot` /
+`CallContext::call` and build HTTP clients with `faucet_core::http::Client`;
+the workspace `clippy.toml` refuses `reqwest::Client::new` / `builder` and
+`tokio::time::sleep` outside sanctioned sites. See
+[Backend calls](../book/src/extending/authoring-connectors.md#backend-calls-callcontext-httpclient-batching).
 
 ## Wiring checklist (CI enforces most of this)
 

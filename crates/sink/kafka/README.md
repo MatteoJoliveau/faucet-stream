@@ -248,7 +248,7 @@ Use `${env:VAR}` / `${secret:…}` interpolation so credentials never land in th
 | Value | Behaviour |
 |-------|-----------|
 | `fail` *(default)* | Abort the batch with `FaucetError::Sink`. |
-| `skip` | Drop the record, log a `WARN`, continue. |
+| `skip` | Drop the record, log a `WARN`, continue. The dropped records are reported as *skipped* to the pipeline's row accounting — on the exactly-once path too (`write_batch_idempotent_reported`) — so the run stays balanced. |
 | `round_robin` | Send the record with no key; librdkafka assigns the partition. Record is kept. |
 
 It does **not** apply to `from_path` topic failures (including a path resolving to `null`) — those are always fatal.
@@ -476,6 +476,14 @@ is refused on a best-effort configuration unless the `dlq:` block sets
 `allow_duplicates_on_dlq_all: true` (a DLQ replay would write the rows that
 already landed a second time). See
 [batch atomicity](https://faucet-hq.github.io/faucet-stream/cookbook/dlq.html#batch-atomicity-and-dlq_all).
+
+## Capabilities
+
+Declares `write_mode: append` and idempotent (exactly-once) writes. Under `value_format: confluent_avro` (the `schema-registry` feature) it declares that it drops record fields the Avro schema lacks, so `on_drift: fail` is refused at load time. `faucet list --json` prints the declaration.
+
+## Timeouts, cancellation and retries
+
+Every produced record's delivery, the `QueueFull` backoff, the transaction calls (`init`, `commit`) and the commit-token read run through the pipeline's `CallContext` (#880): the run's deadline ends a delivery that an unreachable or stalled cluster never confirms, and a `QueueFull` wait, promptly; a commit cut short is aborted. Each counts as one round trip (`produce`, `init`, `commit`, `metadata`, `read_token`) in `faucet_sink_roundtrips_total`, and Schema Registry requests run under the same context (`schema`, `register`). The sink never re-sends a delivered-or-unknown record itself.
 
 ## License
 

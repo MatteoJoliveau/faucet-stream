@@ -61,3 +61,57 @@ async fn conformance_capabilities_truthful() {
     assert!(!sink.supports_idempotent_writes());
     assert!(!sink.dedups_by_key());
 }
+
+/// #878: in Individual mode every record is its own request, so the per-row
+/// outcomes the sink reports must match the requests the endpoint accepted.
+#[tokio::test]
+async fn conformance_partial_outcomes_truthful() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/ingest"))
+        .respond_with(ResponseTemplate::new(200))
+        .mount(&server)
+        .await;
+    let sink = HttpSink::new(
+        HttpSinkConfig::new(format!("{}/ingest", server.uri()))
+            .batch_mode(HttpBatchMode::Individual),
+    );
+    let server_ref = &server;
+    faucet_conformance::assert_partial_outcomes_truthful(&sink, || async move {
+        server_ref.received_requests().await.unwrap().len()
+    })
+    .await;
+}
+
+#[test]
+fn conformance_descriptor_matches_built_sink() {
+    for v in [
+        serde_json::json!({"url": "http://127.0.0.1:1/ingest"}),
+        serde_json::json!({"url": "http://127.0.0.1:1/ingest", "batch_size": 0}),
+    ] {
+        let cfg: faucet_sink_http::HttpSinkConfig = serde_json::from_value(v.clone()).unwrap();
+        let built = faucet_sink_http::HttpSink::new(cfg);
+        faucet_conformance::assert_descriptor_matches_sink(
+            &faucet_sink_http::DESCRIPTOR,
+            "http",
+            &v,
+            &built,
+        );
+    }
+}
+
+/// A hung endpoint: the write ends at the call deadline and on cancel (#880).
+#[tokio::test]
+async fn conformance_call_deadline() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(200).set_delay(std::time::Duration::from_secs(60)))
+        .mount(&server)
+        .await;
+    let url = format!("{}/ingest", server.uri());
+    faucet_conformance::calls::assert_sink_call_deadline(
+        || HttpSink::new(HttpSinkConfig::new(url.clone())),
+        &[serde_json::json!({"id": 1})],
+    )
+    .await;
+}

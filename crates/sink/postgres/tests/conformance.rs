@@ -125,3 +125,81 @@ async fn conformance_capabilities_truthful() {
     })
     .await;
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn conformance_call_deadline() {
+    // A table another session holds locked stands in for a hung backend (#880).
+    let (_container, url, first) = fresh_sink().await;
+    let mut cfg = PostgresSinkConfig::new(&url, "t")
+        .column_mapping(PostgresColumnMapping::AutoMap)
+        .with_batch_size(0);
+    cfg.write_timeout_secs = 0;
+    let second = PostgresSink::new(cfg).await.expect("sink");
+    let mut lock = <sqlx::PgConnection as sqlx::Connection>::connect(&url)
+        .await
+        .expect("lock connection");
+    sqlx::query("BEGIN")
+        .execute(&mut lock)
+        .await
+        .expect("begin");
+    sqlx::query("LOCK TABLE t IN ACCESS EXCLUSIVE MODE")
+        .execute(&mut lock)
+        .await
+        .expect("lock");
+    let built = std::sync::Mutex::new(vec![first, second]);
+    faucet_conformance::calls::assert_sink_call_deadline(
+        || built.lock().unwrap().pop().unwrap(),
+        &[serde_json::json!({"id": 1, "v": "a"})],
+    )
+    .await;
+}
+
+/// The capabilities the sink declares beyond its descriptor (#878): truthful
+/// per-row outcomes, a replay-safe keyed write, the overwrite lifecycle, and an
+/// atomic `batch_size: 0` JSONB batch (Postgres rejects a `\u0000` in `jsonb`,
+/// failing the whole statement).
+#[tokio::test(flavor = "multi_thread")]
+async fn conformance_declared_capabilities() {
+    let (_container, url, sink) = fresh_sink().await;
+    let count = || {
+        let url = url.clone();
+        async move { count_rows(&url).await }
+    };
+    faucet_conformance::assert_partial_outcomes_truthful(&sink, count).await;
+    faucet_conformance::assert_replay_safe(&sink, count).await;
+
+    let mut cfg = PostgresSinkConfig::new(&url, "t").column_mapping(PostgresColumnMapping::AutoMap);
+    cfg.write.write_mode = WriteMode::Overwrite;
+    let overwrite = PostgresSink::new(cfg).await.expect("overwrite sink");
+    faucet_conformance::assert_overwrite_lifecycle(&overwrite, count).await;
+
+    let pool = sqlx::PgPool::connect(&url).await.expect("pool connect");
+    sqlx::query("CREATE TABLE j (data JSONB)")
+        .execute(&pool)
+        .await
+        .expect("create jsonb table");
+    let jsonb = PostgresSink::new(
+        PostgresSinkConfig::new(&url, "j")
+            .column_mapping(PostgresColumnMapping::Jsonb {
+                column: "data".into(),
+            })
+            .with_batch_size(0),
+    )
+    .await
+    .expect("jsonb sink");
+    let pool = &pool;
+    faucet_conformance::assert_batch_atomicity_truthful(
+        &jsonb,
+        move || async move {
+            sqlx::query_scalar::<_, i64>("SELECT COUNT(*)::BIGINT FROM j")
+                .fetch_one(pool)
+                .await
+                .expect("count") as usize
+        },
+        &[
+            serde_json::json!({"id": 959, "v": "kept only if the batch is torn"}),
+            serde_json::json!({"id": 960, "v": "\u{0}"}),
+        ],
+    )
+    .await;
+}

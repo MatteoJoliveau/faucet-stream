@@ -382,6 +382,14 @@ This crate has no optional features of its own; enable it in the CLI/umbrella vi
 and `sla.max_lag_*` thresholds turn it into an SLA. A failing lag query is
 logged once and reported as no lag — it never fails a run.
 
+## Capabilities
+
+Declares `exactly_once` (deterministic replay from the LSN bookmark) and `reports_lag` (slot lag in bytes). `faucet list --json` prints the declaration.
+
+## Timeouts, cancellation and retries
+
+The replication connect, the slot calls (create, advance, start, drop), the catalog reads and the replication stream run through the pipeline's `CallContext` (#880): the run's deadline and cancel token end a hung connect or an idle stream promptly with an error (the pipeline has already stopped reading and flushed what it took), and the backoff between `slot is active` retries (`slot_acquire_retries`) ends early too. Each call counts as one round trip (`connect`, `slot`, `start`, `query`) in `faucet_source_roundtrips_total`. The slot's `confirmed_flush_lsn` still moves only from a persisted bookmark.
+
 ## License
 
 Licensed under either of [Apache License, Version 2.0](https://www.apache.org/licenses/LICENSE-2.0) or [MIT license](https://opensource.org/licenses/MIT) at your option.

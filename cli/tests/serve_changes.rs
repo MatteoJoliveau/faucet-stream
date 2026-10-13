@@ -9,6 +9,7 @@
     feature = "source-csv",
     feature = "sink-jsonl"
 ))]
+#![allow(clippy::disallowed_methods)] // tests drive time and raw clients directly
 
 use serde_json::{Value, json};
 use std::time::Duration;
@@ -86,6 +87,11 @@ fn serve_args(
         vault_previous_key: Vec::new(),
         connect_providers: None,
         allow_subprocess_connectors: false,
+        // A submitted config reads only the variables the operator allows (#881).
+        references: faucet_cli::cli::ReferenceArgs {
+            allow_env: vec!["FAUCET_789_*".into()],
+            ..Default::default()
+        },
     }
 }
 

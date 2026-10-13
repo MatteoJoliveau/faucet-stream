@@ -146,3 +146,72 @@ async fn conformance_capabilities_truthful() {
     })
     .await;
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn conformance_call_deadline() {
+    // A table another session holds an exclusive lock on stands in for a hung
+    // backend (#880): the write waits on the lock.
+    let _serial = SERIAL.lock().await;
+    let (container, pool, first) = fresh_sink().await;
+    let port = container
+        .get_host_port_ipv4(1433)
+        .await
+        .expect("mssql host port");
+    let cfg = conn_cfg(port);
+    let mut scfg = MssqlSinkConfig::new(cfg.connection_url.clone().unwrap(), "dbo.t");
+    scfg.connection.tls = cfg.tls.clone();
+    scfg.column_mapping = MssqlColumnMapping::AutoColumns {
+        on_unknown_field: OnUnknownField::Warn,
+    };
+    let second = MssqlSink::new(scfg).await.expect("sink");
+    let mut blocker = pool.get().await.expect("blocker");
+    blocker
+        .simple_query("BEGIN TRAN; SELECT * FROM dbo.t WITH (TABLOCKX, HOLDLOCK)")
+        .await
+        .expect("lock")
+        .into_results()
+        .await
+        .expect("lock");
+    let built = std::sync::Mutex::new(vec![first, second]);
+    faucet_conformance::calls::assert_sink_call_deadline(
+        || built.lock().unwrap().pop().unwrap(),
+        &[serde_json::json!({"id": 1, "v": "a"})],
+    )
+    .await;
+}
+
+/// The capabilities the sink declares beyond its descriptor (#878): truthful
+/// per-row outcomes, a replay-safe keyed write, an atomic keyed batch (a
+/// non-numeric `INT` fails the `MERGE`'s transaction) and the overwrite
+/// lifecycle.
+#[tokio::test(flavor = "multi_thread")]
+async fn conformance_declared_capabilities() {
+    let (container, pool, sink) = fresh_sink().await;
+    let pool = &pool;
+    let count = move || async move { count_rows(pool).await };
+    faucet_conformance::assert_partial_outcomes_truthful(&sink, count).await;
+    faucet_conformance::assert_replay_safe(&sink, count).await;
+    faucet_conformance::assert_batch_atomicity_truthful(
+        &sink,
+        count,
+        &[
+            serde_json::json!({"id": 963, "v": "kept only if the batch is torn"}),
+            serde_json::json!({"id": "not a number", "v": "x"}),
+        ],
+    )
+    .await;
+
+    let port = container
+        .get_host_port_ipv4(1433)
+        .await
+        .expect("mssql host port");
+    let cfg = conn_cfg(port);
+    let mut scfg = MssqlSinkConfig::new(cfg.connection_url.clone().unwrap(), "dbo.t");
+    scfg.connection.tls = cfg.tls.clone();
+    scfg.column_mapping = MssqlColumnMapping::AutoColumns {
+        on_unknown_field: OnUnknownField::Warn,
+    };
+    scfg.write.write_mode = WriteMode::Overwrite;
+    let overwrite = MssqlSink::new(scfg).await.expect("overwrite sink");
+    faucet_conformance::assert_overwrite_lifecycle(&overwrite, count).await;
+}

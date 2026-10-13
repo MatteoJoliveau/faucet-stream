@@ -77,3 +77,35 @@ async fn conformance_capabilities_truthful() {
     assert!(!sink.supports_idempotent_writes());
     assert!(!sink.dedups_by_key());
 }
+
+/// The sink buffers until flush: a cancelled run must still flush (#878).
+#[tokio::test]
+async fn conformance_cancellation_flushes() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("out.csv");
+    let sink = CsvSink::new(CsvSinkConfig::new(path.to_str().unwrap()).write_headers(false));
+    faucet_conformance::assert_cancellation_flushes(&sink, || {
+        let path = path.clone();
+        async move { count_rows(&path) }
+    })
+    .await;
+}
+
+// ── Descriptor (RFC 0013): agrees with the built sink ───────────────────────
+#[test]
+fn descriptor_matches_built_sink() {
+    for policy in [None, Some("warn"), Some("error")] {
+        let mut v = serde_json::json!({"path": "/tmp/does-not-matter.csv"});
+        if let Some(p) = policy {
+            v["on_unknown_field"] = serde_json::json!(p);
+        }
+        let cfg: CsvSinkConfig = serde_json::from_value(v.clone()).unwrap();
+        let built = CsvSink::new(cfg);
+        faucet_conformance::assert_descriptor_matches_sink(
+            &faucet_sink_csv::DESCRIPTOR,
+            "csv",
+            &v,
+            &built,
+        );
+    }
+}

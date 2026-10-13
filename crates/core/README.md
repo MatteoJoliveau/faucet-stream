@@ -222,6 +222,65 @@ let stages = vec![TransformStage::Map(
 let wrapped = TransformingSource::new(source, stages);
 ```
 
+## Backend calls: `CallContext`, `http::Client`, batching
+
+Every call a connector makes to its backend runs through
+`faucet_core::io::CallContext` (RFC 0013, #880). `ctx.call(op, || fut)` applies
+the per-attempt timeout (`DEFAULT_CALL_TIMEOUT`, 300 s, unless set), the run's
+deadline, classified retry under a `RetryPolicy` (a
+`FaucetError::RateLimited(wait)` waits the time it states; an optional
+separate rate-limit budget), cancellation, round-trip metering (`op` is the
+`faucet_*_roundtrips_total` label) and redaction of the returned error.
+`ctx.wait(d)` is the cancel- and deadline-aware pause for poll intervals.
+
+A connector keeps a `CallSlot`: its own settings from config, plus the context
+the pipeline installs through the defaulted `Source::set_call_context` /
+`Sink::set_call_context` (every wrapper forwards it). The pipeline's context
+carries the round-trip recorder, any deadline from
+`Pipeline::with_call_context`, and — for a source only — the run's cancel
+token; it never carries a retry policy.
+
+```rust
+use faucet_core::io::{CallContext, CallSlot};
+use faucet_core::http::Client;
+
+let client = Client::builder().timeout(std::time::Duration::from_secs(30)).build()?;
+let calls = CallSlot::new(CallContext::new().with_retry(faucet_core::RetryPolicy::default()));
+let resp = client.execute(&calls.get(), "page", || client.get("https://api.example.com/items")).await?;
+let body: serde_json::Value = client.json(resp).await?;
+```
+
+`faucet_core::http::Client` wraps reqwest: redirects followed by faucet, which
+drops credential headers (and never replays a body) on a hop to another
+origin; bounded buffered reads (`max_response_bytes`, 1 GiB default); one
+status-error shape. `faucet_core::batching` re-chunks under the `batch_size`
+contract (`chunks`, `into_chunks`) and bounds concurrency (`map_concurrent`,
+`for_each_concurrent`, `ConcurrencyLimit`).
+
+The workspace `clippy.toml` disallows constructing reqwest clients directly and
+`tokio::time::sleep` / `sleep_until` / `std::thread::sleep`; a sanctioned site
+carries `#[allow(clippy::disallowed_methods)] // <reason>`.
+
+## Resource annotations and reference policies
+
+Mark a config field that names a local path, a URL or a program with
+`#[schemars(extend("x-faucet-resource" = "path"))]` (`"url"`, `"command"`).
+`faucet_core::resolve` reads the annotation back from a config schema
+(`annotated_resources(schema, config)`, `declares(schema, kind)`) and checks
+each value with a `ReferencePolicy`: an allow-list of path roots (compared
+after symlinks resolve), URL schemes and hosts (link-local and cloud-metadata
+hosts refused unless listed), environment variable names, secret-manager
+schemes and whether a program may run. `ReferencePolicy::deny_all()` is the
+default and `open()` allows everything but metadata hosts. `faucet serve` uses
+it to confine configs a caller submits, so an annotated third-party connector
+is confined without serve changes.
+
+A connector whose own input can reach host files or the network — a SQL
+engine that can `ATTACH` or `read_csv` — exposes a boolean switch that confines
+it and marks it `#[schemars(extend("x-faucet-sandbox" = true))]`;
+`resolve::sandbox_fields(schema)` reads the marked fields back, and a host
+loading a config it does not trust forces each one on.
+
 ## Error types
 
 `FaucetError` covers every failure mode:
@@ -243,9 +302,11 @@ let wrapped = TransformingSource::new(source, stages);
 | `ContractViolation { version, message }` | A record breached the data contract under `on_breach: fail` |
 | `State(String)` | State-store read/write/delete failures |
 | `StateIncompatible { key, found, expected }` | A stored bookmark written by a newer release or another source (#736) — refused before the source is read |
+| `Timeout { operation, after }` | A call did not finish within its bound (retriable) |
+| `Cancelled { operation }` | A backend call was abandoned because the run was cancelled (#880) |
 | `Custom(Box<dyn Error + Send + Sync>)` | Wrap any third-party connector error |
 
-`FaucetError::is_retriable()` classifies transient failures (network errors, 5xx, 429) so connectors can drive `execute_with_retry` (exponential backoff + jitter, also re-exported). The `Custom` variant is intentionally permanent in the public API so connector authors can wrap their own error types without losing the chain.
+`FaucetError::is_retriable()` classifies transient failures (network errors, 5xx, 429); connectors retry through `CallContext::call` (see [Backend calls](#backend-calls-callcontext-httpclient-batching)). The `Custom` variant is intentionally permanent in the public API so connector authors can wrap their own error types without losing the chain.
 
 ## State stores (resume & bookmarks)
 
@@ -271,6 +332,25 @@ let result = Pipeline::new(&source, &sink)
 
 State keys are validated via `state::validate_state_key`.
 
+Runtimes that drive many pipelines build their keys with `StateKey` (#882): a
+typed key from its components (tenant, pipeline, row, parent key, shard, a
+`KeySuffix` marker) with one rendering,
+`[{tenant}::]{pipeline}::{row}[::{sub}][::{shard}][::{suffix}]`. The rendering
+is versioned by `KEY_SCHEME_VERSION`; `StateKey::legacy_renderings()` lists the
+keys earlier schemes rendered, and `migrate_state_key(store, key, candidates)`
+moves a value left under one of them to the current key (only while the current
+key is empty), so a rendering change never turns a resumable pipeline into a
+first run.
+
+```rust
+use faucet_core::{KeySuffix, StateKey};
+
+let key = StateKey::invocation("orders", "lines").with_parent_key("42");
+assert_eq!(key.render(), "orders::lines::42");
+let sla = key.with_suffix(KeySuffix::Sla);
+assert_eq!(sla.render(), "orders::lines::42::__sla__");
+```
+
 The pipeline stores each bookmark in a **versioned envelope** (#736,
 `state_version`): `{ "faucet_state": 1, "owner": <connector_name>, "schema":
 <state_schema>, "data": <bookmark> }`. On resume it refuses
@@ -282,6 +362,45 @@ writes the bare value instead — for a mixed-version cluster.
 ## Dead-letter queue (DLQ)
 
 `Pipeline::with_dlq(DlqConfig)` attaches an optional DLQ sink. The streaming loop calls `Sink::write_batch_partial` per page; rows that come back `Err` are wrapped in a fixed-shape envelope (`build_envelope`) and routed to the DLQ before the page bookmark advances. `OnBatchError` controls the policy when a sink can't report per-row results: `propagate` aborts the run; `dlq_all` routes the whole failed page. Sinks override `write_batch_partial` to expose per-row results (BigQuery `insertAll`, Elasticsearch `_bulk`).
+
+## Governance (RFC 0013)
+
+`faucet_core::Governance` carries every guarantee a run is held to — masking,
+quality, contract, schema drift, the data-flow policy, budget, profiling,
+metadata columns, metering, resilience, cancellation and the DLQ — and
+assembles them in one canonical order. Wrap the destination with
+`sink_builder()` and attach the value with `Pipeline::with_governance`:
+
+```rust,ignore
+let governance = Governance::new()
+    .with_masking(masking)
+    .with_budget(BudgetSpec { max_records: Some(1_000_000), ..Default::default() })
+    .with_dlq(DlqGovernance::new(dlq).with_facts(dlq_facts))
+    .with_cancel(cancel)
+    .without(Pass::Profiling, "a backfill would skew the baseline");
+let sink = governance.sink_builder().build(Box::new(destination));
+Pipeline::new(&source, &sink).with_governance(governance).run().await?;
+```
+
+Around the sink the order is `policy → profiling → [outer tap] → metadata →
+[inner tap] → budget → destination` (`SINK_LAYERS`); per page it is masking →
+quality → contract → drift. The DLQ is governed as a destination of its own:
+masking rules naming it, the policy with its own attributes, the shared budget
+and metering. A pass that does not apply is turned off with
+`without(pass, reason)`, which is recorded (`opt_outs()`) and logged.
+
+## Row accounting
+
+Every row offered to a sink is accounted for: `offered = accepted + coalesced +
+skipped + failed + quarantined + dropped`. The pipeline writes through
+`Sink::write_batch_reported`, whose default wraps `write_batch`'s count
+(crediting a keyed sink's merged rows as coalesced); a shortfall fails the page
+with `FaucetError::RowsUnaccounted` before its bookmark advances. The
+exactly-once path does the same through `Sink::write_batch_idempotent_reported`
+(default: `write_batch_idempotent`'s count): a short report fails the page after
+the sink committed its token and before the bookmark is persisted, so the next
+run resumes from the sink's watermark and the run is never reported green.
+`Pipeline::with_row_accounts(Arc<RowAccounts>)` exposes the counts.
 
 ## Effectively-once delivery
 
@@ -522,6 +641,29 @@ let schema = serde_json::to_value(schema_for!(MyConfig))?;
 
 > **Keep `faucet-core` the only required dependency.** If your connector needs a new common dependency, propose re-exporting it from `faucet-core` rather than requiring every connector author to add it. Keep the `Source` / `Sink` traits object-safe (no connector-specific types or generics on methods) and `FaucetError::Custom` intact for third-party error wrapping.
 
+## Wrapping a source or sink
+
+A wrapper that holds another connector must forward every defaulted hook, or the
+feature behind it turns off for everything it wraps. `forward_source!` /
+`forward_sink!` generate the forwarding body of every hook inside the wrapper's
+`impl` block; the wrapper writes only the hooks it changes and lists them (plus
+any it deliberately leaves at the trait default) after `except`:
+
+```rust,ignore
+#[async_trait]
+impl Sink for Stamped {
+    async fn write_batch(&self, records: &[Value]) -> Result<usize, FaucetError> {
+        self.inner.write_batch(&self.stamp(records)).await
+    }
+    forward_sink!(inner; except write_batch, write_batch_partial, write_batch_idempotent,
+        supports_columnar, write_batch_columnar, native_load_capabilities, load_native);
+}
+```
+
+An unknown name in `except` does not compile, so the list stays exact. Prove the
+wrapper with `faucet_conformance::forwarding::assert_sink_forwards_every_hook` /
+`assert_source_forwards_every_hook`.
+
 ## Modules
 
 | Module | Contents |
@@ -534,9 +676,12 @@ let schema = serde_json::to_value(schema_for!(MyConfig))?;
 | `config` | `load_json`, `load_env`, `load_env_file`, duration serde helpers |
 | `transform` | `RecordTransform`, `CompiledTransform`, support enums (`CastType`, `CastOnError`, `KeyCaseMode`, `ValueCaseMode`) |
 | `transforming_source` | `TransformingSource` — attach stages to any source |
+| `forward` | `forward_source!` / `forward_sink!` — generate a wrapper's pass-through hooks (see below) |
 | `stage` | `TransformStage`, `FilterSpec`, `ExplodeSpec`, `CdcUnwrapSpec`, `compile_stage` |
 | `state` | `StateStore` trait, `MemoryStateStore`, `FileStateStore`, `validate_state_key` |
 | `dlq` | `DlqConfig`, `OnBatchError`, `DlqReason`, `DlqStats`, `build_envelope` |
+| `governance` | `Governance`, `GovernedSinkBuilder`, `GovernedSink`, `DlqGovernance`, `PolicyGovernance`, `Pass`, `OptOut`, `SINK_LAYERS` — one builder for every guarantee (#875, #870) |
+| `accounting` | `WriteReport`, `RowAccounts`, `RowAccountsSnapshot` — per-page row accounting (#879) |
 | `idempotency` | `DeliveryMode`, `format_token`, `parse_token`, `wrap_state`, `unwrap_state` |
 | `state_version` | Versioned state envelope (#736) — `StoredState`, `wrap_versioned`, `peel_versioned`, `check_compat`, `resolve_for_source`, `StateCodec`, `VersionedStateStore` |
 | `write_mode` | `WriteMode`, `WriteSpec`, `DeleteMarker`, `plan_writes`, `WritePlan` |
@@ -545,6 +690,9 @@ let schema = serde_json::to_value(schema_for!(MyConfig))?;
 | `masking` | PII detection + column-level masking — `MaskingSpec`, `CompiledMasking`, `apply_masking`, `Detector`, `MaskAction` (the `masking` feature) |
 | `replication` | `ReplicationMethod`, `filter_incremental`, `max_replication_value` |
 | `retry` | `execute_with_retry` (exponential backoff + jitter) |
+| `io` | `CallContext`, `CallSlot`, `DEFAULT_CALL_TIMEOUT` — the backend-call wrapper (#880) |
+| `http` | `Client`, `ClientBuilder`, `status_error`, `is_cross_origin`, `strip_credentials`, `ResponseTooLarge` |
+| `batching` | `chunks`, `into_chunks`, `map_concurrent`, `for_each_concurrent`, `ConcurrencyLimit` |
 | `schema` | `infer_schema` from record samples |
 | `check` | `CheckContext`, `Probe`, `CheckReport` for `faucet doctor` |
 | `observability` | Pipeline-internal `tracing`/`metrics` decorators; `install_observability` |

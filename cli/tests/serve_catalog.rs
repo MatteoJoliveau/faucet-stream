@@ -4,6 +4,7 @@
 //! detail (schema timeline + stats + edges) and the lineage graph — plus RBAC
 //! (a viewer can read the catalog; an unauthenticated caller cannot).
 #![cfg(all(feature = "catalog", feature = "source-csv", feature = "sink-jsonl"))]
+#![allow(clippy::disallowed_methods)] // tests drive time and raw clients directly
 
 use serde_json::Value;
 use std::time::Duration;
@@ -73,6 +74,7 @@ fn serve_args(port: u16, auth_config: std::path::PathBuf) -> faucet_cli::cli::Se
         vault_previous_key: Vec::new(),
         connect_providers: None,
         allow_subprocess_connectors: false,
+        references: Default::default(),
     }
 }
 

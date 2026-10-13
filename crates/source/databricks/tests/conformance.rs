@@ -70,3 +70,62 @@ async fn conformance_bounded_memory() {
 
     assert_bounded_memory(&src, batch, total).await;
 }
+
+// ── Descriptor agreement (RFC 0013) ───────────────────────────────────────────
+
+#[test]
+fn conformance_descriptor_matches_built_source() {
+    let base = json!({
+        "workspace_url": "https://x.cloud.databricks.com",
+        "warehouse_id": "wh",
+        "sql": "SELECT 1",
+        "auth": {"type": "pat", "config": {"token": "t"}},
+    });
+    let mut configs = vec![base.clone()];
+    if cfg!(feature = "arrow") {
+        let mut arrow = base;
+        arrow["arrow_native"] = json!(true);
+        configs.push(arrow);
+    }
+    for v in configs {
+        let cfg: DatabricksSourceConfig = serde_json::from_value(v.clone()).unwrap();
+        let built = DatabricksSource::new(cfg).expect("offline source");
+        faucet_conformance::assert_descriptor_matches_source(
+            &faucet_source_databricks::DESCRIPTOR,
+            "databricks",
+            &v,
+            &built,
+        );
+    }
+}
+
+// ── Check: backend calls honour the call deadline and cancel (#880) ──────────
+
+#[tokio::test]
+async fn conformance_call_deadline() {
+    let hung = faucet_conformance::hung::SilentListener::start()
+        .await
+        .expect("listener");
+    let uri = hung.http_url();
+    let make = || {
+        let config = DatabricksSourceConfig {
+            workspace_url: uri.clone(),
+            warehouse_id: "wh".into(),
+            sql: "SELECT id FROM t".into(),
+            auth: AuthSpec::Inline(DatabricksAuth::Pat { token: "t".into() }),
+            catalog: None,
+            schema: None,
+            parameters: Vec::new(),
+            wait_timeout_secs: 50,
+            poll_interval_secs: 1,
+            statement_timeout_secs: 3600,
+            batch_size: 100,
+            arrow_native: false,
+            result_disposition: Default::default(),
+            replication: DatabricksReplication::Full,
+            state_key: None,
+        };
+        DatabricksSource::new(config).unwrap()
+    };
+    faucet_conformance::calls::assert_source_call_deadline(make).await;
+}

@@ -142,3 +142,55 @@ async fn conformance_preflight_check_wellformed() {
         .expect("source");
     assert_preflight_check_wellformed(&source, &faucet_core::check::CheckContext::default()).await;
 }
+
+// ── Descriptor agreement (RFC 0013) ──────────────────────────────────────────
+
+#[tokio::test(flavor = "multi_thread")]
+async fn conformance_descriptor_matches_built_source() {
+    let dir = tempfile::tempdir().unwrap();
+    let uri = table_uri(&dir, "descriptor");
+    seed(&uri, 1).await;
+    let v = serde_json::json!({ "table_uri": uri });
+    let cfg: DeltaSourceConfig = serde_json::from_value(v.clone()).unwrap();
+    let built = DeltaSource::new(cfg).await.expect("source");
+    faucet_conformance::assert_descriptor_matches_source(
+        &faucet_source_delta::DESCRIPTOR,
+        "delta",
+        &v,
+        &built,
+    );
+}
+
+// ── Check: backend calls honour the call deadline and cancel (#880) ──────────
+
+fn block_on<F: std::future::Future>(f: F) -> F::Output {
+    tokio::task::block_in_place(|| tokio::runtime::Handle::current().block_on(f))
+}
+
+fn hung_table(endpoint: &str) -> serde_json::Value {
+    serde_json::json!({
+        "table_uri": "s3://hung/table",
+        "storage_options": {
+            "AWS_ENDPOINT_URL": endpoint,
+            "AWS_ACCESS_KEY_ID": "k",
+            "AWS_SECRET_ACCESS_KEY": "s",
+            "AWS_REGION": "us-east-1",
+            "AWS_ALLOW_HTTP": "true",
+            "AWS_S3_ALLOW_UNSAFE_RENAME": "true"
+        }
+    })
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn conformance_call_deadline() {
+    let hung = faucet_conformance::hung::SilentListener::start()
+        .await
+        .expect("listener");
+    let v = hung_table(&hung.http_url());
+    faucet_conformance::calls::assert_source_call_deadline(|| {
+        let cfg: faucet_source_delta::DeltaSourceConfig =
+            serde_json::from_value(v.clone()).expect("config");
+        block_on(faucet_source_delta::DeltaSource::new(cfg)).expect("source")
+    })
+    .await;
+}

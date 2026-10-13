@@ -10,6 +10,7 @@
 //!
 //! Bookmark/idempotency checks (3/4/5) do not apply: core NATS is
 //! fire-and-forget (no bookmark) and 4/5 are sink-only.
+#![allow(clippy::disallowed_methods)] // tests drive time and raw clients directly
 
 use faucet_conformance::{assert_config_schema_valid_value, assert_errors_not_panics};
 use faucet_core::Source as _;
@@ -403,4 +404,56 @@ mod docker {
         seqs.dedup();
         assert_eq!(seqs, (1..=6).collect::<Vec<u64>>(), "no duplicates");
     }
+}
+
+/// The static descriptor answers exactly what the built source declares (RFC 0013).
+#[tokio::test(flavor = "multi_thread")]
+async fn conformance_descriptor_matches_built_source() {
+    #[allow(unused_mut)]
+    let configs = vec![
+        r#"{"subject": "events.>", "servers": ["nats://127.0.0.1:1"], "idle_timeout_secs": 1}"#,
+    ];
+    for raw in configs {
+        let v: faucet_core::Value = faucet_core::serde_json::from_str(raw).expect("json");
+        let cfg: faucet_source_nats::NatsSourceConfig =
+            faucet_core::serde_json::from_value(v.clone()).expect("config");
+        let built = faucet_source_nats::NatsSource::new(cfg)
+            .await
+            .expect("offline build");
+        faucet_conformance::assert_descriptor_matches_source(
+            &faucet_source_nats::DESCRIPTOR,
+            "nats",
+            &v,
+            &built,
+        );
+    }
+}
+
+/// A server that accepts TCP connections and never answers stands in for a
+/// hung backend (#880): the lazy connect waits on it.
+async fn silent_server() -> String {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        let mut held = Vec::new();
+        while let Ok((stream, _)) = listener.accept().await {
+            held.push(stream);
+        }
+    });
+    format!("nats://{addr}")
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn conformance_call_deadline() {
+    let server = silent_server().await;
+    let mut built = Vec::new();
+    for _ in 0..2 {
+        let mut cfg = NatsSourceConfig::new("events.>");
+        cfg.connection.servers = vec![server.clone()];
+        cfg.idle_timeout_secs = Some(60);
+        built.push(NatsSource::new(cfg).await.expect("lazy construction"));
+    }
+    let built = std::sync::Mutex::new(built);
+    faucet_conformance::calls::assert_source_call_deadline(|| built.lock().unwrap().pop().unwrap())
+        .await;
 }

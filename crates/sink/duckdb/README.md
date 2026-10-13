@@ -82,3 +82,11 @@ is refused on a best-effort configuration unless the `dlq:` block sets
 `allow_duplicates_on_dlq_all: true` (a DLQ replay would write the rows that
 already landed a second time). See
 [batch atomicity](https://faucet-hq.github.io/faucet-stream/cookbook/dlq.html#batch-atomicity-and-dlq_all).
+
+## Capabilities
+
+Append only. `faucet list --json` prints the declaration.
+
+## Timeouts, cancellation and retries
+
+Every page write runs through the pipeline's `CallContext` (#880): the run's deadline ends it promptly, and a write cut short is interrupted inside DuckDB so its transaction rolls back. Each write counts as one `write` round trip in `faucet_sink_roundtrips_total`. The sink never retries a write itself.

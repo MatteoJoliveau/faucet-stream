@@ -5,6 +5,7 @@
 //! requires Docker — it runs in CI alongside the other integration tests. It
 //! drives the stream mode (`XRANGE`-paged), matching the existing streaming
 //! integration test's container boot + seeding path verbatim.
+#![allow(clippy::disallowed_methods)] // tests drive time and raw clients directly
 
 use faucet_conformance::assert_config_schema_valid_value;
 use faucet_core::Source;
@@ -143,5 +144,48 @@ async fn conformance_errors_not_panics() {
         &source,
         &faucet_core::check::CheckContext::default(),
     )
+    .await;
+}
+
+/// The static descriptor answers exactly what the built source declares (RFC 0013).
+#[tokio::test(flavor = "multi_thread")]
+async fn conformance_descriptor_matches_built_source() {
+    #[allow(unused_mut)]
+    let configs =
+        vec![r#"{"url": "redis://127.0.0.1:1", "source_type": {"type": "List", "key": "k"}}"#];
+    for raw in configs {
+        let v: faucet_core::Value = faucet_core::serde_json::from_str(raw).expect("json");
+        let cfg: faucet_source_redis::RedisSourceConfig =
+            faucet_core::serde_json::from_value(v.clone()).expect("config");
+        let built = faucet_source_redis::RedisSource::new(cfg).expect("offline build");
+        faucet_conformance::assert_descriptor_matches_source(
+            &faucet_source_redis::DESCRIPTOR,
+            "redis",
+            &v,
+            &built,
+        );
+    }
+}
+
+/// A server that accepts TCP connections and never answers stands in for a
+/// hung backend (#880): the lazy connect waits on it.
+#[tokio::test(flavor = "multi_thread")]
+async fn conformance_call_deadline() {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        let mut held = Vec::new();
+        while let Ok((stream, _)) = listener.accept().await {
+            held.push(stream);
+        }
+    });
+    let url = format!("redis://{addr}");
+    faucet_conformance::calls::assert_source_call_deadline(|| {
+        RedisSource::new(RedisSourceConfig::new(
+            &url,
+            RedisSourceType::List { key: "q".into() },
+        ))
+        .unwrap()
+    })
     .await;
 }

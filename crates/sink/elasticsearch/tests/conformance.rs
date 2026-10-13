@@ -204,3 +204,103 @@ async fn conformance_preflight_check_wellformed() {
     let sink = ElasticsearchSink::new(ElasticsearchSinkConfig::new(server.uri(), "idx")).unwrap();
     assert_sink_preflight_check_wellformed(&sink, &CheckContext::default()).await;
 }
+
+/// The static descriptor answers exactly what the built sink declares (RFC 0013).
+#[tokio::test(flavor = "multi_thread")]
+async fn conformance_descriptor_matches_built_sink() {
+    #[allow(unused_mut)]
+    let configs = vec![
+        r#"{"base_url": "http://127.0.0.1:1", "index": "i", "auth": {"type": "none"}}"#,
+        r#"{"base_url": "http://127.0.0.1:1", "index": "i", "auth": {"type": "none"}, "write_mode": "upsert", "key": ["id"]}"#,
+        r#"{"base_url": "http://127.0.0.1:1", "index": "i", "auth": {"type": "none"}, "write_mode": "delete", "key": ["id"]}"#,
+    ];
+    for raw in configs {
+        let v: faucet_core::Value = faucet_core::serde_json::from_str(raw).expect("json");
+        let cfg: faucet_sink_elasticsearch::ElasticsearchSinkConfig =
+            faucet_core::serde_json::from_value(v.clone()).expect("config");
+        let built = faucet_sink_elasticsearch::ElasticsearchSink::new(cfg).expect("offline build");
+        faucet_conformance::assert_descriptor_matches_sink(
+            &faucet_sink_elasticsearch::DESCRIPTOR,
+            "elasticsearch",
+            &v,
+            &built,
+        );
+    }
+}
+
+// ── Check: backend calls honour the call deadline and cancel (#880) ──────────
+
+#[tokio::test]
+async fn conformance_call_deadline() {
+    let server = MockServer::start().await;
+    Mock::given(wiremock::matchers::any())
+        .respond_with(ResponseTemplate::new(200).set_delay(std::time::Duration::from_secs(60)))
+        .mount(&server)
+        .await;
+    let uri = server.uri();
+    faucet_conformance::calls::assert_sink_call_deadline(
+        || ElasticsearchSink::new(ElasticsearchSinkConfig::new(uri.clone(), "idx")).unwrap(),
+        &[json!({"id": 1})],
+    )
+    .await;
+}
+
+// ── #878: declared capabilities ───────────────────────────────────────────────
+
+#[allow(dead_code)]
+#[path = "support/fake_cluster.rs"]
+mod fake_cluster;
+
+/// Per-row `_bulk` outcomes are truthful, and a replayed keyed write converges
+/// on the document `_id`.
+#[tokio::test(flavor = "multi_thread")]
+async fn conformance_partial_outcomes_and_replay_safety() {
+    let server = MockServer::start().await;
+    let store = BulkDocStore::new();
+    Mock::given(method("POST"))
+        .and(path("/_bulk"))
+        .respond_with(store.clone())
+        .mount(&server)
+        .await;
+    let config = ElasticsearchSinkConfig {
+        write: WriteSpec {
+            write_mode: WriteMode::Upsert,
+            key: vec!["id".to_string()],
+            delete_marker: None,
+            rollback: None,
+        },
+        ..ElasticsearchSinkConfig::new(server.uri(), "idx")
+    };
+    let sink = ElasticsearchSink::new(config).unwrap();
+    let count = || {
+        let store = store.clone();
+        async move { store.count() }
+    };
+    faucet_conformance::assert_partial_outcomes_truthful(&sink, count).await;
+    faucet_conformance::assert_replay_safe(&sink, count).await;
+}
+
+/// The alias-swap overwrite stages into a new index until commit, against the
+/// same stand-in cluster `tests/overwrite.rs` uses.
+#[tokio::test(flavor = "multi_thread")]
+async fn conformance_overwrite_lifecycle() {
+    let server = MockServer::start().await;
+    let cluster = fake_cluster::FakeCluster::default();
+    Mock::given(wiremock::matchers::any())
+        .respond_with(cluster.clone())
+        .mount(&server)
+        .await;
+    cluster.add_index(
+        "orders-old",
+        vec![json!({"id": -1}), json!({"id": -2})],
+        Some("orders"),
+    );
+    let mut cfg = ElasticsearchSinkConfig::new(server.uri(), "orders");
+    cfg.write.write_mode = WriteMode::Overwrite;
+    let sink = ElasticsearchSink::new(cfg).unwrap();
+    faucet_conformance::assert_overwrite_lifecycle(&sink, || {
+        let cluster = cluster.clone();
+        async move { cluster.alias_docs("orders").len() }
+    })
+    .await;
+}

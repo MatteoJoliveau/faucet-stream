@@ -4,6 +4,7 @@
 //! mid-outage, and the run API / log endpoint surfaces against a mock OTLP
 //! collector.
 #![cfg(all(feature = "serve", feature = "otel", feature = "serve-history-sqlite"))]
+#![allow(clippy::disallowed_methods)] // tests drive time and raw clients directly
 
 #[path = "support/otlp_mock.rs"]
 mod otlp_mock;
@@ -67,6 +68,7 @@ fn args(port: u16) -> ServeArgs {
         vault_previous_key: Vec::new(),
         connect_providers: None,
         allow_subprocess_connectors: false,
+        references: Default::default(),
     }
 }
 

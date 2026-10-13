@@ -15,6 +15,7 @@
 //!          them while `assert_bounded_memory` drives the stream; the source's
 //!          `idle_timeout` (5 s of quiet) terminates the drain once the writer
 //!          finishes.
+#![allow(clippy::disallowed_methods)] // tests drive time and raw clients directly
 
 use faucet_conformance::{
     assert_bookmark_roundtrip, assert_bounded_memory, assert_config_schema_valid_value,
@@ -225,4 +226,22 @@ async fn conformance_errors_not_panics() {
         .await
         .expect("new + preflight succeed against a live server");
     assert_errors_not_panics(&source).await;
+}
+
+/// A binlog stream with nothing to deliver stands in for a hung backend
+/// (#880): the read waits on the server until the deadline or the cancel.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn conformance_call_deadline() {
+    let (_container, url) = start_mysql_cdc().await;
+    let mut built = Vec::new();
+    for _ in 0..2 {
+        built.push(
+            MysqlCdcSource::new(build_config(&url))
+                .await
+                .expect("source new"),
+        );
+    }
+    let built = std::sync::Mutex::new(built);
+    faucet_conformance::calls::assert_source_call_deadline(|| built.lock().unwrap().pop().unwrap())
+        .await;
 }

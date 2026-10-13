@@ -513,9 +513,25 @@ e.g. `postgres`) need `--kind source|sink`.
 
 Both `faucet list` and `faucet list --available` accept `--json` for a
 machine-readable listing — `list --json` emits `{ sources, sinks, transforms,
-state_stores }` (each connector entry carries `name`, `description`, and a
-maturity `tier`), and `list --available --json` emits the registry rows with a
-`compiled` flag per connector.
+state_stores }` (each connector entry carries `name`, `description`, a maturity
+`tier`, and the `capabilities` the connector declares), and
+`list --available --json` emits the registry rows with a `compiled` flag per
+connector.
+
+A connector's `capabilities` object is what `faucet validate` checks a config
+against (RFC 0013): `write_modes`, `idempotent_writes` (exactly-once watermark),
+`keyed_upsert`, `cleanup`, `rollback`, `schema_evolution`, `schema_report`
+(`reported`, `schemaless`, `drops_unknown_fields` or `undeclared`),
+`scoped_overwrite`, `direct_overwrite`, `staged_load` for sinks and
+`exactly_once`, `discover`, `shardable`, `range_read`, `range_digest`,
+`reports_lag`, `table_routing` (names each record's table, so it can drive a
+multi-table `faucet mirror`) and `read_side_effects` (reading creates or
+advances a slot, joins a consumer group or opens a listener, so `faucet plan
+--live` refuses it) for sources, plus `columnar` / `native` for both. The listing
+shows the kind-level view — every capability some config enables; a few depend
+on the config (a SQL sink cleans up and rolls back only with
+`column_mapping: auto_map`), and `faucet validate` reads them from your config.
+`keyed_dedup` (the config dedups by key) is always `false` here.
 
 ## `conformance`
 
@@ -561,8 +577,8 @@ publishing is always complete.
 faucet conformance --export --require-all > connectors.json
 ```
 
-Every capability is derived from the registry allowlists and the connector's
-config schema — the same sources as the capability matrix and the conformance
+Every capability is derived from what the connector declares (its
+`ConnectorDescriptor`, kind-level view) and its config schema — the same sources as the capability matrix and the conformance
 score — never copied by hand. Shape (`version: 1`; additive changes only):
 
 | Field | Meaning |
@@ -1373,6 +1389,11 @@ Selected flags (`faucet serve --help` for the full list):
 | `--allow-unauthenticated-network` | With `--no-auth`, allow a non-loopback `--listen` (`0.0.0.0`, `::`, a LAN address). Without it that combination refuses to start; with it the server logs a warning. Env: `FAUCET_SERVE_ALLOW_UNAUTHENTICATED_NETWORK`. |
 | `--auth-config <path>` | RBAC principals file (`{ name, token, role }`; roles `viewer`/`operator`/`admin`) — enables role enforcement + the `GET /v1/audit` log. Tokens resolve `${env:}` / `${file:}` / secret-manager references at startup; an unresolvable one refuses the start. Mutually exclusive with `--auth-token`/`--no-auth`. |
 | `--allow-subprocess-connectors` | Let a config submitted over HTTP or MCP use connectors that run a program on the host (`singer`). Off by default (`422`); configs for a tenant are refused regardless, registered templates are always allowed. See [Subprocess connectors](http-api.md#subprocess-connectors). |
+| `--allow-path-root <dir>` | Directory a config submitted over HTTP or MCP may read or write local files under (connector paths, `${file:}`, state / DLQ / lineage files). Repeatable. Default: the working directory and the system temp directory. See [Reference policy](http-api.md#reference-policy). |
+| `--allow-url-scheme <scheme>` / `--allow-url-host <host>` | Restrict the URLs a submitted config may connect to (repeatable or comma-separated; `*.example.com` matches subdomains). Default: any, except link-local and cloud-metadata hosts, which are reachable only when listed. |
+| `--allow-env <name>` | Environment variable a submitted config may read through `${env:}` / `${secret:}` (`NAME` or `PREFIX*`). Default: none. |
+| `--allow-secret-scheme <scheme>` | Secret-manager scheme (`vault`, `aws-sm`, `gcp-sm`, `azure-kv`) a submitted config may resolve with the server's credentials. Default: none. |
+| `--tenant-path-root <dir>` | Confine the local paths of a config submitted for a tenant to `<dir>/<tenant id>`. |
 | `--read-token <t>` / `--write-token <t>` / `--admin-token <t>` | The three-token shorthand for the same RBAC (`viewer` / `operator` / `admin`) with no file to author — prefer the env vars `FAUCET_SERVE_{READ,WRITE,ADMIN}_TOKEN`. Any subset may be set; mutually exclusive with `--auth-token` / `--auth-config` / `--no-auth`. See the [role × route matrix](http-api.md#role--route-matrix). |
 | `--max-concurrent-runs <n>` / `--max-queued-runs <n>` | Concurrency + queue caps (429 past the queue). |
 | `--history <url>` | `postgres://…` / `sqlite:…` for durable run history (feature-gated; default in-memory). Env: `FAUCET_SERVE_HISTORY` — prefer it for a URL with a password, which `ps` would otherwise show. |
