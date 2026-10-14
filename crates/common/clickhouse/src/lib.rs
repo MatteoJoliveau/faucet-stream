@@ -222,7 +222,7 @@ pub fn parse_json_each_row(body: &str) -> Result<Vec<Value>, FaucetError> {
         if trimmed.is_empty() {
             continue;
         }
-        let value: Value = serde_json::from_str(trimmed).map_err(|e| {
+        let value: Value = faucet_core::fidelity::from_str(trimmed).map_err(|e| {
             FaucetError::Source(format!(
                 "ClickHouse: failed to parse JSONEachRow line {}: {e}",
                 idx + 1
@@ -293,8 +293,7 @@ pub fn sql_literal(value: &Value) -> String {
 }
 
 fn quote_string(s: &str) -> String {
-    let escaped = s.replace('\\', "\\\\").replace('\'', "\\'");
-    format!("'{escaped}'")
+    faucet_common_sql::SqlDialect::quote_literal(&faucet_common_sql::dialects::ClickHouse, s)
 }
 
 /// Quote a ClickHouse identifier (column, table or database name).
@@ -302,10 +301,9 @@ fn quote_string(s: &str) -> String {
 /// Like string literals, ClickHouse double-quoted identifiers accept C-style
 /// escapes, so [`faucet_core::util::quote_ident`] (which only doubles `"`) is
 /// unsafe here: a name containing `\"` would close the identifier. Both `\`
-/// and `"` are backslash-escaped.
+/// and `"` are backslash-escaped (the shared ClickHouse dialect's quoting).
 pub fn quote_ident(name: &str) -> String {
-    let escaped = name.replace('\\', "\\\\").replace('"', "\\\"");
-    format!("\"{escaped}\"")
+    faucet_common_sql::dialects::clickhouse::quote_ident(name)
 }
 
 #[cfg(test)]

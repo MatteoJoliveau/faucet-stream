@@ -3260,6 +3260,21 @@ impl faucet_core::Sink for BigQuerySink {
 
 #[cfg(test)]
 mod tests {
+
+    /// The value-fidelity corpus (#885): the NDJSON a load job carries reads
+    /// back unchanged.
+    #[test]
+    fn the_fidelity_corpus_encodes_unchanged() {
+        use faucet_conformance::fidelity;
+        let sent = fidelity::corpus();
+        let ndjson = super::records_to_ndjson(&sent).unwrap();
+        let landed: Vec<serde_json::Value> = ndjson
+            .lines()
+            .map(|l| faucet_core::fidelity::from_str(l).unwrap())
+            .collect();
+        fidelity::assert_round_trip(&sent, &landed, fidelity::Tolerance::exact());
+    }
+
     #[tokio::test]
     async fn call_once_never_resends_under_a_retrying_context() {
         let fast = std::time::Duration::from_millis(1);
