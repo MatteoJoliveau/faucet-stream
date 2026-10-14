@@ -300,8 +300,8 @@ impl Sink for MetadataSink {
     // The columnar and native paths carry no per-row Value to stamp, so they stay
     // at the trait default (off); everything else reaches the wrapped sink.
     crate::forward_sink!(inner; except
-        admit_page, write_batch, write_batch_reported, write_batch_partial, write_batch_idempotent,
-        write_batch_idempotent_reported,
+        admit_page, write_batch, write_batch_reported, write_governed, write_batch_partial,
+        write_batch_idempotent, write_batch_idempotent_reported,
         begin_overwrite,
         supports_columnar, write_batch_columnar, native_load_capabilities, load_native);
 
@@ -326,6 +326,17 @@ impl Sink for MetadataSink {
         self.inner.write_batch_reported(&self.stamp(records)).await
     }
 
+    async fn write_governed(
+        &self,
+        page: &crate::governance::GovernedPage<'_>,
+    ) -> Result<crate::accounting::WriteReport, FaucetError> {
+        self.ensure_columns().await?;
+        self.inner
+            .write_governed(&page.restamped(self.stamp(page.records())))
+            .await
+    }
+
+    #[allow(deprecated)] // drives the 1.x lifecycle hook until faucet-core 2.0 (RFC 0014)
     async fn write_batch_idempotent(
         &self,
         records: &[Value],
@@ -338,6 +349,7 @@ impl Sink for MetadataSink {
             .await
     }
 
+    #[allow(deprecated)] // drives the 1.x lifecycle hook until faucet-core 2.0 (RFC 0014)
     async fn write_batch_idempotent_reported(
         &self,
         records: &[Value],
@@ -350,6 +362,7 @@ impl Sink for MetadataSink {
             .await
     }
 
+    #[allow(deprecated)] // drives the 1.x lifecycle hook until faucet-core 2.0 (RFC 0014)
     async fn begin_overwrite(&self) -> Result<(), FaucetError> {
         // Before the staging clone is taken from the target.
         self.ensure_columns().await?;
@@ -357,6 +370,7 @@ impl Sink for MetadataSink {
     }
 }
 
+#[allow(deprecated)] // the tests drive the 1.x lifecycle hooks directly (RFC 0014)
 #[cfg(test)]
 mod tests {
     use super::*;

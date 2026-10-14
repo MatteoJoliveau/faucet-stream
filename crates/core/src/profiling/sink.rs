@@ -35,8 +35,8 @@ impl Sink for ProfilingSink {
     // Profiling needs parsed rows, so the native byte path stays off; everything
     // else reaches the wrapped sink.
     crate::forward_sink!(inner; except
-        write_batch, write_batch_reported, write_batch_partial, write_batch_idempotent,
-        write_batch_idempotent_reported,
+        write_batch, write_batch_reported, write_governed, write_batch_partial,
+        write_batch_idempotent, write_batch_idempotent_reported,
         write_batch_columnar, native_load_capabilities, load_native);
 
     async fn write_batch(&self, records: &[Value]) -> Result<usize, FaucetError> {
@@ -51,6 +51,15 @@ impl Sink for ProfilingSink {
     ) -> Result<crate::accounting::WriteReport, FaucetError> {
         let r = self.inner.write_batch_reported(records).await?;
         self.observe(records);
+        Ok(r)
+    }
+
+    async fn write_governed(
+        &self,
+        page: &crate::governance::GovernedPage<'_>,
+    ) -> Result<crate::accounting::WriteReport, FaucetError> {
+        let r = self.inner.write_governed(page).await?;
+        self.observe(page.records());
         Ok(r)
     }
 
@@ -72,6 +81,7 @@ impl Sink for ProfilingSink {
         Ok(outcomes)
     }
 
+    #[allow(deprecated)] // drives the 1.x lifecycle hook until faucet-core 2.0 (RFC 0014)
     async fn write_batch_idempotent(
         &self,
         records: &[Value],
@@ -86,6 +96,7 @@ impl Sink for ProfilingSink {
         Ok(n)
     }
 
+    #[allow(deprecated)] // drives the 1.x lifecycle hook until faucet-core 2.0 (RFC 0014)
     async fn write_batch_idempotent_reported(
         &self,
         records: &[Value],
@@ -113,6 +124,7 @@ impl Sink for ProfilingSink {
     }
 }
 
+#[allow(deprecated)] // the tests drive the 1.x lifecycle hooks directly (RFC 0014)
 #[cfg(test)]
 mod tests {
     use super::*;

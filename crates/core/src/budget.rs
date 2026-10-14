@@ -402,8 +402,8 @@ impl Sink for BudgetSink {
     // A native byte load cannot be counted before it lands, so it stays off;
     // everything else reaches the wrapped sink.
     crate::forward_sink!(inner; except
-        admit_page, write_batch, write_batch_reported, write_batch_partial, write_batch_idempotent,
-        write_batch_idempotent_reported,
+        admit_page, write_batch, write_batch_reported, write_governed, write_batch_partial,
+        write_batch_idempotent, write_batch_idempotent_reported,
         write_batch_columnar, native_load_capabilities, load_native);
 
     async fn admit_page(&self, records: &[Value]) -> Result<(), FaucetError> {
@@ -430,6 +430,15 @@ impl Sink for BudgetSink {
         self.account(r.accepted as u64, bytes);
         Ok(r)
     }
+    async fn write_governed(
+        &self,
+        page: &crate::governance::GovernedPage<'_>,
+    ) -> Result<crate::accounting::WriteReport, FaucetError> {
+        let bytes = self.admit(page.records())?;
+        let r = self.inner.write_governed(page).await?;
+        self.account(r.accepted as u64, bytes);
+        Ok(r)
+    }
     async fn write_batch_partial(&self, records: &[Value]) -> Result<Vec<RowOutcome>, FaucetError> {
         let bytes = self.admit(records)?;
         let outcomes = self.inner.write_batch_partial(records).await?;
@@ -437,6 +446,7 @@ impl Sink for BudgetSink {
         self.account(ok, bytes);
         Ok(outcomes)
     }
+    #[allow(deprecated)] // drives the 1.x lifecycle hook until faucet-core 2.0 (RFC 0014)
     async fn write_batch_idempotent(
         &self,
         records: &[Value],
@@ -452,6 +462,7 @@ impl Sink for BudgetSink {
         Ok(n)
     }
 
+    #[allow(deprecated)] // drives the 1.x lifecycle hook until faucet-core 2.0 (RFC 0014)
     async fn write_batch_idempotent_reported(
         &self,
         records: &[Value],
@@ -494,6 +505,7 @@ impl Sink for BudgetSink {
     }
 }
 
+#[allow(deprecated)] // the tests drive the 1.x lifecycle hooks directly (RFC 0014)
 #[cfg(test)]
 mod tests {
     use super::*;

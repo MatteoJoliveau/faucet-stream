@@ -316,8 +316,8 @@ impl Sink for PolicySink {
     // Classification needs parsed rows, so the native byte path stays off;
     // everything else reaches the wrapped sink.
     crate::forward_sink!(inner; except
-        write_batch, write_batch_reported, write_batch_partial, write_batch_idempotent,
-        write_batch_idempotent_reported,
+        write_batch, write_batch_reported, write_governed, write_batch_partial,
+        write_batch_idempotent, write_batch_idempotent_reported,
         write_batch_columnar, native_load_capabilities, load_native);
 
     async fn write_batch_reported(
@@ -333,6 +333,21 @@ impl Sink for PolicySink {
             });
         }
         self.inner.write_batch_reported(records).await
+    }
+
+    async fn write_governed(
+        &self,
+        page: &crate::governance::GovernedPage<'_>,
+    ) -> Result<crate::accounting::WriteReport, FaucetError> {
+        let offending = self.screen(page.records())?;
+        if let Some((_, v)) = offending.first() {
+            return Err(FaucetError::PolicyViolation {
+                rule: v.rule.clone(),
+                column: v.column.clone(),
+                message: format!("{v} (quarantine needs a `dlq:` block; none is attached)"),
+            });
+        }
+        self.inner.write_governed(page).await
     }
 
     async fn write_batch(&self, records: &[Value]) -> Result<usize, FaucetError> {
@@ -388,6 +403,7 @@ impl Sink for PolicySink {
         Ok(outcomes)
     }
 
+    #[allow(deprecated)] // drives the 1.x lifecycle hook until faucet-core 2.0 (RFC 0014)
     async fn write_batch_idempotent(
         &self,
         records: &[Value],
@@ -400,6 +416,7 @@ impl Sink for PolicySink {
             .await
     }
 
+    #[allow(deprecated)] // drives the 1.x lifecycle hook until faucet-core 2.0 (RFC 0014)
     async fn write_batch_idempotent_reported(
         &self,
         records: &[Value],
@@ -430,6 +447,7 @@ impl Sink for PolicySink {
     }
 }
 
+#[allow(deprecated)] // the tests drive the 1.x lifecycle hooks directly (RFC 0014)
 #[cfg(test)]
 mod tests {
     use super::*;

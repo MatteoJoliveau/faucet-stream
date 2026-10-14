@@ -1,6 +1,7 @@
 //! The MSSQL sink against a scripted TDS endpoint: every write path, its
 //! error mapping and its cut-short connection repair, without a server.
 
+#![allow(deprecated)] // the tests drive the 1.x lifecycle hooks directly (RFC 0014)
 use std::collections::BTreeMap;
 use std::time::Duration;
 
@@ -170,6 +171,25 @@ async fn a_hung_insert_replaces_the_connection() {
     assert!(err.contains("MSSQL insert"), "{err}");
     // The replaced connection serves the next page.
     assert_eq!(sink.write_batch(&page()).await.unwrap(), 2);
+}
+
+/// RFC 0014: the driver-built sink declares only the lifecycles its driver
+/// implements, and its four write paths agree, keyed and appending.
+#[tokio::test]
+async fn driver_declarations_and_row_paths() {
+    let server = TdsServer::start().await.unwrap();
+    server.on(TABLE_PROBE, table_exists(true)).on(
+        COLUMN_INFO,
+        columns(&[("id", "bigint", false), ("v", "nvarchar", true)]),
+    );
+    for (mode, key) in [(WriteMode::Upsert, &["id"][..]), (WriteMode::Append, &[])] {
+        let sink = MssqlSink::new(auto(&server, mode, key)).await.unwrap();
+        faucet_conformance::assert_driver_declarations_truthful(&sink).await;
+        faucet_conformance::assert_driver_row_paths_agree(&sink).await;
+    }
+    let json = MssqlSink::new(cfg(&server)).await.unwrap();
+    assert!(!json.supports_cleanup());
+    faucet_conformance::assert_driver_declarations_truthful(&json).await;
 }
 
 #[tokio::test]
