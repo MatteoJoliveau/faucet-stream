@@ -706,7 +706,7 @@ mod tests {
     use serde_json::json;
 
     fn spec_of(yaml: &str) -> ParamsSpec {
-        serde_yaml::from_str(yaml).unwrap()
+        serde_yaml_bw::from_str(yaml).unwrap()
     }
 
     fn supplied(pairs: &[(&str, Value)]) -> SuppliedParams {

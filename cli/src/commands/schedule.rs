@@ -979,7 +979,7 @@ mod tests {
     use crate::schedule::spec::ScheduleSpec;
 
     fn compiled(yaml: &str) -> CompiledSchedule {
-        let spec: ScheduleSpec = serde_yaml::from_str(yaml).unwrap();
+        let spec: ScheduleSpec = serde_yaml_bw::from_str(yaml).unwrap();
         CompiledSchedule::compile(&spec).unwrap()
     }
 

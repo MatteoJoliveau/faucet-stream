@@ -168,7 +168,7 @@ impl MaterializedConfig {
 pub fn parse_body(body: &str, format: ConfigFormat) -> CliResult<Value> {
     match format {
         ConfigFormat::Yaml => {
-            serde_yaml::from_str(body).map_err(|e| CliError::Config(format!("invalid YAML: {e}")))
+            serde_yaml_bw::from_str(body).map_err(|e| CliError::Config(format!("invalid YAML: {e}")))
         }
         ConfigFormat::Json => {
             serde_json::from_str(body).map_err(|e| CliError::Config(format!("invalid JSON: {e}")))
