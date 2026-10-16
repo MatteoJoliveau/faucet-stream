@@ -18,10 +18,11 @@ name: Docker images
 #     from the `faucet-cli-vX.Y.Z` tag only in image-build files (Dockerfile,
 #     .github, scripts, deploy, docs), so a tag never names another binary.
 #
-# Every image is built and smoke-tested locally first (it starts; `full`
-# carries its features and loads the Oracle client);
-# only an image that passes is pushed, signed and attested. Sizes land in the
-# run summary.
+# Every image is built natively for linux/amd64 and linux/arm64 and
+# smoke-tested on its own architecture first (it starts; `full` carries its
+# features and loads the Oracle client); only images that pass are pushed. The
+# merge job then publishes one multi-arch tag set per profile and signs and
+# attests it (#904). Sizes land in the run summary.
 
 on:
   workflow_dispatch:
@@ -56,7 +57,9 @@ jobs:
     # manual dispatch) so a `faucet-source-*` / `faucet-sink-*` crate tag does
     # not trigger a full image build. Mirrors the `helm` job's guard below.
     if: github.event_name == 'workflow_dispatch' || startsWith(github.ref_name, 'faucet-cli-v')
-    runs-on: ubuntu-latest
+    runs-on: ${{ matrix.arch == 'arm64' && 'ubuntu-24.04-arm' || 'ubuntu-latest' }}
+    # A full build takes about an hour; anything far past that is a hang.
+    timeout-minutes: 180
     env:
       PUSH: ${{ github.event_name == 'release' || inputs.push }}
       RELEASE: ${{ inputs.release }}
@@ -65,6 +68,10 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
+        # Every profile is built natively on both architectures (#904): amd64
+        # on ubuntu-latest, arm64 on GitHub's arm64 runner, with no emulation.
+        arch: [amd64, arm64]
+        profile: [full, core, analytics, cdc]
         include:
           # The CLI's `full` feature: every connector and every feature, plus
           # the Oracle Instant Client its Oracle connectors load. Heavy.
@@ -72,19 +79,24 @@ jobs:
             sources: ""
             sinks: ""
             oracle: "auto"
+            # Fat LTO runs out of memory linking every feature (#911).
+            cargo_profile: release
           # Lean, common analytics/ELT set.
           - profile: core
             sources: "rest,postgres,s3,csv"
             sinks: "postgres,s3,jsonl,stdout"
             oracle: "false"
+            cargo_profile: release-lto
           - profile: analytics
             sources: "rest,postgres,s3,bigquery,snowflake"
             sinks: "bigquery,snowflake,s3,jsonl"
             oracle: "false"
+            cargo_profile: release-lto
           - profile: cdc
             sources: "postgres-cdc,mysql-cdc,mongodb-cdc"
             sinks: "postgres,kafka,s3"
             oracle: "false"
+            cargo_profile: release-lto
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -113,6 +125,154 @@ jobs:
             echo "$changed"
             exit 1
           fi
+
+      - name: Lowercase image name
+        id: img
+        run: echo "name=${REGISTRY}/${GITHUB_REPOSITORY,,}" >>"$GITHUB_OUTPUT"
+
+      # Base-image pulls go through the Docker Hub mirror the test jobs use
+      # (scripts/docker-hub-mirror.sh), so builds avoid the anonymous rate limit.
+      - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+        with:
+          buildkitd-config-inline: |
+            [registry."docker.io"]
+              mirrors = ["mirror.gcr.io"]
+
+      - name: Log in to Docker Hub
+        if: env.DOCKERHUB_USERNAME != ''
+        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
+        with:
+          username: ${{ env.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Log in to GHCR
+        if: env.PUSH == 'true'
+        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build (${{ matrix.profile }}, ${{ matrix.arch }})
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          context: .
+          file: ./Dockerfile
+          platforms: linux/${{ matrix.arch }}
+          load: true
+          build-args: |
+            SOURCES=${{ matrix.sources }}
+            SINKS=${{ matrix.sinks }}
+            ORACLE_CLIENT=${{ matrix.oracle }}
+            CARGO_PROFILE=${{ matrix.cargo_profile }}
+          tags: faucet-smoke:${{ matrix.profile }}
+          cache-from: type=gha,scope=faucet-${{ matrix.profile }}-${{ matrix.arch }}
+          cache-to: type=gha,mode=max,scope=faucet-${{ matrix.profile }}-${{ matrix.arch }}
+          provenance: false
+
+      - name: Smoke-test the image
+        env:
+          PROFILE: ${{ matrix.profile }}
+        run: |
+          set -euo pipefail
+          img="faucet-smoke:${PROFILE}"
+          # Every command is bounded: a hung container fails the step instead
+          # of holding the runner for hours.
+          drun() { timeout --kill-after=10 180 docker run --rm "$@"; }
+          drun "$img" --version
+          drun "$img" list > list.txt
+          if [ "$PROFILE" = full ]; then
+            # A sample of what #845 found missing from the old :full image.
+            drun "$img" schema transform sql > /dev/null
+            drun "$img" schema transform wasm > /dev/null
+            drun "$img" schema templates-sync > /dev/null
+            grep -qw oracle list.txt
+            mkdir -p smoke
+            printf '%s\n' \
+              'version: 1' \
+              'name: oracle-client-smoke' \
+              'pipeline:' \
+              '  source:' \
+              '    type: oracle' \
+              '    config: { host: 127.0.0.1, port: 1, service_name: X, username: u, password: p, query: "SELECT 1 FROM DUAL" }' \
+              '  sink: { type: stdout, config: {} }' > smoke/oracle.yaml
+            out="$(drun -v "$PWD/smoke:/smoke:ro" "$img" run --no-env-file /smoke/oracle.yaml 2>&1 || true)"
+            echo "$out" | tail -5
+            if echo "$out" | grep -qE 'DPI-1047|DPI-1072'; then
+              echo "::error::the Oracle client did not load in full"; exit 1
+            fi
+            echo "$out" | grep -qE 'ORA-|DPI-' \
+              || { echo "::error::no Oracle error came back, so the client was never exercised"; exit 1; }
+          fi
+          test "$(docker image inspect -f '{{.Architecture}}' "$img")" = "${{ matrix.arch }}"
+          raw=$(docker image inspect -f '{{.Size}}' "$img")
+          echo "| ${PROFILE} | ${{ matrix.arch }} | $((raw / 1048576)) MiB |" | tee -a "$GITHUB_STEP_SUMMARY"
+
+      # Same inputs and a warm cache, so this reuses the tested build's layers.
+      # Pushed by digest only; the merge job puts every architecture behind
+      # the profile's tags.
+      - name: Push by digest (${{ matrix.profile }}, ${{ matrix.arch }})
+        id: build
+        if: env.PUSH == 'true'
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          context: .
+          file: ./Dockerfile
+          platforms: linux/${{ matrix.arch }}
+          build-args: |
+            SOURCES=${{ matrix.sources }}
+            SINKS=${{ matrix.sinks }}
+            ORACLE_CLIENT=${{ matrix.oracle }}
+            CARGO_PROFILE=${{ matrix.cargo_profile }}
+          outputs: type=image,name=${{ steps.img.outputs.name }},push-by-digest=true,name-canonical=true,push=true
+          cache-from: type=gha,scope=faucet-${{ matrix.profile }}-${{ matrix.arch }}
+          # SLSA provenance and an SBOM travel with the image (#789 SUPPLY-05).
+          provenance: mode=max
+          sbom: true
+
+      - name: Hand the digest to the merge job
+        if: env.PUSH == 'true'
+        env:
+          DIGEST: ${{ steps.build.outputs.digest }}
+        run: |
+          mkdir -p digests
+          touch "digests/${DIGEST#sha256:}"
+
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        if: env.PUSH == 'true'
+        with:
+          name: digests-${{ matrix.profile }}-${{ matrix.arch }}
+          path: digests/*
+          if-no-files-found: error
+          retention-days: 1
+
+  # One multi-arch tag set per profile over the per-architecture digests, then
+  # sign and attest that index (#904).
+  merge:
+    needs: build
+    if: (github.event_name == 'workflow_dispatch' && inputs.push) || startsWith(github.ref_name, 'faucet-cli-v')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+      id-token: write
+      attestations: write
+    env:
+      RELEASE: ${{ inputs.release }}
+    strategy:
+      fail-fast: false
+      matrix:
+        profile: [full, core, analytics, cdc]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          pattern: digests-${{ matrix.profile }}-*
+          path: digests
+          merge-multiple: true
 
       - name: Lowercase image name
         id: img
@@ -151,138 +311,59 @@ jobs:
           fi
           echo "tags=${tags}" >>"$GITHUB_OUTPUT"
 
-      # Base-image pulls go through the Docker Hub mirror the test jobs use
-      # (scripts/docker-hub-mirror.sh), so builds avoid the anonymous rate limit.
       - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
-        with:
-          buildkitd-config-inline: |
-            [registry."docker.io"]
-              mirrors = ["mirror.gcr.io"]
-
-      - name: Log in to Docker Hub
-        if: env.DOCKERHUB_USERNAME != ''
-        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
-        with:
-          username: ${{ env.DOCKERHUB_USERNAME }}
-          password: ${{ secrets.DOCKERHUB_TOKEN }}
 
       - name: Log in to GHCR
-        if: env.PUSH == 'true'
         uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
         with:
           registry: ${{ env.REGISTRY }}
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Build (${{ matrix.profile }})
-        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
-        with:
-          context: .
-          file: ./Dockerfile
-          platforms: linux/amd64
-          load: true
-          build-args: |
-            SOURCES=${{ matrix.sources }}
-            SINKS=${{ matrix.sinks }}
-            ORACLE_CLIENT=${{ matrix.oracle }}
-          tags: faucet-smoke:${{ matrix.profile }}
-          cache-from: type=gha,scope=faucet-${{ matrix.profile }}
-          cache-to: type=gha,mode=max,scope=faucet-${{ matrix.profile }}
-          provenance: false
-
-      - name: Smoke-test the image
+      - name: Publish the multi-arch tags
+        id: index
         env:
-          PROFILE: ${{ matrix.profile }}
-        run: |
-          set -euo pipefail
-          img="faucet-smoke:${PROFILE}"
-          docker run --rm "$img" --version
-          docker run --rm "$img" list > list.txt
-          if [ "$PROFILE" = full ]; then
-            # A sample of what #845 found missing from the old :full image.
-            docker run --rm "$img" schema transform sql > /dev/null
-            docker run --rm "$img" schema transform wasm > /dev/null
-            docker run --rm "$img" schema templates-sync > /dev/null
-            grep -qw oracle list.txt
-            mkdir -p smoke
-            printf '%s\n' \
-              'version: 1' \
-              'name: oracle-client-smoke' \
-              'pipeline:' \
-              '  source:' \
-              '    type: oracle' \
-              '    config: { host: 127.0.0.1, port: 1, service_name: X, username: u, password: p, query: "SELECT 1 FROM DUAL" }' \
-              '  sink: { type: stdout, config: {} }' > smoke/oracle.yaml
-            out="$(docker run --rm -v "$PWD/smoke:/smoke:ro" "$img" run --no-env-file /smoke/oracle.yaml 2>&1 || true)"
-            echo "$out" | tail -5
-            if echo "$out" | grep -qE 'DPI-1047|DPI-1072'; then
-              echo "::error::the Oracle client did not load in full"; exit 1
-            fi
-            echo "$out" | grep -qE 'ORA-|DPI-' \
-              || { echo "::error::no Oracle error came back, so the client was never exercised"; exit 1; }
-          fi
-          raw=$(docker image inspect -f '{{.Size}}' "$img")
-          echo "RAW_MIB=$((raw / 1048576))" >> "$GITHUB_ENV"
-
-      # Same inputs and a warm cache, so this reuses the tested build's layers.
-      - name: Push (${{ matrix.profile }})
-        id: build
-        if: env.PUSH == 'true'
-        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
-        with:
-          context: .
-          file: ./Dockerfile
-          platforms: linux/amd64
-          push: true
-          build-args: |
-            SOURCES=${{ matrix.sources }}
-            SINKS=${{ matrix.sinks }}
-            ORACLE_CLIENT=${{ matrix.oracle }}
-          tags: ${{ steps.tags.outputs.tags }}
-          cache-from: type=gha,scope=faucet-${{ matrix.profile }}
-          # SLSA provenance and an SBOM travel with the image (#789 SUPPLY-05).
-          provenance: mode=max
-          sbom: true
-
-      - name: Record the image size
-        env:
-          DIGEST: ${{ steps.build.outputs.digest }}
-          PROFILE: ${{ matrix.profile }}
           IMAGE: ${{ steps.img.outputs.name }}
+          TAGS: ${{ steps.tags.outputs.tags }}
         run: |
           set -euo pipefail
-          packed="not pushed"
-          if [ "$PUSH" = "true" ]; then
-            index=$(docker buildx imagetools inspect --raw "${IMAGE}@${DIGEST}")
-            amd64=$(echo "$index" | jq -r '[.manifests[]? | select(.platform.architecture == "amd64")][0].digest // empty')
-            if [ -n "$amd64" ]; then
-              index=$(docker buildx imagetools inspect --raw "${IMAGE}@${amd64}")
-            fi
-            bytes=$(echo "$index" | jq '[.layers[]?.size] | add // 0')
-            packed="$((bytes / 1048576)) MiB"
+          sources=()
+          for f in digests/*; do sources+=("${IMAGE}@sha256:${f#digests/}"); done
+          if [ "${#sources[@]}" -ne 2 ]; then
+            echo "::error::expected an amd64 and an arm64 digest, found ${#sources[@]}"; exit 1
           fi
+          args=()
+          IFS=, read -ra tags <<<"$TAGS"
+          for t in "${tags[@]}"; do args+=(-t "$t"); done
+          docker buildx imagetools create "${args[@]}" "${sources[@]}"
+          first="${TAGS%%,*}"
+          docker buildx imagetools inspect "$first"
+          digest=$(docker buildx imagetools inspect "$first" --format '{{json .Manifest}}' | jq -r .digest)
+          echo "digest=$digest" >>"$GITHUB_OUTPUT"
+          index=$(docker buildx imagetools inspect --raw "$first")
           {
-            echo "| Profile | Uncompressed | Compressed (pull) |"
+            echo "| Profile | Architecture | Compressed (pull) |"
             echo "|---|---|---|"
-            echo "| ${PROFILE} | ${RAW_MIB} MiB | ${packed} |"
+            for arch in amd64 arm64; do
+              d=$(echo "$index" | jq -r --arg a "$arch" '[.manifests[] | select(.platform.architecture == $a)][0].digest')
+              bytes=$(docker buildx imagetools inspect --raw "${IMAGE}@${d}" | jq '[.layers[]?.size] | add // 0')
+              echo "| ${{ matrix.profile }} | ${arch} | $((bytes / 1048576)) MiB |"
+            done
           } | tee -a "$GITHUB_STEP_SUMMARY"
 
       - name: Install cosign
-        if: env.PUSH == 'true'
         uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
 
       - name: Sign the image (keyless)
-        if: env.PUSH == 'true'
         env:
-          DIGEST: ${{ steps.build.outputs.digest }}
-        run: cosign sign --yes "${{ steps.img.outputs.name }}@${DIGEST}"
+          DIGEST: ${{ steps.index.outputs.digest }}
+        run: cosign sign --yes --recursive "${{ steps.img.outputs.name }}@${DIGEST}"
 
       - name: Attest build provenance
-        if: env.PUSH == 'true'
         uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
         with:
           subject-name: ${{ steps.img.outputs.name }}
-          subject-digest: ${{ steps.build.outputs.digest }}
+          subject-digest: ${{ steps.index.outputs.digest }}
           push-to-registry: true
 
   # Publish the Helm chart as an OCI artifact on GHCR and attach a

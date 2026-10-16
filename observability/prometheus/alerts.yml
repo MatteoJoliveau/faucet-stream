@@ -199,6 +199,31 @@ groups:
             fallen back to in-memory records — run history and idempotency
             guarantees are not durable. /readyz is reporting 503.
 
+      - alert: FaucetServeHistoryUnreachable
+        expr: faucet_serve_history_unreachable == 1
+        for: 2m
+        labels:
+          severity: critical
+        annotations:
+          summary: "faucet serve cannot reach its run-history database"
+          description: >
+            The last lease renewal did not reach the history database. In
+            cluster mode the server does not fall back to memory: submissions
+            fail, this instance cancels its own runs before their leases
+            expire, and /readyz is reporting 503 until the database answers.
+
+      - alert: FaucetServeScheduleTicksMissed
+        expr: increase(faucet_serve_trigger_missed_ticks_total[1h]) > 0
+        labels:
+          severity: warning
+        annotations:
+          summary: "schedule trigger {{ $labels.trigger }} skipped ticks"
+          description: >
+            Scheduled ticks passed without a run, usually because no faucet
+            serve instance was running. With catch_up (the default) only the
+            latest missed tick ran; check whether the skipped windows need a
+            backfill.
+
   - name: faucet-telemetry
     rules:
       - alert: FaucetOtelExportFailures
