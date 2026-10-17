@@ -105,6 +105,85 @@ no fork; every credential is a `secret: true` param with no default. Shaping
 that every destination needs (`keys_case`, `json_encode` for nested objects)
 goes in the top-level `transforms`.
 
+## Importing a template from an OpenAPI description
+
+When an API publishes an OpenAPI 3.x or Swagger 2.0 document, start from it
+instead of a blank file:
+
+```bash
+faucet hub import openapi https://api.example.com/openapi.json --owner acme --out .
+faucet hub import openapi ./openapi.yaml --owner acme --include '/v1/*' --dry-run
+```
+
+The importer writes `source-templates/<owner>/<name>.yaml` and a draft suite at
+`tests/<owner>/<name>/suite.yaml` under `--out` (a hub root). It is
+deterministic: the same spec gives the same bytes, so a re-import diffs cleanly
+against the published version, and it refuses to overwrite a changed file
+unless `--force` (it prints the diff either way). Every connector field comes
+from the REST source's own config types, and the result is read back through
+the parser `faucet validate` and `faucet hub lint` use before anything is
+written.
+
+| In the spec | In the template |
+|---|---|
+| `servers[]` (Swagger: `schemes` + `host` + `basePath`) | an `api_root` param defaulting to the chosen server (`--server` picks an index or URL); `base_url: ${param.api_root}`. No absolute server → `api_root` is required |
+| `components.securitySchemes` (Swagger: `securityDefinitions`) | `auth:` — HTTP bearer → `bearer`, HTTP basic → `basic`, `apiKey` in a header or query → `api_key` / `api_key_query`, OAuth2 client credentials → `oauth2`. Each credential is a `secret: true` param with no default. The scheme most operations use becomes the shared auth |
+| each `GET` operation that returns an array, directly or under an envelope property (`data`, `items`, `results`, …) | one stream, with `records_path` |
+| a path parameter (`/customers/{customer_id}/orders`) that resolves to another list | a child stream with `parent:` and a `${parent.field}` path token |
+| `cursor` / `starting_after` / `page_token` + a next-cursor field, `page` / `per_page`, `offset` / `limit`, a `Link` response header, a next-page URL in the body | `pagination:` `Cursor`, `PageNumber`, `Offset`, `LinkHeader`, `NextLinkInBody` |
+| `x-primary-key`, an `id` property, or one required key-like property | `primary_keys` |
+| an `updated_since`-style filter parameter + a timestamp property | an incremental stream (`replication_key` + `replication_bind`), `write: [upsert, append]` |
+| no incremental filter | `write: [overwrite, upsert]` |
+| an event or log list (`/events`, `/logs`, `/audit_logs`, …) | `write: append` |
+| response schemas | a per-stream `schema` hint; nested object and array fields are encoded by one shared `json_encode` transform |
+| a documented `429`, `Retry-After` or `x-ratelimit-*` header | `retry_on_response` rules (the reset header's wait is read when its unit is documented) |
+| response `example` / `examples` | behavioural cases in the draft suite: the example records in, the transformed records out |
+
+When the spec does not settle a choice — two candidate cursor parameters, no
+detectable key, a reset header without a unit, a page-size parameter with nothing
+that advances pages, a `count` field that may be the page size rather than the
+total — the field is left unset and the choice is listed as an open **decision**
+in the report. Where the importer does pick (the first of several servers, a
+conventional wrapper among several arrays, `{customer_id}` taken to be the
+parent's `id`, the alphabetically first of equally used auth schemes), the pick
+is listed as a decision too (stderr, or `--format
+json` for the report and both files as one document). Nothing is guessed, so a
+missing key fails `faucet hub check` for keyed write modes instead of shipping a
+wrong one. Auth schemes and spec features the REST source cannot express
+(OAuth2 flows that need a browser, cookie API keys, mutual TLS) are reported as
+**unsupported**, and operations that are not lists (single-object lookups,
+reports) are listed as **skipped**. A spec with more than 200 `GET` operations
+needs `--include`.
+
+`$ref`s are followed within the document and into relative files inside the
+spec's own location: the same scheme, host and port for a URL, the spec's
+directory (symlinks resolved) for a file. An absolute or network-path
+reference, one that leaves that location, or one with a backslash or
+surrounding whitespace is refused unless `--allow-remote-refs`; a remote
+document is never allowed to reference a local file. `$ref`s inside literal
+data (`example`, `default`, `enum`, `x-*` extensions, an Example Object's
+`value`) are not followed. Each document is read with a 32 MiB limit, local
+ones only when they are regular files.
+
+Spec text is untrusted: a path, server URL, parameter or field name, token URL
+or API-key name containing `${` would become an interpolation directive in the
+template, so it is refused (reported as unsupported, the item left out), and
+descriptions and example records containing it are dropped.
+
+Then finish it like any other template: resolve the decisions from the API
+reference or a live response, lint, check against two sinks, run the suite:
+
+```bash
+faucet hub lint --hub .
+faucet hub check --hub . --source acme/example-store --sink faucet-hq/sqlite
+faucet template test tests/acme/example-store/suite.yaml
+```
+
+The agent skill's [from-API-docs workflow](https://github.com/faucet-hq/faucet-stream/blob/main/skills/faucet-templates/references/from-api-docs.md)
+covers APIs without a machine-readable description, and a worked example (spec,
+generated template and suite) lives under
+[`skills/faucet-templates/examples/`](https://github.com/faucet-hq/faucet-stream/tree/main/skills/faucet-templates/examples).
+
 ## A sink template
 
 ```yaml
@@ -306,6 +385,7 @@ faucet hub check     --source X --sink Y [--overlay O] [--json]  # per-stream wr
 faucet hub compose   --source X --sink Y [--overlay O] [--out FILE|--json]
 faucet hub matrix    [--format table|markdown|json] [--out FILE]
 faucet hub lint      [--hub DIR] [FILE…]                   # publishability lint + typed config validation
+faucet hub import    openapi <URL|PATH> --owner O [--out DIR] [--include GLOB] [--dry-run] [--format json]  # draft source template + suite
 faucet run           --source X --sink Y [--overlay O] [--param k=v] …  # compose + run
 faucet validate      --source X --sink Y [--overlay O] [--show-composed]  # compose + validate offline
 faucet schema source-template | sink-template | deployment | test-suite | template-tests
