@@ -178,11 +178,31 @@ impl SqlDialect for Postgres {
             .collect::<Vec<_>>()
             .join(" AND ");
         Ok(format!(
-            "DELETE FROM {} t WHERE {scope_pred} \
-             AND NOT EXISTS (SELECT 1 FROM {} c WHERE {join_pred})",
+            "DELETE FROM {} t WHERE {}NOT EXISTS (SELECT 1 FROM {} c WHERE {join_pred})",
             target.reference,
+            crate::dialect::scope_and(&scope_pred),
             self.cleanup_keys_table()
         ))
+    }
+
+    fn cleanup_absent_keys_sql(
+        &self,
+        target: &TableTarget,
+        scope: &[String],
+        scope_types: &[Option<&str>],
+        key: &[String],
+    ) -> Result<Option<String>, FaucetError> {
+        let pairs = key
+            .iter()
+            .map(|k| format!("{}, t.{}", self.quote_literal(k), quote(k)))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let delete = self.cleanup_delete_sql(target, scope, scope_types, key)?;
+        Ok(Some(delete.replacen(
+            "DELETE FROM ",
+            &format!("SELECT json_build_object({pairs})::text FROM "),
+            1,
+        )))
     }
 
     fn cleanup_table_display(&self, target: &TableTarget) -> String {

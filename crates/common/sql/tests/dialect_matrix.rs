@@ -22,6 +22,10 @@ struct Recorder {
     columns: Vec<TableColumn>,
     statements: Vec<Recorded>,
     journaled: Vec<usize>,
+    /// Key rows a `CleanupJournal` read returns, as JSON text.
+    absent: Vec<String>,
+    /// The key tuples each journal call recorded.
+    journaled_keys: Vec<Vec<Value>>,
 }
 
 impl Recorder {
@@ -33,6 +37,8 @@ impl Recorder {
                 .collect(),
             statements: Vec::new(),
             journaled: Vec::new(),
+            absent: Vec::new(),
+            journaled_keys: Vec::new(),
         }
     }
 
@@ -59,8 +65,18 @@ impl SqlExecutor for Recorder {
         Ok(1)
     }
 
+    async fn fetch_text(&mut self, stmt: &Statement<'_>) -> Result<Vec<String>, FaucetError> {
+        self.execute(stmt).await?;
+        Ok(self.absent.clone())
+    }
+
     async fn journal_plan(&mut self, plan: &WritePlan, _run_id: &str) -> Result<(), FaucetError> {
         self.journaled.push(plan.upserts.len() + plan.deletes.len());
+        self.journaled_keys.extend(
+            plan.deletes
+                .iter()
+                .map(|k| k.0.iter().map(|(_, v)| v.clone()).collect()),
+        );
         Ok(())
     }
 }
@@ -562,6 +578,161 @@ fn matrix_cleanup() {
     every_cleanup_dialect!(cleanup_runs_create_load_delete);
 }
 
+/// A rollback-enabled cleanup journals the rows it is about to delete, in
+/// its transaction, before the delete — so a rollback restores them (#706).
+/// A dialect that cannot journal refuses instead of deleting unjournaled.
+fn journaling_cleanup_records_the_rows_it_deletes<D: SqlDialect>(d: D) {
+    let name = d.name();
+    let journals = d.journal_sql().is_some();
+    let mut s = spec(WriteMode::Upsert, &["id", "kind"]);
+    s.rollback = Some(faucet_core::rollback::RollbackWriteSpec {
+        run_id: "r1".into(),
+        run_id_column: "_faucet_run_id".into(),
+        journal: true,
+        keep_previous: false,
+    });
+    let engine = SqlSinkEngine::new(d, s);
+    let mut rec = Recorder::new(&[("id", "int"), ("kind", "text"), ("parent", "int")]);
+    rec.absent = vec![
+        r#"{"id": 5, "kind": "a"}"#.into(),
+        r#"{"id": 12345678901234567890123, "kind": "b"}"#.into(),
+    ];
+    let t = target(engine.dialect(), "t");
+    let mut seen = SeenKeys::new();
+    seen.record_page(
+        &[json!({"id": 1, "kind": "a"})],
+        &["id".to_string(), "kind".to_string()],
+        100,
+    );
+    let scope: BTreeMap<String, Value> = [("parent".to_string(), json!(7))].into();
+    let result = futures_lite_block_on(engine.cleanup(&mut rec, &t, &scope, &seen));
+    if !journals {
+        let err = result.unwrap_err().to_string();
+        assert!(err.contains("cannot be journaled"), "{name}: {err}");
+        assert!(
+            !rec.kinds().contains(&StatementKind::CleanupDelete),
+            "{name}: nothing is deleted unjournaled"
+        );
+        return;
+    }
+    result.unwrap();
+    let kinds = rec.kinds();
+    let read = kinds
+        .iter()
+        .position(|k| *k == StatementKind::CleanupJournal)
+        .unwrap_or_else(|| panic!("{name}: reads the doomed keys: {kinds:?}"));
+    let delete = kinds
+        .iter()
+        .position(|k| *k == StatementKind::CleanupDelete)
+        .unwrap();
+    assert!(read < delete, "{name}: journals before the delete");
+    let (_, sql, params) = &rec.statements[read];
+    assert!(sql.starts_with("SELECT"), "{name}: {sql}");
+    assert!(sql.contains("NOT EXISTS"), "{name}: {sql}");
+    assert!(
+        sql.contains("'id'") && sql.contains("'kind'"),
+        "{name}: {sql}"
+    );
+    assert_eq!(params, &vec![json!(7)], "{name}: bound like the delete");
+    assert_eq!(
+        rec.journaled_keys,
+        vec![
+            vec![json!(5), json!("a")],
+            vec![json!("12345678901234567890123"), json!("b")]
+        ],
+        "{name}: every doomed key is journaled, exact"
+    );
+
+    // Nothing to delete: no journal call.
+    let mut empty = Recorder::new(&[("id", "int"), ("kind", "text"), ("parent", "int")]);
+    futures_lite_block_on(engine.cleanup(&mut empty, &t, &scope, &seen)).unwrap();
+    assert!(empty.journaled.is_empty(), "{name}");
+
+    // An unreadable key row fails the cleanup before anything is deleted.
+    let mut bad = Recorder::new(&[("id", "int"), ("kind", "text"), ("parent", "int")]);
+    bad.absent = vec!["not json".into()];
+    let err = futures_lite_block_on(engine.cleanup(&mut bad, &t, &scope, &seen))
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("journal"), "{name}: {err}");
+    assert!(
+        !bad.kinds().contains(&StatementKind::CleanupDelete),
+        "{name}"
+    );
+}
+
+#[test]
+fn matrix_journaling_cleanup() {
+    every_cleanup_dialect!(journaling_cleanup_records_the_rows_it_deletes);
+}
+
+fn whole_destination_cleanup_has_no_scope_predicate<D: SqlDialect>(d: D) {
+    let name = d.name();
+    let engine = SqlSinkEngine::new(d, spec(WriteMode::Upsert, &["id"]));
+    let mut rec = Recorder::new(&[("id", "int")]);
+    let t = target(engine.dialect(), "t");
+    let mut seen = SeenKeys::new();
+    seen.record_page(&[json!({"id": 1})], &["id".to_string()], 100);
+    futures_lite_block_on(engine.cleanup(&mut rec, &t, &BTreeMap::new(), &seen)).unwrap();
+    let delete = rec
+        .statements
+        .iter()
+        .find(|s| s.0 == StatementKind::CleanupDelete)
+        .unwrap();
+    assert!(
+        delete.1.contains("WHERE NOT EXISTS"),
+        "{name}: {}",
+        delete.1
+    );
+    assert!(
+        !delete.1.contains(" AND NOT EXISTS"),
+        "{name}: {}",
+        delete.1
+    );
+    assert!(delete.2.is_empty(), "{name}: no scope parameters");
+}
+
+#[test]
+fn matrix_whole_destination_cleanup() {
+    every_cleanup_dialect!(whole_destination_cleanup_has_no_scope_predicate);
+}
+
+/// A rollback-enabled whole-destination cleanup (empty scope) journals with
+/// the same unscoped predicate the delete uses.
+fn journaling_whole_destination_cleanup<D: SqlDialect>(d: D) {
+    let name = d.name();
+    if d.journal_sql().is_none() {
+        return;
+    }
+    let mut s = spec(WriteMode::Upsert, &["id"]);
+    s.rollback = Some(faucet_core::rollback::RollbackWriteSpec {
+        run_id: "r1".into(),
+        run_id_column: "_faucet_run_id".into(),
+        journal: true,
+        keep_previous: false,
+    });
+    let engine = SqlSinkEngine::new(d, s);
+    let mut rec = Recorder::new(&[("id", "int")]);
+    rec.absent = vec![r#"{"id": 5}"#.into()];
+    let t = target(engine.dialect(), "t");
+    let mut seen = SeenKeys::new();
+    seen.record_page(&[json!({"id": 1})], &["id".to_string()], 100);
+    futures_lite_block_on(engine.cleanup(&mut rec, &t, &BTreeMap::new(), &seen)).unwrap();
+    let (_, sql, params) = rec
+        .statements
+        .iter()
+        .find(|s| s.0 == StatementKind::CleanupJournal)
+        .unwrap_or_else(|| panic!("{name}: journals before the delete"));
+    assert!(sql.contains("WHERE NOT EXISTS"), "{name}: {sql}");
+    assert!(params.is_empty(), "{name}: no scope parameters");
+    assert_eq!(rec.journaled_keys, vec![vec![json!(5)]], "{name}");
+}
+
+#[test]
+fn matrix_journaling_whole_destination_cleanup() {
+    every_cleanup_dialect!(journaling_whole_destination_cleanup);
+}
+
 fn token_and_journal_sql_use_the_dialect<D: SqlDialect>(d: D) {
     let name = d.name();
     assert!(
@@ -713,10 +884,13 @@ fn backend_specific_text() {
     );
     assert_eq!(Mssql.cleanup_table_display(&t), "dbo.t");
     assert!(Mssql.cleanup_create_sql(&t, &[], &[]).is_err());
-    assert!(
+    assert_eq!(
         Mssql
             .cleanup_delete_sql(&t, &[], &[], &["k".into()])
-            .is_err()
+            .unwrap(),
+        "DELETE t FROM [dbo].[t] AS t WHERE NOT EXISTS (SELECT 1 FROM #faucet_cleanup_keys c \
+         WHERE c.[k] = t.[k])",
+        "an empty scope is the whole destination (a complete-read cleanup)"
     );
     assert!(
         Mssql

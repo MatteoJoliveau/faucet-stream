@@ -83,6 +83,10 @@ pub struct DlqReplayRequest {
     pub failed_dlq: Option<String>,
     #[serde(default)]
     pub row: Option<String>,
+    /// Replay every envelope, whichever pipeline and row wrote it (by
+    /// default only the selected row's own envelopes are replayed).
+    #[serde(default)]
+    pub all_rows: bool,
     #[serde(default)]
     pub dry_run: bool,
     /// Keys for a DLQ sealed at rest (first = current, rest = rotated). When
@@ -434,6 +438,7 @@ mod tests {
             records_written: 2,
             dry_run: false,
             failed_dlq: "/dlq.failed".into(),
+            skipped_other_rows: 0,
         });
         running.finish(&outcome, false).await;
         let rec = state.history().get("rp-1").await.unwrap().unwrap();

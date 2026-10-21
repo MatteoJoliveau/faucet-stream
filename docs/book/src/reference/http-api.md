@@ -249,9 +249,26 @@ Every config the server loads from a caller is checked against one
 allow-list before anything runs. A connector field that names a local path,
 a URL or a program carries an `x-faucet-resource` annotation in its schema, so
 the server confines connector configs it has never seen, plugin connectors
-included, with no per-connector code. The same allow-list covers `${env:}`,
+included, with no per-connector code. Host-bearing fields that are not URLs
+are annotated too and read for their hosts: a broker or server list
+(`brokers: b1:9092,b2:9092`, NATS `servers`), a bare `host` / `emulator_host`,
+an ADO.NET / ODBC connection string (`Server=tcp:host,1433;…`) and an Azure
+Storage connection string (`BlobEndpoint=…`, or the account host). A free-form
+option map (Delta `storage_options`) names the keys that hold an endpoint or a
+credential file (`x-faucet-resource-keys`), and those keys are checked like the
+typed fields. A transform's config is read the same way (a `sql` transform's
+`http` relation `url` and `csv` / `jsonl` relation `path`). The same allow-list covers `${env:}`,
 `${file:}`, `${secret:}` and secret-manager directives, the state, DLQ and
-lineage paths, and the `token_url` / `url` of an `auth:` provider.
+lineage paths, every endpoint an `auth:` provider calls (`token_url`, `url`,
+a `flow` provider's `steps[].request.url` and `base_url_from`, a service
+account's `token_uri` — in the config or inside `key_json`), a transform that
+reads a file (`lookup`'s `jsonl`), and the `reconcile:` count probe (a SQL probe
+runs sandboxed like every other SQL connector). An `auth:` provider in a
+caller's config may not name a local file at all: pass a service-account key
+inline as `key_json` rather than `key_file`, and leave out `oauth2_refresh`'s
+`persist` (the server decides where tokens are written). A tenant's
+connections are held to the same rules, under the tenant's policy, when they
+are stored and again whenever a run uses them.
 
 | Reference | Default for a caller's config | Widen with |
 |-----------|-------------------------------|------------|
@@ -270,15 +287,28 @@ follows a directory which does not exist yet, is refused. A path field that
 holds a remote URL (`s3://…`) is checked as a URL. A URL host is compared in
 the form a URL parser reads it, so `2852039166`, `0xa9fea9fe`, `0251.0376.0251.0376`
 or a trailing dot (`169.254.169.254.`, `metadata.google.internal.`) name the
-metadata address they spell. A URL whose host a caller's config takes from
+metadata address they spell, and an `http(s)` URL's authority ends at a `\` as
+it does for HTTP clients (`http://169.254.169.254\@allowed.example/` names
+`169.254.169.254`). A URL whose host a caller's config takes from
 records (`https://${parent.host}/…`, a whole `${parent.next_url}`) cannot be
 checked, so it is refused; register the pipeline as a template instead.
 
 **At run time.** A caller's run executes with the caller policy scoped over
 it — on every instance that claims it, sharded or not — so its HTTP connectors
-check the first request and every redirect hop against it. Whatever the
+check the first request and every redirect hop against it. The network
+calls a submission makes before it is queued (partition bound probes,
+discovery fan-out, row selection, and the auth logins they trigger) run under
+the same policy. Whatever the
 origin, an HTTP connector never follows a redirect into a link-local or
-cloud-metadata address.
+cloud-metadata address, and a host *name* is judged by the addresses it
+resolves to when the connection is made: the client's resolver drops
+link-local / metadata addresses (so `169.254.169.254.nip.io`, or a name
+re-pointed after the submit-time check, is never connected to) unless the
+policy lists that name exactly. Behind an HTTP proxy the proxy resolves the
+target, so this check cannot apply there. A GCS `storage_host` that is not a
+`googleapis.com` endpoint never receives the server's own credentials
+(`application_default` or a key file); a Snowflake `account` must be an
+account identifier, so its request URL always names a Snowflake host.
 
 **DLQ locations.** The `location` of `POST /v1/dlq/inspect` and
 `/v1/dlq/discard`, and the `from` / `failed_dlq` of `POST /v1/dlq/replay`, are
@@ -1043,6 +1073,17 @@ lacks, or declares a param differently from the templates is a `422`; `overlay`
 on a `pipeline` template is a `422`. The run is labelled `overlay` (and
 `overlay_version` for a registered one), and `warnings` flags incremental
 streams composed with no state store.
+
+An **inline** overlay is the request's own document, so it is screened like a
+submitted config before it is merged into the (trusted) template body: its
+`${env:}` / `${file:}` / `${secret:}` / secret-manager references, every local
+path (a `file` state store, a file DLQ sink), every URL (a notification
+webhook, an `http` DLQ sink) and any connector that runs a program are held to
+the [caller reference policy](#reference-policy) — refused with `403` (`422`
+for a subprocess connector without `--allow-subprocess-connectors`). A run for
+a tenant (a tenant-scoped principal, or `POST /v1/tenants/{tenant}/…`) may not
+carry an inline overlay at all (`403`); register the overlay and name it
+instead. Every refusal is audited as a denied `template.run`.
 
 **Registering never moves callers.** `POST /v1/templates` appends a version and
 stops there; `POST /v1/templates/{id}/launch` is the one call that moves `stable`

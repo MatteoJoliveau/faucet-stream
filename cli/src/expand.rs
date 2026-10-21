@@ -1410,28 +1410,7 @@ pub fn expand(cfg: &PipelineConfig) -> CliResult<Vec<ExpandedNode>> {
                 // tracker never sees its key — and the delete would then remove
                 // its destination row, losing data the source still has. Reject
                 // rather than silently delete.
-                let mut quarantines: Vec<&str> = Vec::new();
-                #[cfg(feature = "quality")]
-                if let Some(q) = cfg.pipeline.quality.as_ref()
-                    && faucet_core::CompiledQuality::compile(q)
-                        .map(|c| c.requires_dlq())
-                        .unwrap_or(false)
-                {
-                    quarantines.push("quality");
-                }
-                #[cfg(feature = "contract")]
-                if let Some(c) = cfg.pipeline.contract.as_ref()
-                    && faucet_core::CompiledContract::compile(c)
-                        .map(|c| c.requires_dlq())
-                        .unwrap_or(false)
-                {
-                    quarantines.push("contract");
-                }
-                if let Some(sd) = cfg.pipeline.schema.as_ref()
-                    && faucet_core::SchemaDriftPolicy::compile(sd).requires_dlq()
-                {
-                    quarantines.push("schema");
-                }
+                let quarantines = quarantining_passes(cfg);
                 if !quarantines.is_empty() {
                     return Err(CliError::Config(format!(
                         "row '{}': `complete_for.on_missing: delete` is incompatible with a \
@@ -1454,6 +1433,24 @@ pub fn expand(cfg: &PipelineConfig) -> CliResult<Vec<ExpandedNode>> {
                 Some(claim.scope.clone())
             }
         };
+
+        // A source that may read its whole dataset in one run (a DynamoDB
+        // stream past its retention, `on_gap: resnapshot`) deletes the
+        // destination rows it did not see afterwards, so the scoped-cleanup
+        // preconditions hold for it too.
+        if crate::registry::source_capabilities(&merged_source.kind, &merged_source.config)
+            .complete_reads()
+        {
+            check_complete_read_cleanup(
+                &ids[i],
+                &merged_source.kind,
+                &merged_sink.kind,
+                &sink_caps,
+                requested_mode,
+                matches!(delivery, faucet_core::DeliveryMode::ExactlyOnce),
+                &quarantining_passes(cfg),
+            )?;
+        }
 
         // Schema-drift policy gates (load-time):
         //  - `evolve` requires an evolution-capable sink.
@@ -1640,6 +1637,9 @@ pub fn expand(cfg: &PipelineConfig) -> CliResult<Vec<ExpandedNode>> {
         }
     }
     check_file_sink_paths(&out)?;
+    if let Some(sh) = &cfg.shard {
+        sh.validate().map_err(CliError::Config)?;
+    }
     if let Err(e) = check_sharding(cfg, &out) {
         tracing::warn!(
             "{e} (`shard:` takes effect only under `faucet serve --cluster`, which refuses \
@@ -1926,6 +1926,17 @@ pub fn check_sharding(cfg: &PipelineConfig, nodes: &[ExpandedNode]) -> CliResult
         .iter()
         .filter(|n| !matches!(n.role, NodeRole::Discovery { .. }))
     {
+        if n.delivery == faucet_core::DeliveryMode::ExactlyOnce && !sink_keyed(n) {
+            return Err(CliError::Config(format!(
+                "row '{}': `delivery: exactly_once` cannot be combined with `shard:` on source \
+                 '{}' — each shard keeps its own commit watermark, and which records a shard \
+                 reads can change between runs (a consumer-group slot is assigned partitions by \
+                 the broker, key ranges are re-planned), so a shard can re-read records another \
+                 shard already committed and write them again. Write with `write_mode: upsert` \
+                 and a `key` (exactly-once through keyed upserts), or remove `shard:`",
+                n.id, n.source.kind
+            )));
+        }
         if n.state.is_some() && pk_range_bookmarked(&n.source.kind, &n.source.config) {
             return Err(CliError::Config(format!(
                 "row '{}': `shard:` cannot be combined with incremental replication on source \
@@ -1938,6 +1949,20 @@ pub fn check_sharding(cfg: &PipelineConfig, nodes: &[ExpandedNode]) -> CliResult
         }
     }
     check_sharded_file_sinks(nodes)
+}
+
+/// Whether `n`'s sink writes by key (`write_mode: upsert|delete` with a
+/// non-empty `key`), so re-writing a record is idempotent.
+fn sink_keyed(n: &ExpandedNode) -> bool {
+    matches!(
+        n.sink.config.get("write_mode").and_then(Value::as_str),
+        Some("upsert" | "delete")
+    ) && n
+        .sink
+        .config
+        .get("key")
+        .and_then(Value::as_array)
+        .is_some_and(|k| !k.is_empty())
 }
 
 /// `shard:` runs every shard of a row at once with the same sink config, so a
@@ -2378,6 +2403,81 @@ fn row_compat_features(
     .collect()
 }
 
+/// The pipeline passes that quarantine records, which then never reach the
+/// sink, so a cleanup could not tell them from records deleted at the source.
+fn quarantining_passes(cfg: &PipelineConfig) -> Vec<&'static str> {
+    let mut quarantines: Vec<&'static str> = Vec::new();
+    #[cfg(feature = "quality")]
+    if let Some(q) = cfg.pipeline.quality.as_ref()
+        && faucet_core::CompiledQuality::compile(q)
+            .map(|c| c.requires_dlq())
+            .unwrap_or(false)
+    {
+        quarantines.push("quality");
+    }
+    #[cfg(feature = "contract")]
+    if let Some(c) = cfg.pipeline.contract.as_ref()
+        && faucet_core::CompiledContract::compile(c)
+            .map(|c| c.requires_dlq())
+            .unwrap_or(false)
+    {
+        quarantines.push("contract");
+    }
+    if let Some(sd) = cfg.pipeline.schema.as_ref()
+        && faucet_core::SchemaDriftPolicy::compile(sd).requires_dlq()
+    {
+        quarantines.push("schema");
+    }
+    quarantines
+}
+
+/// Gates for a source that declares `complete_reads`: after such a run the
+/// destination rows it did not write are deleted, which needs a keyed,
+/// cleanup-capable upsert sink outside the commit-token path and no pass that
+/// keeps records from the sink.
+fn check_complete_read_cleanup(
+    row_id: &str,
+    source_kind: &str,
+    sink_kind: &str,
+    sink_caps: &faucet_core::Capabilities,
+    write_mode: &str,
+    exactly_once: bool,
+    quarantines: &[&str],
+) -> CliResult<()> {
+    let what = format!(
+        "row '{row_id}': source '{source_kind}' can read its whole dataset in one run (for \
+         dynamodb: `on_gap: resnapshot`), after which the destination rows of records it did \
+         not see are deleted"
+    );
+    if !sink_caps.cleanup() {
+        return Err(CliError::Config(format!(
+            "{what}, but sink '{sink_kind}' with this config cannot delete them (cleanup-capable \
+             sinks: {}) — the destination would keep rows of deleted records. Use one of those \
+             sinks, or `on_gap: fail`",
+            crate::registry::sink_kinds_where(|c| c.cleanup()).join(", ")
+        )));
+    }
+    if write_mode != "upsert" {
+        return Err(CliError::Config(format!(
+            "{what}, which requires `write_mode: upsert` with a `key` (got '{write_mode}')"
+        )));
+    }
+    if exactly_once {
+        return Err(CliError::Config(format!(
+            "{what}, which is incompatible with `delivery: exactly_once` — the delete happens \
+             outside the commit-token transaction"
+        )));
+    }
+    if !quarantines.is_empty() {
+        return Err(CliError::Config(format!(
+            "{what}, which is incompatible with a quarantining `{}` policy — a quarantined record \
+             never reaches the sink, so its destination row would be deleted",
+            quarantines.join("`/`")
+        )));
+    }
+    Ok(())
+}
+
 /// `complete_for … on_missing: delete` deletes every in-scope destination row
 /// an invocation did not write, so each invocation's fetch must be the whole
 /// scope (#789 CLI-23, CLI-25):
@@ -2637,6 +2737,37 @@ mod tests {
     }
 
     #[test]
+    fn sharding_an_exactly_once_watermark_run_is_refused() {
+        let yaml = |sink: &str| {
+            format!(
+                r#"
+version: 1
+name: s
+delivery: exactly_once
+shard: {{ count: 2 }}
+pipeline:
+  source: {{ type: kafka, config: {{ brokers: "localhost:9092", topics: [t], group_id: g, idle_timeout: 5 }} }}
+  sink: {{ type: postgres, config: {{ connection_url: "postgres://u@h/db", table_name: t2, column_mapping: auto_map{sink} }} }}
+  state: {{ type: file, config: {{ path: ./state }} }}
+"#
+            )
+        };
+        let cfg = PipelineConfig::from_text(&yaml(""), std::path::Path::new("t.yaml")).unwrap();
+        let nodes = expand(&cfg).unwrap();
+        let err = check_sharding(&cfg, &nodes).unwrap_err().to_string();
+        assert!(
+            err.contains("`delivery: exactly_once` cannot be combined"),
+            "{err}"
+        );
+        let keyed = PipelineConfig::from_text(
+            &yaml(", write_mode: upsert, key: [id]"),
+            std::path::Path::new("t.yaml"),
+        )
+        .unwrap();
+        assert!(check_sharding(&keyed, &expand(&keyed).unwrap()).is_ok());
+    }
+
+    #[test]
     fn sharding_an_incrementally_replicated_sql_source_is_refused() {
         let yaml = |source: &str, shard: &str| {
             format!(
@@ -2659,6 +2790,13 @@ pipeline:
         let nodes = expand(&cfg).expect("`faucet run` ignores `shard:`, so it only warns");
         let err = check_sharding(&cfg, &nodes).unwrap_err().to_string();
         assert!(err.contains("`shard:` cannot be combined"), "{err}");
+        let huge = PipelineConfig::from_text(
+            &yaml("postgres", "shard: { count: 500000000 }"),
+            std::path::Path::new("t.yaml"),
+        )
+        .unwrap();
+        let err = expand(&huge).unwrap_err().to_string();
+        assert!(err.contains("at most 4096 shards"), "{err}");
         let cfg = PipelineConfig::from_text(&yaml("postgres", ""), std::path::Path::new("t.yaml"))
             .unwrap();
         assert!(check_sharding(&cfg, &expand(&cfg).unwrap()).is_ok());

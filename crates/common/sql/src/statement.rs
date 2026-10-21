@@ -28,6 +28,9 @@ pub enum StatementKind {
     TokenTable,
     /// Upsert one scope's commit token.
     TokenUpsert,
+    /// Read the keys the scoped-cleanup `DELETE` is about to remove, so a
+    /// journaling (rollback-enabled) write records their before-images.
+    CleanupJournal,
 }
 
 /// One bound value.

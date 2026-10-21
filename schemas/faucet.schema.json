@@ -6967,7 +6967,7 @@
           }
         },
         {
-          "description": "Only rows whose `column` is strictly greater than the stored bookmark\n(or `initial_value` on the first run) are emitted.\n\nThe bookmark is applied two ways: if the query contains the literal\ntoken `@bookmark`, it is bound as a parameter so the server filters\n(efficient); the source *also* filters client-side as a correctness\nbackstop. The new maximum of `column` is persisted on the final page.",
+          "description": "Only rows not yet read, in `column` order, resuming from the stored\nbookmark (or `initial_value` on the first run).\n\nThe source wraps the query as\n`SELECT * FROM (<query>) AS q WHERE q.[column] >= <bookmark> ORDER BY q.[column]`\nand drops the rows it already emitted at the bookmark value, so rows\nthat share a cursor value (ties, late commits, `DATETIME`'s 1/300 s\nticks) are never skipped. Every page carries a bookmark, so a crash\nreplays at most one page. Write `@bookmark` in the query (with `>=`)\nto apply the cursor further inside it, e.g. in a CTE; a strict `>` is\nrefused. The query must not end in a top-level `ORDER BY` (T-SQL\nforbids it in a derived table). Rows whose `column` is NULL are never\nread.",
           "type": "object",
           "properties": {
             "column": {
@@ -6975,7 +6975,7 @@
               "type": "string"
             },
             "initial_value": {
-              "description": "Lower bound used on the first run, before any bookmark is stored."
+              "description": "Lower bound (inclusive) used on the first run, before any bookmark\nis stored."
             },
             "type": {
               "type": "string",
@@ -8192,7 +8192,7 @@
           }
         },
         {
-          "description": "Only rows whose `column` is strictly greater than the stored bookmark\n(or `initial_value` on the first run) are emitted. If the SQL contains\nthe literal token `${bookmark}`, it is replaced with a positional bind\nparameter so Redshift filters server-side (efficient); the source also\nfilters client-side as a correctness backstop. The new maximum of\n`column` is persisted on the final page.",
+          "description": "Only rows not yet read, in `column` order, resuming from the stored\nbookmark (or `initial_value` on the first run).\n\nThe source wraps the query as\n`SELECT * FROM (<query>) AS q WHERE q.\"column\" >= CAST($n AS <type>) ORDER BY q.\"column\"`\n(the column's type as the server describes it) and drops the rows it\nalready emitted at the bookmark value, so rows that share a cursor\nvalue (batch loads stamped with one `updated_at`, COPY jobs landing in\nseveral commits) are never skipped. Every page carries a bookmark, so\na crash replays at most one page. Write `${bookmark}` in the query\n(with `>=`) to apply the cursor further inside it; a strict `>` is\nrefused. Rows whose `column` is NULL are never read.",
           "type": "object",
           "properties": {
             "column": {
@@ -8200,7 +8200,7 @@
               "type": "string"
             },
             "initial_value": {
-              "description": "Lower bound used on the first run, before any bookmark is stored."
+              "description": "Lower bound (inclusive) used on the first run, before any bookmark\nis stored."
             },
             "type": {
               "type": "string",
@@ -8308,7 +8308,7 @@
           }
         },
         {
-          "description": "Only rows whose `column` is strictly greater than the stored bookmark\n(or `initial_value` on the first run) are emitted.\n\nThe bookmark is applied two ways: if the query contains the literal\ntoken `@bookmark`, it is substituted as an injection-safe SQL literal so\nthe server filters (efficient pushdown); the source *also* filters\nclient-side as a correctness backstop. The new maximum of `column` is\npersisted on the final page.",
+          "description": "Only rows not yet read, in `column` order, resuming from the stored\nbookmark (or `initial_value` on the first run).\n\nThe source wraps the query as\n`SELECT * FROM (<query>) AS q WHERE q.\"column\" >= <bookmark> ORDER BY q.\"column\"`\nand drops the rows it already emitted at the bookmark value, so rows\nthat share a cursor value (ties, late inserts in the same second,\nasync-insert flushes) are never skipped. Every page carries a bookmark,\nso a crash replays at most one page. Write `@bookmark` in the query\n(with `>=`) to apply the cursor further inside it; it is substituted as\nan injection-safe SQL literal, and a strict `>` is refused. Rows whose\n`column` is NULL are never read.",
           "type": "object",
           "properties": {
             "column": {
@@ -8316,7 +8316,7 @@
               "type": "string"
             },
             "initial_value": {
-              "description": "Lower bound used on the first run, before any bookmark is stored."
+              "description": "Lower bound (inclusive) used on the first run, before any bookmark\nis stored."
             },
             "type": {
               "type": "string",
@@ -8379,8 +8379,9 @@
               "type": "object",
               "properties": {
                 "connection_string": {
-                  "description": "Connection string.",
-                  "type": "string"
+                  "description": "Connection string. Its endpoints (`BlobEndpoint=`, or the account\nhost built from `AccountName=` / `EndpointSuffix=`) are checked\nlike a URL by a host that confines configs.",
+                  "type": "string",
+                  "x-faucet-resource": "url"
                 }
               }
             }
@@ -9520,7 +9521,7 @@
           }
         },
         {
-          "description": "Only rows whose `column` is strictly greater than the stored bookmark\n(or `initial_value` on the first run) are emitted.\n\nThe bookmark is applied two ways: if the query contains the named\nparameter `@bookmark`, it is bound so the server filters (efficient);\nthe source *also* filters client-side as a correctness backstop. The\nnew maximum of `column` is persisted on the final page.\n\nSpanner does not implicitly coerce parameter types: a string bookmark\ncompared against a `TIMESTAMP` column needs an explicit cast in the\nquery, e.g. `WHERE updated_at > TIMESTAMP(@bookmark)`.",
+          "description": "Only rows not yet read, in `column` order, resuming from the stored\nbookmark (or `initial_value` on the first run).\n\nThe source wraps the query as\n``SELECT * FROM (<query>) AS q WHERE q.`column` >= CAST(@bookmark AS <type>) ORDER BY q.`column` ``\n(`<type>` is the column's type, read from the query's result metadata)\nand drops the rows it already emitted at the bookmark value, so rows\nthat share a cursor value (ties, late commits) are never skipped.\nEvery page carries a bookmark, so a crash replays at most one page.\nWrite `@bookmark` in the query (with `>=`) to apply the cursor further\ninside it; a strict `>` is refused. Rows whose `column` is NULL are\nnever read.\n\n`@bookmark` inside the query is bound by its JSON type (a timestamp\nbookmark is a STRING), and Spanner does not coerce parameter types: cast\nit where you use it, e.g. `WHERE updated_at >= TIMESTAMP(@bookmark)`.",
           "type": "object",
           "properties": {
             "column": {
@@ -9528,7 +9529,7 @@
               "type": "string"
             },
             "initial_value": {
-              "description": "Lower bound used on the first run, before any bookmark is stored."
+              "description": "Lower bound (inclusive) used on the first run, before any bookmark\nis stored."
             },
             "type": {
               "type": "string",
@@ -9570,7 +9571,8 @@
           "type": "object",
           "properties": {
             "pattern": {
-              "type": "string"
+              "type": "string",
+              "x-faucet-resource": "path"
             },
             "type": {
               "type": "string",
@@ -9885,7 +9887,7 @@
           }
         },
         {
-          "description": "Only rows whose `column` is strictly greater than the stored bookmark\n(or `initial_value` on the first run) are emitted. If the SQL contains\nthe literal token `${bookmark}`, it is bound as a `:_faucet_bookmark`\nnamed parameter so the warehouse filters server-side (efficient); the\nsource also filters client-side as a correctness backstop. The new\nmaximum of `column` is persisted on the final page.",
+          "description": "Only rows not yet read, in `column` order, resuming from the stored\nbookmark (or `initial_value` on the first run).\n\nThe source wraps the SQL as\n``SELECT * FROM (<sql>) AS q WHERE q.`column` >= :_faucet_bookmark ORDER BY q.`column` ``\nand drops the rows it already emitted at the bookmark value, so rows\nthat share a cursor value (ties, late commits) are never skipped.\nEvery page carries a bookmark, so a crash replays at most one page.\nWrite `${bookmark}` in the SQL (with `>=`) to apply the cursor further\ninside it; a strict `>` is refused. Rows whose `column` is NULL are\nnever read.",
           "type": "object",
           "properties": {
             "column": {
@@ -9893,7 +9895,7 @@
               "type": "string"
             },
             "initial_value": {
-              "description": "Lower bound used on the first run, before any bookmark is stored."
+              "description": "Lower bound (inclusive) used on the first run, before any bookmark\nis stored."
             },
             "type": {
               "type": "string",
@@ -10426,11 +10428,12 @@
           "default": "WRITE_APPEND"
         },
         "storage_host": {
-          "description": "Optional GCS storage endpoint override (e.g. a fake-gcs-server host for\ntests). `None` uses the real Google endpoint.",
+          "description": "Optional GCS storage endpoint override (e.g. a fake-gcs-server host for\ntests). `None` uses the real Google endpoint.\nProcess-held credentials (`application_default`, a key file) are sent\nonly to a Google endpoint; use an anonymous `gcs_auth` elsewhere.",
           "type": [
             "string",
             "null"
-          ]
+          ],
+          "x-faucet-resource": "url"
         }
       }
     },
@@ -14552,8 +14555,9 @@
               "type": "object",
               "properties": {
                 "connection_string": {
-                  "description": "Connection string.",
-                  "type": "string"
+                  "description": "Connection string. Its endpoints (`BlobEndpoint=`, or the account\nhost built from `AccountName=` / `EndpointSuffix=`) are checked\nlike a URL by a host that confines configs.",
+                  "type": "string",
+                  "x-faucet-resource": "url"
                 }
               }
             }
@@ -14881,7 +14885,7 @@
                       "default": null
                     },
                     "assume_ordered": {
-                      "description": "The feed returns records in ascending `replication_key` order, so an\nincremental pass that `max_pages` cuts short may persist the largest key\nit read and resume after it next run. Without it such a pass fails the\nrun. Ignored for windowed passes, with `persist_cursor`, and across\n`requests:` entries (a truncated entry fails the run).",
+                      "description": "The feed returns records in ascending `replication_key` order, so an\nincremental pass that `max_pages` cuts short may persist the largest key\nit read and resume after it next run. Without it such a pass fails the\nrun. Requires a `replication_bind` when `max_pages` is set: only a\nbookmark the server filters on moves the next run past the pages\nalready read. Ignored for windowed passes, with `persist_cursor`, and\nacross `requests:` entries (a truncated entry fails the run).",
                       "type": [
                         "boolean",
                         "string"
@@ -16533,7 +16537,8 @@
                       "type": [
                         "string",
                         "null"
-                      ]
+                      ],
+                      "x-faucet-resource": "url"
                     },
                     "tls": {
                       "description": "TLS / encryption settings. Defaults to [`MssqlTlsMode::Prefer`].",
@@ -17095,7 +17100,8 @@
                       },
                       "default": [
                         "nats://127.0.0.1:4222"
-                      ]
+                      ],
+                      "x-faucet-resource": "url"
                     },
                     "auth": {
                       "description": "Authentication mode. Defaults to [`NatsAuth::None`] (anonymous).",
@@ -17292,7 +17298,8 @@
                       "type": [
                         "string",
                         "null"
-                      ]
+                      ],
+                      "x-faucet-resource": "url"
                     },
                     "port": {
                       "description": "Broker port. Defaults to `5672` (`5671` with TLS).",
@@ -17593,7 +17600,8 @@
                   "properties": {
                     "host": {
                       "description": "Server hostname or IP address.",
-                      "type": "string"
+                      "type": "string",
+                      "x-faucet-resource": "url"
                     },
                     "port": {
                       "description": "Server port (default: 22).",
@@ -18486,7 +18494,8 @@
                       "type": [
                         "string",
                         "null"
-                      ]
+                      ],
+                      "x-faucet-resource": "url"
                     },
                     "tls": {
                       "description": "TLS / encryption settings. Defaults to [`MssqlTlsMode::Prefer`].",
@@ -18661,7 +18670,8 @@
                   "properties": {
                     "host": {
                       "description": "Cluster / endpoint host (e.g. `my-cluster.abc123.us-east-1.redshift.amazonaws.com`).",
-                      "type": "string"
+                      "type": "string",
+                      "x-faucet-resource": "url"
                     },
                     "port": {
                       "description": "Port. Defaults to [`DEFAULT_PORT`] (5439).",
@@ -18858,7 +18868,8 @@
                       "type": [
                         "string",
                         "null"
-                      ]
+                      ],
+                      "x-faucet-resource": "url"
                     },
                     "credentials": {
                       "description": "How to authenticate. Defaults to Application Default Credentials.",
@@ -19022,7 +19033,8 @@
                       "type": [
                         "string",
                         "null"
-                      ]
+                      ],
+                      "x-faucet-resource": "url"
                     },
                     "http_port": {
                       "description": "HTTP-interface port used with [`host`](Self::host). Defaults to\n[`DEFAULT_HTTP_PORT`] (`8123`).",
@@ -20244,59 +20256,13 @@
                   "description": "Configuration for the Elasticsearch search source.",
                   "properties": {
                     "auth": {
-                      "$ref": "#/$defs/source_elasticsearch__AuthSpec",
-                      "description": "Authentication: either inline (`{ type, config }`) or a `{ ref: <name> }`\npointer to a shared provider in the CLI's top-level `auth:` catalog."
+                      "description": "Authentication: either inline (`{ type, config }`) or a `{ ref: <name> }`\npointer to a shared provider in the CLI's top-level `auth:` catalog.",
+                      "$ref": "#/$defs/source_elasticsearch__AuthSpec"
                     },
                     "base_url": {
                       "description": "Base URL of the Elasticsearch cluster (e.g. `\"http://localhost:9200\"`).",
                       "type": "string",
                       "x-faucet-resource": "url"
-                    },
-                    "batch_size": {
-                      "default": 1000,
-                      "description": "Records per emitted [`StreamPage`](faucet_core::StreamPage), which is\nalso the `size` parameter passed to the Elasticsearch scroll API\n(`POST /{index}/_search?scroll={timeout}&size={batch_size}`). Each\nscroll response becomes exactly one `StreamPage`. Defaults to\n[`DEFAULT_BATCH_SIZE`].\n\n`batch_size = 0` is the \"no batching\" sentinel: the whole result set\nis drained through the scroll API (10 000 documents per request) and\nemitted as one `StreamPage`. Use it for small indices or for sinks\n(e.g. SQL `COPY`, BigQuery load jobs) that prefer one large request to\nmany small ones.",
-                      "format": "uint",
-                      "minimum": 0,
-                      "type": [
-                        "integer",
-                        "string"
-                      ]
-                    },
-                    "connect_timeout_secs": {
-                      "default": 10,
-                      "description": "Seconds to wait for a TCP/TLS connection to the cluster. Default `10`.",
-                      "format": "uint64",
-                      "minimum": 0,
-                      "type": [
-                        "integer",
-                        "string"
-                      ]
-                    },
-                    "index": {
-                      "description": "Index name to search.",
-                      "type": "string"
-                    },
-                    "query": {
-                      "description": "Elasticsearch query DSL. Defaults to `{\"match_all\": {}}`."
-                    },
-                    "scroll_timeout": {
-                      "description": "Scroll context keep-alive (e.g. `\"5m\"`), renewed by every scroll\nrequest — so it must outlast the slowest page *write* between two\nrequests, or the context expires mid-run. Defaults to `\"5m\"`.",
-                      "type": "string",
-                      "default": "5m"
-                    },
-                    "auth": {
-                      "description": "Authentication: either inline (`{ type, config }`) or a `{ ref: <name> }`\npointer to a shared provider in the CLI's top-level `auth:` catalog.",
-                      "$ref": "#/$defs/source_elasticsearch__AuthSpec"
-                    },
-                    "max_pages": {
-                      "description": "Maximum number of scroll pages to fetch. `None` means no limit.",
-                      "format": "uint",
-                      "minimum": 0,
-                      "type": [
-                        "integer",
-                        "null",
-                        "string"
-                      ]
                     },
                     "batch_size": {
                       "description": "Records per emitted [`StreamPage`](faucet_core::StreamPage), which is\nalso the `size` parameter passed to the Elasticsearch scroll API\n(`POST /{index}/_search?scroll={timeout}&size={batch_size}`). Each\nscroll response becomes exactly one `StreamPage`. Defaults to\n[`DEFAULT_BATCH_SIZE`].\n\n`batch_size = 0` is the \"no batching\" sentinel: the whole result set\nis drained through the scroll API (10 000 documents per request) and\nemitted as one `StreamPage`. Use it for small indices or for sinks\n(e.g. SQL `COPY`, BigQuery load jobs) that prefer one large request to\nmany small ones.",
@@ -20317,6 +20283,28 @@
                       "format": "uint64",
                       "minimum": 0,
                       "default": 10
+                    },
+                    "index": {
+                      "description": "Index name to search.",
+                      "type": "string"
+                    },
+                    "query": {
+                      "description": "Elasticsearch query DSL. Defaults to `{\"match_all\": {}}`."
+                    },
+                    "scroll_timeout": {
+                      "description": "Scroll context keep-alive (e.g. `\"5m\"`), renewed by every scroll\nrequest — so it must outlast the slowest page *write* between two\nrequests, or the context expires mid-run. Defaults to `\"5m\"`.",
+                      "type": "string",
+                      "default": "5m"
+                    },
+                    "max_pages": {
+                      "description": "Maximum number of scroll pages to fetch. `None` means no limit.",
+                      "format": "uint",
+                      "minimum": 0,
+                      "type": [
+                        "integer",
+                        "null",
+                        "string"
+                      ]
                     },
                     "request_timeout_secs": {
                       "description": "Seconds one search or scroll request may take end to end before it\nfails the run (the source does not retry it). Default `300`, so a\nhalf-open connection or a wedged node cannot hang a run forever.",
@@ -20395,7 +20383,8 @@
                   "properties": {
                     "brokers": {
                       "description": "Comma-separated bootstrap server list, e.g. `\"broker1:9092,broker2:9092\"`.",
-                      "type": "string"
+                      "type": "string",
+                      "x-faucet-resource": "url"
                     },
                     "topics": {
                       "description": "One or more topics to subscribe to.",
@@ -20805,7 +20794,8 @@
                       "type": [
                         "string",
                         "null"
-                      ]
+                      ],
+                      "x-faucet-resource": "url"
                     },
                     "query": {
                       "description": "GoogleSQL query to run. Use named parameters (`@name`) for\n[`params`](Self::params), and the named parameter `@bookmark` to bind\nthe incremental cursor server-side.",
@@ -21066,12 +21056,24 @@
                       }
                     },
                     "storage_options": {
-                      "description": "Extra `storage_options` passed verbatim to delta-rs (e.g. a MinIO\nendpoint override, or any object-store key the [`DeltaCredentials`]\nenum does not model). Keys set here **win** over credential-derived\nkeys.",
+                      "description": "Extra `storage_options` passed verbatim to delta-rs (e.g. a MinIO\nendpoint override, or any object-store key the [`DeltaCredentials`]\nenum does not model). Keys set here **win** over credential-derived\nkeys. Keys that name an endpoint (`*endpoint*`, `*_url`, a proxy, an\nauthority host) or a local file (`*_file`, `*_path`, a service-account\nor application-credentials file) are checked like the typed fields by a\nhost that confines configs (`faucet serve`).",
                       "type": "object",
                       "additionalProperties": {
                         "type": "string"
                       },
-                      "default": {}
+                      "default": {},
+                      "x-faucet-resource-keys": {
+                        "*endpoint*": "url",
+                        "*_url": "url",
+                        "url": "url",
+                        "*proxy": "url",
+                        "*authority_host": "url",
+                        "*_file": "path",
+                        "*_path": "path",
+                        "*application_credentials": "path",
+                        "google_service_account": "path",
+                        "service_account": "path"
+                      }
                     },
                     "version": {
                       "description": "Time travel: read the table as of this version. Mutually exclusive with\n`timestamp`.",
@@ -21259,7 +21261,7 @@
                       "default": 1000
                     },
                     "arrow_native": {
-                      "description": "Fetch results as Apache Arrow instead of JSON. When `true`, the\nstatement is submitted with `EXTERNAL_LINKS` disposition +\n`ARROW_STREAM` format; each chunk's presigned link is fetched and\ndecoded as an Arrow IPC stream. This enables the **columnar** fast path\n([`Source::stream_batches`](faucet_core::Source::stream_batches)) so a\n`databricks → parquet`/`delta` chain skips the per-cell JSON decode.\n\nRequires the crate-local `arrow` feature, and (in this release) only\n[`DatabricksReplication::Full`] — the columnar path does not run the\nper-row client-side incremental filter. Defaults to `false` (the\n`INLINE` + `JSON_ARRAY` row path, unchanged). RFC 0002 / #375.",
+                      "description": "Fetch results as Apache Arrow instead of JSON. When `true`, the\nstatement is submitted with `EXTERNAL_LINKS` disposition +\n`ARROW_STREAM` format; each chunk's presigned link is fetched and\ndecoded as an Arrow IPC stream. This enables the **columnar** fast path\n([`Source::stream_batches`](faucet_core::Source::stream_batches)) so a\n`databricks → parquet`/`delta` chain skips the per-cell JSON decode.\n\nRequires the crate-local `arrow` feature, and (in this release) only\n[`DatabricksReplication::Full`] — the columnar path does not run the\nper-row cursor bookmark. Defaults to `false` (the\n`INLINE` + `JSON_ARRAY` row path, unchanged). RFC 0002 / #375.",
                       "type": [
                         "boolean",
                         "string"
@@ -21449,11 +21451,12 @@
                       "default": false
                     },
                     "storage_host": {
-                      "description": "Optional storage-host override (e.g. `http://localhost:4443` for\nfake-gcs-server). Production users should leave this unset.",
+                      "description": "Optional storage-host override (e.g. `http://localhost:4443` for\nfake-gcs-server). Production users should leave this unset.\n\nProcess-held credentials (`application_default`, a key file) are sent\nonly to a Google endpoint; use `auth: { type: anonymous }` elsewhere.",
                       "type": [
                         "string",
                         "null"
-                      ]
+                      ],
+                      "x-faucet-resource": "url"
                     },
                     "compression": {
                       "description": "Compression codec applied to each downloaded object. Defaults to\n[`CompressionConfig::Auto`](faucet_core::CompressionConfig::Auto) —\nthe codec is resolved per-object-key, so a single source can read a\nmix of compressed and uncompressed objects. Requires the\ncrate-local `compression` feature.",
@@ -22406,7 +22409,8 @@
                       "type": [
                         "string",
                         "null"
-                      ]
+                      ],
+                      "x-faucet-resource": "url"
                     },
                     "external_auth": {
                       "default": false,
@@ -22421,7 +22425,8 @@
                       "type": [
                         "string",
                         "null"
-                      ]
+                      ],
+                      "x-faucet-resource": "url"
                     },
                     "json_columns": {
                       "description": "Output columns whose text holds JSON (a `JSON_SERIALIZE(...)` or an\n`IS JSON` `VARCHAR2`/`CLOB`); their values are emitted as parsed JSON.",
@@ -22620,7 +22625,8 @@
                       "type": [
                         "string",
                         "null"
-                      ]
+                      ],
+                      "x-faucet-resource": "url"
                     },
                     "external_auth": {
                       "default": false,
@@ -22640,7 +22646,8 @@
                       "type": [
                         "string",
                         "null"
-                      ]
+                      ],
+                      "x-faucet-resource": "url"
                     },
                     "idle_timeout": {
                       "default": 30,
@@ -23703,11 +23710,12 @@
                       "default": false
                     },
                     "storage_host": {
-                      "description": "Optional storage-host override (e.g. `http://localhost:4443` for\nfake-gcs-server). Production users should leave this unset.",
+                      "description": "Optional storage-host override (e.g. `http://localhost:4443` for\nfake-gcs-server). Production users should leave this unset.\n\nProcess-held credentials (`application_default`, a key file) are sent\nonly to a Google endpoint; use `auth: { type: anonymous }` elsewhere.",
                       "type": [
                         "string",
                         "null"
-                      ]
+                      ],
+                      "x-faucet-resource": "url"
                     },
                     "compression": {
                       "description": "Compression codec applied to each downloaded object. Defaults to\n[`CompressionConfig::Auto`](faucet_core::CompressionConfig::Auto) —\nthe codec is resolved per-object-key, so a single source can read a\nmix of compressed and uncompressed objects. Requires the\ncrate-local `compression` feature.",
@@ -24854,7 +24862,8 @@
                       "type": [
                         "string",
                         "null"
-                      ]
+                      ],
+                      "x-faucet-resource": "url"
                     },
                     "tls": {
                       "description": "TLS / encryption settings. Defaults to [`MssqlTlsMode::Prefer`].",
@@ -25462,7 +25471,8 @@
                       },
                       "default": [
                         "nats://127.0.0.1:4222"
-                      ]
+                      ],
+                      "x-faucet-resource": "url"
                     },
                     "auth": {
                       "description": "Authentication mode. Defaults to [`NatsAuth::None`] (anonymous).",
@@ -25599,7 +25609,8 @@
                       "type": [
                         "string",
                         "null"
-                      ]
+                      ],
+                      "x-faucet-resource": "url"
                     },
                     "port": {
                       "description": "Broker port. Defaults to `5672` (`5671` with TLS).",
@@ -25872,7 +25883,8 @@
                   "properties": {
                     "host": {
                       "description": "Server hostname or IP address.",
-                      "type": "string"
+                      "type": "string",
+                      "x-faucet-resource": "url"
                     },
                     "port": {
                       "description": "Server port (default: 22).",
@@ -27018,7 +27030,8 @@
                   "properties": {
                     "brokers": {
                       "description": "Comma-separated `host:port` bootstrap brokers, passed straight through\nas librdkafka's `bootstrap.servers` (e.g. `\"b1:9092,b2:9092\"`).\nRequired; a blank value is rejected at config load.",
-                      "type": "string"
+                      "type": "string",
+                      "x-faucet-resource": "url"
                     },
                     "topic": {
                       "description": "Destination topic. Either a fixed name\n(`{ type: fixed, name: events }`) or a per-record JSONPath lookup\n(`{ type: from_path, path: \"$.dest\" }`) for multi-topic routing.\nRequired.",
@@ -27495,7 +27508,8 @@
                       "type": [
                         "string",
                         "null"
-                      ]
+                      ],
+                      "x-faucet-resource": "url"
                     },
                     "table_name": {
                       "description": "Target table name.",
@@ -28195,12 +28209,24 @@
                       }
                     },
                     "storage_options": {
-                      "description": "Extra `storage_options` passed verbatim to delta-rs (e.g. a MinIO\nendpoint override, or any object-store key the [`DeltaCredentials`]\nenum does not model). Keys set here **win** over credential-derived\nkeys.",
+                      "description": "Extra `storage_options` passed verbatim to delta-rs (e.g. a MinIO\nendpoint override, or any object-store key the [`DeltaCredentials`]\nenum does not model). Keys set here **win** over credential-derived\nkeys. Keys that name an endpoint (`*endpoint*`, `*_url`, a proxy, an\nauthority host) or a local file (`*_file`, `*_path`, a service-account\nor application-credentials file) are checked like the typed fields by a\nhost that confines configs (`faucet serve`).",
                       "type": "object",
                       "additionalProperties": {
                         "type": "string"
                       },
-                      "default": {}
+                      "default": {},
+                      "x-faucet-resource-keys": {
+                        "*endpoint*": "url",
+                        "*_url": "url",
+                        "url": "url",
+                        "*proxy": "url",
+                        "*authority_host": "url",
+                        "*_file": "path",
+                        "*_path": "path",
+                        "*application_credentials": "path",
+                        "google_service_account": "path",
+                        "service_account": "path"
+                      }
                     },
                     "create_table": {
                       "description": "Create the table (and its schema, from the inferred record shape) on the\nfirst write when it does not already exist. When `false`, an absent\ntable fails the first write with a typed error.\n\nSpelled `create_table` on the wire since #580, matching every other\ntable sink; the historical `create_if_not_missing` stays accepted as an\nalias. Same default (`true`): a first-ever sync cannot assume the\ndestination exists.",
@@ -28389,11 +28415,12 @@
                       "default": 1000
                     },
                     "storage_host": {
-                      "description": "Optional storage-host override (integration-test escape hatch).",
+                      "description": "Optional storage-host override (integration-test escape hatch).\n\nProcess-held credentials (`application_default`, a key file) are sent\nonly to a Google endpoint; use `auth: { type: anonymous }` elsewhere.",
                       "type": [
                         "string",
                         "null"
-                      ]
+                      ],
+                      "x-faucet-resource": "url"
                     },
                     "compression": {
                       "description": "Compression codec applied to each uploaded object body. Defaults to\n[`CompressionConfig::Auto`](faucet_core::CompressionConfig::Auto) —\nresolves against the object name (`path`'s, else `file_extension`, so\n`.jsonl.gz` triggers gzip).\nRequires the crate-local `compression` feature. Note: this sink does\n**not** set the GCS `Content-Encoding` metadata, so consumers must\ndecompress explicitly.",
@@ -28533,7 +28560,8 @@
                   "properties": {
                     "host": {
                       "description": "Cluster / endpoint host (e.g. `my-cluster.abc123.us-east-1.redshift.amazonaws.com`).",
-                      "type": "string"
+                      "type": "string",
+                      "x-faucet-resource": "url"
                     },
                     "port": {
                       "description": "Port. Defaults to [`DEFAULT_PORT`] (5439).",
@@ -28784,7 +28812,8 @@
                       "type": [
                         "string",
                         "null"
-                      ]
+                      ],
+                      "x-faucet-resource": "url"
                     },
                     "credentials": {
                       "description": "How to authenticate. Defaults to Application Default Credentials.",
@@ -28906,7 +28935,8 @@
                       "type": [
                         "string",
                         "null"
-                      ]
+                      ],
+                      "x-faucet-resource": "url"
                     },
                     "http_port": {
                       "description": "HTTP-interface port used with [`host`](Self::host). Defaults to\n[`DEFAULT_HTTP_PORT`] (`8123`).",
@@ -29795,7 +29825,8 @@
                       "type": [
                         "string",
                         "null"
-                      ]
+                      ],
+                      "x-faucet-resource": "url"
                     },
                     "create_table": {
                       "default": true,
@@ -29829,7 +29860,8 @@
                       "type": [
                         "string",
                         "null"
-                      ]
+                      ],
+                      "x-faucet-resource": "url"
                     },
                     "identifier_case": {
                       "$ref": "#/$defs/sink_oracle__IdentifierCase",
@@ -30448,7 +30480,7 @@
         },
         {
           "const": "resnapshot",
-          "description": "Re-read the whole table (emitted as `op: \"r\"` envelopes), then resume\nthe stream from the trim horizon. Converges on an upsert sink.",
+          "description": "Re-read the whole table (emitted as `op: \"r\"` envelopes), then resume\nthe stream from the trim horizon. The run is a complete read: afterwards\nthe destination rows of items it did not see (deleted while their stream\nrecords were trimmed) are deleted, so the sink must support cleanup, with\n`write_mode: upsert` and a `key`.",
           "type": "string"
         }
       ]
@@ -31235,14 +31267,14 @@
           "type": "object"
         },
         {
-          "description": "Only rows whose `column` is strictly greater than the stored bookmark\n(or `initial_value` on the first run) are emitted.\n\nPut the `:bookmark` placeholder in the query to push the cursor down to\nthe server (`WHERE UPDATED_AT > :bookmark`); the source also filters\nclient-side as a correctness backstop. `column` names the key exactly\nas it appears in the output — Oracle upper-cases unquoted names.",
+          "description": "Only rows not yet read, in `column` order, resuming from the stored\nbookmark (or `initial_value` on the first run).\n\nThe source wraps the query as\n`SELECT * FROM (<query>) q WHERE q.\"COLUMN\" >= :bookmark ORDER BY q.\"COLUMN\"`\nand drops the rows it already emitted at the bookmark value, so rows\nthat share a cursor value (ties, late commits, `DATE`'s one-second\nresolution) are never skipped. Every page carries a bookmark, so a\ncrash replays at most one page. Write `:bookmark` in the query (with\n`>=`) to apply the cursor further inside it; a strict `>` is refused.\n`column` names the key exactly as it appears in the output — Oracle\nupper-cases unquoted names. Rows whose `column` is NULL are never read.",
           "properties": {
             "column": {
               "description": "Output column holding the replication cursor (e.g. `UPDATED_AT`).",
               "type": "string"
             },
             "initial_value": {
-              "description": "Lower bound used on the first run, before any bookmark is stored."
+              "description": "Lower bound (inclusive) used on the first run, before any bookmark\nis stored."
             },
             "type": {
               "const": "incremental",
