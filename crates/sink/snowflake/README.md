@@ -199,7 +199,7 @@ sink:
 
 ### Asynchronous execution
 
-Snowflake's SQL REST API may answer a submitted `INSERT` with **HTTP 202 Accepted** — the statement was queued but has not yet executed. The sink does **not** count those rows as written at that point (that would report success before the data is durable). Instead it polls `GET /api/v2/statements/{handle}` until the statement reports success (code `090001`), then returns. The poll loop is bounded by `poll_timeout` (default 172800 s — 48 hours, Snowflake's own maximum statement time, so a large commit group on a small warehouse is not cut short): if the statement is still running after that budget, the write fails with `FaucetError::Sink` and the statement is cancelled server-side. Set `poll_timeout: 0` to poll indefinitely.
+Snowflake's SQL REST API may answer a submitted `INSERT` with **HTTP 202 Accepted** — the statement was queued but has not yet executed. The sink does **not** count those rows as written at that point (that would report success before the data is durable). Instead it polls `GET /api/v2/statements/{handle}` until the statement reports success (code `090001`), then returns. The poll loop is bounded by `poll_timeout` (default 172800 s — 48 hours, Snowflake's own maximum statement time, so a large commit group on a small warehouse is not cut short): if the statement is still running after that budget, the write fails with `FaucetError::Sink` and the statement is cancelled server-side. Set `poll_timeout: 0` to poll indefinitely. A poll that fails transiently — a connection error or HTTP 429 / 502 / 503 / 504 from the status endpoint — is retried with backoff (500 ms doubling to 8 s, up to 6 times in a row) rather than cancelling the running statement; any other answer fails the write.
 
 ## Effectively-once delivery
 
@@ -438,7 +438,12 @@ written to Parquet, uploaded to an **external** stage's backing cloud storage,
 and loaded with `COPY INTO <table> FROM @stage FILE_FORMAT=(TYPE=PARQUET)`. This
 runs end-to-end without per-row JSON when the source is also columnar (e.g.
 `parquet → snowflake`). It is **append-only** and independent of the row-path
-`INSERT`/exactly-once code, which is unchanged.
+`INSERT`/exactly-once code, which is unchanged. Before the `COPY` it runs the
+row path's table checks on the batch's columns (creates the table, adds a
+missing column with `create_table`, else fails naming it), and after it the
+write fails unless the `COPY` result's `rows_loaded` equals the batch's rows — a
+stage whose location differs from `bulk_load.url` (`Copy executed with 0 files
+processed.`) fails instead of reporting the batch written.
 
 ```yaml
 sink:

@@ -303,6 +303,13 @@ export async function renderLocalOutputs(host, scope = {}) {
     paint(data);
   }
 
+  // On a dataset's page the age purge is scoped to that dataset (the server
+  // combines `dataset_id` with `older_than_days`), and the label says so.
+  function purgeLabel(n) {
+    const days = n === "" ? "N days" : `${n} day${n === "1" ? "" : "s"}`;
+    return datasetId ? `Purge this dataset's outputs older than ${days}` : `Purge older than ${days}`;
+  }
+
   function paint(data) {
     const {
       outputs,
@@ -332,7 +339,7 @@ export async function renderLocalOutputs(host, scope = {}) {
               canManage
                 ? `<span class="lo-purge">
                      <input type="number" id="lo-days" min="0" value="${retention}" />
-                     <button class="btn-warn" id="lo-purge-btn">Purge older than ${retention} day${retention === 1 ? "" : "s"}</button>
+                     <button class="btn-warn" id="lo-purge-btn">${purgeLabel(String(retention))}</button>
                    </span>
                    <button class="btn-danger" id="lo-all">${
                      datasetId ? "Clean this dataset's outputs" : "Clean all local outputs"
@@ -369,9 +376,7 @@ export async function renderLocalOutputs(host, scope = {}) {
     // Keep the button label in sync with the typed window, so N is never a
     // placeholder — it always names the exact days that will be purged.
     daysInput.oninput = () => {
-      const n = daysInput.value.trim();
-      purgeBtn.textContent =
-        n === "" ? "Purge older than N days" : `Purge older than ${n} day${n === "1" ? "" : "s"}`;
+      purgeBtn.textContent = purgeLabel(daysInput.value.trim());
     };
     purgeBtn.onclick = () => {
       const days = Number(daysInput.value);
@@ -381,6 +386,14 @@ export async function renderLocalOutputs(host, scope = {}) {
       }
       // The typed window *is* the intent, so no dialog — except for 0, which
       // means "everything" and clears the same gate as "clean all".
+      // A dataset-scoped purge is bounded by the dataset, so it needs no gate.
+      if (datasetId) {
+        cleanup(
+          { dataset_id: datasetId, older_than_days: days },
+          `purged this dataset's outputs older than ${days} day(s)`,
+        );
+        return;
+      }
       if (days === 0 && !confirm(CLEAN_ALL_PROMPT("every tracked local output"))) return;
       cleanup(
         { older_than_days: days, confirm: days === 0 },

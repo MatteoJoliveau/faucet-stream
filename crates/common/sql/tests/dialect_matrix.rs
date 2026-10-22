@@ -26,6 +26,8 @@ struct Recorder {
     absent: Vec<String>,
     /// The key tuples each journal call recorded.
     journaled_keys: Vec<Vec<Value>>,
+    /// Catalog reads: `columns` and `key_types` calls.
+    catalog_reads: usize,
 }
 
 impl Recorder {
@@ -39,6 +41,7 @@ impl Recorder {
             journaled: Vec::new(),
             absent: Vec::new(),
             journaled_keys: Vec::new(),
+            catalog_reads: 0,
         }
     }
 
@@ -50,7 +53,25 @@ impl Recorder {
 #[faucet_core::async_trait]
 impl SqlExecutor for Recorder {
     async fn columns(&mut self, _target: &TableTarget) -> Result<Vec<TableColumn>, FaucetError> {
+        self.catalog_reads += 1;
         Ok(self.columns.clone())
+    }
+
+    async fn key_types(
+        &mut self,
+        _target: &TableTarget,
+        key: &[String],
+    ) -> Result<Vec<Option<String>>, FaucetError> {
+        self.catalog_reads += 1;
+        Ok(key
+            .iter()
+            .map(|k| {
+                self.columns
+                    .iter()
+                    .find(|c| &c.name == k)
+                    .and_then(|c| c.sql_type().map(str::to_string))
+            })
+            .collect())
     }
 
     async fn execute(&mut self, stmt: &Statement<'_>) -> Result<u64, FaucetError> {
@@ -265,6 +286,42 @@ fn matrix_upsert_delete_ordering() {
     every_keyed_dialect!(groups_run_in_page_order_with_journal_first);
 }
 
+/// A page alternating upserts and deletes is one group per row; the table's
+/// catalog is still read once per kind, not once per group.
+fn alternating_groups_read_the_catalog_once<D: SqlDialect>(d: D) {
+    let mut s = spec(WriteMode::Upsert, &["id"]);
+    s.delete_marker = Some(faucet_core::DeleteMarker {
+        field: "op".into(),
+        values: vec!["d".into()],
+    });
+    let name = d.name();
+    let engine = SqlSinkEngine::new(d, s);
+    let page: Vec<Value> = (0..20)
+        .map(|i| {
+            if i % 2 == 0 {
+                json!({"id": i, "v": "x"})
+            } else {
+                json!({"id": i, "op": "d"})
+            }
+        })
+        .collect();
+    let plans = engine.plan_keyed(&page).unwrap();
+    assert_eq!(plans.len(), 20, "{name}");
+    let mut rec = Recorder::new(&[("id", "int"), ("v", "text")]);
+    let t = target(engine.dialect(), "t");
+    let affected = futures_lite_block_on(engine.apply_plans(&mut rec, &t, &plans)).unwrap();
+    assert_eq!(affected, 20, "{name}");
+    assert_eq!(
+        rec.catalog_reads, 2,
+        "{name}: one columns + one key_types read"
+    );
+}
+
+#[test]
+fn matrix_alternating_groups_catalog_reads() {
+    every_keyed_dialect!(alternating_groups_read_the_catalog_once);
+}
+
 fn statements_stay_under_the_parameter_limit<D: SqlDialect>(d: D) {
     let name = d.name();
     for width in [1usize, 2, 3, 7, 64, 500] {
@@ -342,6 +399,32 @@ fn matrix_present_column_groups() {
     every_keyed_dialect!(append_unions_columns_and_upsert_groups_them);
 }
 
+/// Two writers upserting one new key must not both take the insert branch:
+/// the statement is either an atomic insert-or-update, or a `MERGE` that
+/// serializes the key (SQL Server's `HOLDLOCK`; Oracle's sink re-runs a
+/// `MERGE` that lost the race with ORA-00001).
+fn upsert_is_safe_under_concurrent_writers<D: SqlDialect>(d: D) {
+    let key = vec!["id".to_string()];
+    let cols = vec!["id".to_string(), "v".to_string()];
+    let sql = d
+        .upsert_sql(&d.quote("t").unwrap(), &key, &cols, &[None, None], 2)
+        .unwrap();
+    let name = d.name();
+    let safe = if sql.starts_with("INSERT") {
+        sql.contains("ON CONFLICT") || sql.contains("ON DUPLICATE KEY UPDATE")
+    } else if name == "oracle" {
+        sql.starts_with("MERGE INTO")
+    } else {
+        sql.starts_with("MERGE") && sql.contains("WITH (HOLDLOCK)")
+    };
+    assert!(safe, "{name}: {sql}");
+}
+
+#[test]
+fn matrix_upsert_concurrency() {
+    every_keyed_dialect!(upsert_is_safe_under_concurrent_writers);
+}
+
 #[test]
 fn matrix_upsert_text() {
     let key = vec!["id".to_string()];
@@ -363,7 +446,7 @@ fn matrix_upsert_text() {
     );
     assert_eq!(
         Mssql.upsert_sql("[t]", &key, &cols, &types, 1).unwrap(),
-        "MERGE [t] AS tgt USING (VALUES (@P1, @P2)) AS src ([id], [v]) ON tgt.[id] = src.[id] \
+        "MERGE [t] WITH (HOLDLOCK) AS tgt USING (VALUES (@P1, @P2)) AS src ([id], [v]) ON tgt.[id] = src.[id] \
          WHEN MATCHED THEN UPDATE SET tgt.[v] = src.[v] \
          WHEN NOT MATCHED THEN INSERT ([id], [v]) VALUES (src.[id], src.[v]);"
     );
@@ -988,4 +1071,44 @@ fn futures_lite_block_on<F: std::future::Future>(f: F) -> F::Output {
         .build()
         .expect("runtime")
         .block_on(f)
+}
+
+/// Concurrent overwrite runs of one table stage apart (#930): a run token
+/// makes the staging name its own, a plain identifier each dialect accepts
+/// and quotes without escaping, and two runs never share one.
+fn overwrite_runs_stage_under_their_own_name<D: SqlDialect>(d: D) {
+    use faucet_common_sql::SqlLayout;
+    use faucet_core::idempotency::{abandoned_overwrite_staging, new_overwrite_run_token};
+    let (a, b) = (new_overwrite_run_token(), new_overwrite_run_token());
+    let untokened = SqlLayout::new("orders").staging_table();
+    let staging_a = SqlLayout::new("orders")
+        .overwrite_run(Some(a.clone()))
+        .staging_table();
+    let staging_b = SqlLayout::new("orders")
+        .overwrite_run(Some(b))
+        .staging_table();
+    assert_eq!(untokened, "orders__faucet_ovw");
+    assert_eq!(staging_a, format!("orders__faucet_ovw_{a}"));
+    assert_ne!(staging_a, staging_b);
+    for name in [&untokened, &staging_a] {
+        d.check_ident(name).unwrap();
+        let quoted = d.quote_ident(name);
+        assert!(quoted.contains(name.as_str()), "{quoted}");
+    }
+    // A live sibling run's staging is never swept by another run's begin.
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+    assert!(!abandoned_overwrite_staging(
+        "orders",
+        &staging_b,
+        Some(&a),
+        now
+    ));
+}
+
+#[test]
+fn matrix_overwrite_staging_names() {
+    every_dialect!(overwrite_runs_stage_under_their_own_name);
 }

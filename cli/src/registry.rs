@@ -422,6 +422,49 @@ where
     Box::pin(async move { Ok(Box::new(fut.await?) as Box<dyn Sink>) })
 }
 
+/// Remove the executor's overwrite run token
+/// ([`faucet_core::idempotency::OVERWRITE_RUN_KEY`]) from a sink config: no
+/// connector config declares it, so a sink that stages an overwrite is handed
+/// it through its `with_overwrite_run` instead, and every other sink never
+/// sees it.
+fn take_overwrite_run(kind: &str, mut config: Value) -> CliResult<(Value, Option<String>)> {
+    let Some(v) = config
+        .as_object_mut()
+        .and_then(|m| m.remove(faucet_core::idempotency::OVERWRITE_RUN_KEY))
+    else {
+        return Ok((config, None));
+    };
+    match v {
+        Value::String(t) => Ok((config, Some(t))),
+        Value::Null => Ok((config, None)),
+        other => Err(CliError::InvalidConnectorConfig {
+            kind: "sink",
+            name: kind.to_owned(),
+            message: format!(
+                "`{}` must be an overwrite run token string, got {other}",
+                faucet_core::idempotency::OVERWRITE_RUN_KEY
+            ),
+        }),
+    }
+}
+
+/// Build a sink, then join it to the overwrite run `run` when there is one.
+#[allow(dead_code)]
+async fn joined<S, F>(
+    fut: F,
+    run: Option<String>,
+    join: fn(S, &str) -> Result<S, faucet_core::FaucetError>,
+) -> Result<S, faucet_core::FaucetError>
+where
+    F: std::future::Future<Output = Result<S, faucet_core::FaucetError>>,
+{
+    let sink = fut.await?;
+    match run {
+        Some(token) => join(sink, &token),
+        None => Ok(sink),
+    }
+}
+
 /// Build a [`Source`] trait object from a `(kind, config)` pair. When the
 /// config carries `auth: { ref: <name> }`, the named provider is resolved from
 /// `auth` (the catalog) and injected into the connector.
@@ -735,7 +778,11 @@ async fn build_source_inner(
             let cfg = decode::<faucet_source_bigquery::BigQuerySourceConfig>(
                 "source", "bigquery", config,
             )?;
-            boxed_source(faucet_source_bigquery::BigQuerySource::new(cfg)).await
+            let mut s = Box::pin(faucet_source_bigquery::BigQuerySource::new(cfg)).await?;
+            if let Some(rp) = retry_policy {
+                s = s.with_retry_policy(rp.clone());
+            }
+            Ok(Box::new(s))
         }
         #[cfg(feature = "source-snowflake")]
         "snowflake" => {
@@ -810,6 +857,9 @@ async fn build_sink_inner(
     auth: &AuthCatalog,
 ) -> CliResult<Box<dyn Sink>> {
     let config = crate::interpolate::unescaped(config);
+    let (config, overwrite_run) = take_overwrite_run(kind, config)?;
+    // Unused when no overwrite-staging sink is compiled in.
+    let _ = &overwrite_run;
     if let Some(entry) = global().sinks.get(kind) {
         reject_unknown_config_keys("sink", kind, kind, &config, &(entry.schema)())?;
         return (entry.factory)(config);
@@ -823,7 +873,12 @@ async fn build_sink_inner(
         "bigquery" => {
             let cfg =
                 decode::<faucet_sink_bigquery::BigQuerySinkConfig>("sink", "bigquery", config)?;
-            boxed_sink(faucet_sink_bigquery::BigQuerySink::new(cfg)).await
+            boxed_sink(joined(
+                faucet_sink_bigquery::BigQuerySink::new(cfg),
+                overwrite_run,
+                faucet_sink_bigquery::BigQuerySink::with_overwrite_run,
+            ))
+            .await
         }
         #[cfg(feature = "sink-iceberg")]
         "iceberg" => {
@@ -839,7 +894,12 @@ async fn build_sink_inner(
         "postgres" => {
             let cfg =
                 decode::<faucet_sink_postgres::PostgresSinkConfig>("sink", "postgres", config)?;
-            boxed_sink(faucet_sink_postgres::PostgresSink::new(cfg)).await
+            boxed_sink(joined(
+                faucet_sink_postgres::PostgresSink::new(cfg),
+                overwrite_run,
+                faucet_sink_postgres::PostgresSink::with_overwrite_run,
+            ))
+            .await
         }
         #[cfg(feature = "sink-jsonl")]
         "jsonl" => {
@@ -859,17 +919,32 @@ async fn build_sink_inner(
         #[cfg(feature = "sink-mysql")]
         "mysql" => {
             let cfg = decode::<faucet_sink_mysql::MysqlSinkConfig>("sink", "mysql", config)?;
-            boxed_sink(faucet_sink_mysql::MysqlSink::new(cfg)).await
+            boxed_sink(joined(
+                faucet_sink_mysql::MysqlSink::new(cfg),
+                overwrite_run,
+                faucet_sink_mysql::MysqlSink::with_overwrite_run,
+            ))
+            .await
         }
         #[cfg(feature = "sink-mssql")]
         "mssql" => {
             let cfg = decode::<faucet_sink_mssql::MssqlSinkConfig>("sink", "mssql", config)?;
-            boxed_sink(faucet_sink_mssql::MssqlSink::new(cfg)).await
+            boxed_sink(joined(
+                faucet_sink_mssql::MssqlSink::new(cfg),
+                overwrite_run,
+                faucet_sink_mssql::MssqlSink::with_overwrite_run,
+            ))
+            .await
         }
         #[cfg(feature = "sink-sqlite")]
         "sqlite" => {
             let cfg = decode::<faucet_sink_sqlite::SqliteSinkConfig>("sink", "sqlite", config)?;
-            boxed_sink(faucet_sink_sqlite::SqliteSink::new(cfg)).await
+            boxed_sink(joined(
+                faucet_sink_sqlite::SqliteSink::new(cfg),
+                overwrite_run,
+                faucet_sink_sqlite::SqliteSink::with_overwrite_run,
+            ))
+            .await
         }
         #[cfg(feature = "sink-duckdb")]
         "duckdb" => {
@@ -895,7 +970,11 @@ async fn build_sink_inner(
         #[cfg(feature = "sink-sftp")]
         "sftp" => {
             let cfg = decode::<faucet_sink_sftp::SftpSinkConfig>("sink", "sftp", config)?;
-            Ok(Box::new(faucet_sink_sftp::SftpSink::new(cfg)?))
+            let mut s = faucet_sink_sftp::SftpSink::new(cfg)?;
+            if let Some(token) = &overwrite_run {
+                s = s.with_overwrite_run(token)?;
+            }
+            Ok(Box::new(s))
         }
         #[cfg(feature = "sink-singer")]
         "singer" => {
@@ -908,12 +987,22 @@ async fn build_sink_inner(
         #[cfg(feature = "sink-s3")]
         "s3" => {
             let cfg = decode::<faucet_sink_s3::S3SinkConfig>("sink", "s3", config)?;
-            boxed_sink(faucet_sink_s3::S3Sink::new(cfg)).await
+            boxed_sink(joined(
+                faucet_sink_s3::S3Sink::new(cfg),
+                overwrite_run,
+                faucet_sink_s3::S3Sink::with_overwrite_run,
+            ))
+            .await
         }
         #[cfg(feature = "sink-mongodb")]
         "mongodb" => {
             let cfg = decode::<faucet_sink_mongodb::MongoSinkConfig>("sink", "mongodb", config)?;
-            boxed_sink(faucet_sink_mongodb::MongoSink::new(cfg)).await
+            boxed_sink(joined(
+                faucet_sink_mongodb::MongoSink::new(cfg),
+                overwrite_run,
+                faucet_sink_mongodb::MongoSink::with_overwrite_run,
+            ))
+            .await
         }
         #[cfg(feature = "sink-redis")]
         "redis" => {
@@ -933,6 +1022,9 @@ async fn build_sink_inner(
                 config,
             )?;
             let mut s = faucet_sink_elasticsearch::ElasticsearchSink::new(cfg)?;
+            if let Some(token) = &overwrite_run {
+                s = s.with_overwrite_run(token)?;
+            }
             if let Some(name) = &auth_ref {
                 s = s.with_auth_provider(auth_catalog::resolve(auth, name)?);
             }
@@ -975,12 +1067,21 @@ async fn build_sink_inner(
         #[cfg(feature = "sink-file")]
         "file" => {
             let cfg = decode::<faucet_sink_file::FileSinkConfig>("sink", "file", config)?;
-            Ok(Box::new(faucet_sink_file::FileSink::new(cfg)?))
+            let mut s = faucet_sink_file::FileSink::new(cfg)?;
+            if let Some(token) = &overwrite_run {
+                s = s.with_overwrite_run(token)?;
+            }
+            Ok(Box::new(s))
         }
         #[cfg(feature = "sink-gcs")]
         "gcs" => {
             let cfg = decode::<faucet_sink_gcs::GcsSinkConfig>("sink", "gcs", config)?;
-            boxed_sink(faucet_sink_gcs::GcsSink::new(cfg)).await
+            boxed_sink(joined(
+                faucet_sink_gcs::GcsSink::new(cfg),
+                overwrite_run,
+                faucet_sink_gcs::GcsSink::with_overwrite_run,
+            ))
+            .await
         }
         #[cfg(feature = "sink-redshift")]
         "redshift" => {
@@ -1009,7 +1110,12 @@ async fn build_sink_inner(
                 "azure-blob",
                 config,
             )?;
-            boxed_sink(faucet_sink_azure_blob::AzureBlobSink::new(cfg)).await
+            boxed_sink(joined(
+                faucet_sink_azure_blob::AzureBlobSink::new(cfg),
+                overwrite_run,
+                faucet_sink_azure_blob::AzureBlobSink::with_overwrite_run,
+            ))
+            .await
         }
         #[cfg(feature = "sink-dynamodb")]
         "dynamodb" => {
@@ -1025,6 +1131,9 @@ async fn build_sink_inner(
                 config,
             )?;
             let mut s = faucet_sink_databricks::DatabricksSink::new(cfg)?;
+            if let Some(token) = &overwrite_run {
+                s = s.with_overwrite_run(token)?;
+            }
             if let Some(name) = &auth_ref {
                 s = s.with_auth_provider(auth_catalog::resolve(auth, name)?);
             }
@@ -1033,7 +1142,12 @@ async fn build_sink_inner(
         #[cfg(feature = "sink-oracle")]
         "oracle" => {
             let cfg = decode::<faucet_sink_oracle::OracleSinkConfig>("sink", "oracle", config)?;
-            boxed_sink(faucet_sink_oracle::OracleSink::new(cfg)).await
+            boxed_sink(joined(
+                faucet_sink_oracle::OracleSink::new(cfg),
+                overwrite_run,
+                faucet_sink_oracle::OracleSink::with_overwrite_run,
+            ))
+            .await
         }
         other => Err(unknown(other, "sink", sink_kinds())),
     }
@@ -1252,10 +1366,12 @@ pub fn source_resumes_from_bookmark(kind: &str, config: &Value) -> bool {
 }
 
 /// Whether a source reads only what arrived since its last run whatever the
-/// config: a queue it consumes from, or a live subscription. Its read is never
-/// a complete fetch (#862 M-022).
+/// config: a queue it consumes from, a live subscription, or a listener that
+/// collects what is sent to it during the run (`webhook`, `websocket`). Its
+/// read is never a complete fetch (#862 M-022).
 pub fn source_reads_a_delta(kind: &str, config: &Value) -> bool {
-    source_kind_consumes_destructively(kind, config) || kind == "nats"
+    source_kind_consumes_destructively(kind, config)
+        || matches!(kind, "nats" | "webhook" | "websocket")
 }
 
 /// Whether a SQL query source reads with `replication: { type: incremental }`.
@@ -1306,6 +1422,12 @@ fn config_object(config: &Value) -> std::borrow::Cow<'_, Value> {
     } else {
         std::borrow::Cow::Borrowed(config)
     }
+}
+
+/// Whether `kind` names a sink connector: compiled in (built-in or plugin), or
+/// a first-party one this binary was built without.
+pub(crate) fn is_known_sink_kind(kind: &str) -> bool {
+    sink_kinds().contains(&kind) || uncompiled_builtin(kind, "sink")
 }
 
 /// Whether `kind` is a first-party connector this binary was built without.
@@ -1586,7 +1708,11 @@ fn builtin_sink_descriptor(kind: &str) -> Option<ConnectorDescriptor> {
 
 /// Keys the executor itself injects into a connector config — hidden from the
 /// schema, so the unknown-key gate must not refuse them (#789 CLI-72).
-const CLI_INJECTED_KEYS: &[&str] = &["_overwrite_staging", "_activate_version"];
+const CLI_INJECTED_KEYS: &[&str] = &[
+    "_overwrite_staging",
+    "_activate_version",
+    faucet_core::idempotency::OVERWRITE_RUN_KEY,
+];
 
 /// Reject connector-config keys the connector does not declare (#654 H9).
 ///
@@ -4127,6 +4253,110 @@ mod tests {
         reject_unknown_config_keys("sink", "bigquery", "row", &cfg, &schema).unwrap();
         let typo = json!({ "project_id": "p", "_overwrite_stagin": true });
         assert!(reject_unknown_config_keys("sink", "bigquery", "row", &typo, &schema).is_err());
+    }
+
+    /// The executor's overwrite run token is taken out of a sink config
+    /// before it is decoded, and only a string (or null) is accepted.
+    #[test]
+    fn the_overwrite_run_token_is_taken_out_of_the_config() {
+        let (cfg, run) = take_overwrite_run(
+            "sqlite",
+            json!({"a": 1, "_overwrite_run": "67000000abcdef"}),
+        )
+        .unwrap();
+        assert_eq!(
+            (cfg, run.as_deref()),
+            (json!({"a": 1}), Some("67000000abcdef"))
+        );
+        let (cfg, run) = take_overwrite_run("sqlite", json!({"_overwrite_run": null})).unwrap();
+        assert_eq!((cfg, run), (json!({}), None));
+        let (cfg, run) = take_overwrite_run("sqlite", json!("x")).unwrap();
+        assert_eq!((cfg, run), (json!("x"), None));
+        assert!(take_overwrite_run("sqlite", json!({"_overwrite_run": 7})).is_err());
+        let schema = json!({"type": "object", "properties": {"a": {}}});
+        reject_unknown_config_keys(
+            "sink",
+            "sqlite",
+            "row",
+            &json!({"a": 1, "_overwrite_run": "67000000abcdef"}),
+            &schema,
+        )
+        .unwrap();
+    }
+
+    /// A sink that stages an overwrite joins the run; a malformed token is
+    /// refused before it can reach a table name.
+    #[cfg(feature = "sink-sqlite")]
+    #[tokio::test]
+    async fn a_staging_sink_is_built_joined_to_its_overwrite_run() {
+        let dir = tempfile::tempdir().unwrap();
+        let url = format!("sqlite://{}?mode=rwc", dir.path().join("t.db").display());
+        let cfg = |token: &str| {
+            json!({
+                "database_url": url, "table_name": "t", "column_mapping": "auto_map",
+                "write_mode": "overwrite", "_overwrite_run": token
+            })
+        };
+        let auth = AuthCatalog::default();
+        build_sink("sqlite", cfg("67000000abcdef"), &auth)
+            .await
+            .unwrap();
+        let err = build_sink("sqlite", cfg("../x"), &auth)
+            .await
+            .err()
+            .unwrap();
+        assert!(err.to_string().contains("_overwrite_run"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn sftp_and_databricks_sinks_join_their_overwrite_run() {
+        let auth = AuthCatalog::default();
+        let sftp = |token: &str| {
+            json!({
+                "host": "sftp.example.com", "username": "user",
+                "type": "password", "config": {"password": "secret"},
+                "path": "/upload", "file_name": "out.jsonl",
+                "write_mode": "overwrite", "_overwrite_run": token
+            })
+        };
+        let dbx = |token: &str| {
+            json!({
+                "workspace_url": "https://x", "warehouse_id": "wh",
+                "auth": {"type": "pat", "config": {"token": "t"}},
+                "catalog": "main", "schema": "s", "table": "t",
+                "write_mode": "overwrite", "_overwrite_run": token
+            })
+        };
+        for (kind, cfg) in [
+            ("sftp", &sftp as &dyn Fn(&str) -> Value),
+            ("databricks", &dbx),
+        ] {
+            build_sink(kind, cfg("67000000abcdef"), &auth)
+                .await
+                .unwrap_or_else(|e| panic!("{kind}: {e}"));
+            let err = build_sink(kind, cfg("../x"), &auth).await.err().unwrap();
+            assert!(err.to_string().contains("overwrite"), "{kind}: {err}");
+        }
+    }
+
+    #[tokio::test]
+    async fn a_bigquery_source_takes_the_retry_policy() {
+        let sa = json!({
+            "type": "service_account", "project_id": "dummy", "private_key_id": "dummy",
+            "private_key": "-----BEGIN PRIVATE KEY-----\nMIIEvwIBADANBgkqhkiG9w0BAQEFAASCBKkwggSlAgEAAoIBAQDNk6cKkWP/4NMu\nWb3s24YHfM639IXzPtTev06PUVVQnyHmT1bZgQ/XB6BvIRaReqAqnQd61PAGtX3e\n8XocTw+u/ZfiPJOf+jrXMkRBpiBh9mbyEIqBy8BC20OmsUc+O/YYh/qRccvRfPI7\n3XMabQ8eFWhI6z/t35oRpvEVFJnSIgyV4JR/L/cjtoKnxaFwjBzEnxPiwtdy4olU\nKO/1maklXexvlO7onC7CNmPAjuEZKzdMLzFszikCDnoKJC8k6+2GZh0/JDMAcAF4\nwxlKNQ89MpHVRXZ566uKZg0MqZqkq5RXPn6u7yvNHwZ0oahHT+8ixPPrAEjuPEKM\nUPzVRz71AgMBAAECggEAfdbVWLW5Befkvam3hea2+5xdmeN3n3elrJhkiXxbAhf3\nE1kbq9bCEHmdrokNnI34vz0SWBFCwIiWfUNJ4UxQKGkZcSZto270V8hwWdNMXUsM\npz6S2nMTxJkdp0s7dhAUS93o9uE2x4x5Z0XecJ2ztFGcXY6Lupu2XvnW93V9109h\nkY3uICLdbovJq7wS/fO/AL97QStfEVRWW2agIXGvoQG5jOwfPh86GZZRYP9b8VNw\ntkAUJe4qpzNbWs9AItXOzL+50/wsFkD/iWMGWFuU8DY5ZwsL434N+uzFlaD13wtZ\n63D+tNAxCSRBfZGQbd7WxJVFfZe/2vgjykKWsdyNAQKBgQDnEBgSI836HGSRk0Ub\nDwiEtdfh2TosV+z6xtyU7j/NwjugTOJEGj1VO/TMlZCEfpkYPLZt3ek2LdNL66n8\nDyxwzTT5Q3D/D0n5yE3mmxy13Qyya6qBYvqqyeWNwyotGM7hNNOix1v9lEMtH5Rd\nUT0gkThvJhtrV663bcAWCALmtQKBgQDjw2rYlMUp2TUIa2/E7904WOnSEG85d+nc\norhzthX8EWmPgw1Bbfo6NzH4HhebTw03j3NjZdW2a8TG/uEmZFWhK4eDvkx+rxAa\n6EwamS6cmQ4+vdep2Ac4QCSaTZj02YjHb06Be3gptvpFaFrotH2jnpXxggdiv8ul\n6x+ooCffQQKBgQCR3ykzGoOI6K/c75prELyR+7MEk/0TzZaAY1cSdq61GXBHLQKT\nd/VMgAN1vN51pu7DzGBnT/dRCvEgNvEjffjSZdqRmrAVdfN/y6LSeQ5RCfJgGXSV\nJoWVmMxhCNrxiX3h01Xgp/c9SYJ3VD54AzeR/dwg32/j/oEAsDraLciXGQKBgQDF\nMNc8k/DvfmJv27R06Ma6liA6AoiJVMxgfXD8nVUDW3/tBCVh1HmkFU1p54PArvxe\nchAQqoYQ3dUMBHeh6ZRJaYp2ATfxJlfnM99P1/eHFOxEXdBt996oUMBf53bZ5cyJ\n/lAVwnQSiZy8otCyUDHGivJ+mXkTgcIq8BoEwERFAQKBgQDmImBaFqoMSVihqHIf\nDa4WZqwM7ODqOx0JnBKrKO8UOc51J5e1vpwP/qRpNhUipoILvIWJzu4efZY7GN5C\nImF9sN3PP6Sy044fkVPyw4SYEisxbvp9tfw8Xmpj/pbmugkB2ut6lz5frmEBoJSN\n3osZlZTgx+pM3sO6ITV6U4ID2Q==\n-----END PRIVATE KEY-----\n",
+            "client_email": "dummy@developer.gserviceaccount.com", "client_id": "dummy",
+            "token_uri": "http://127.0.0.1:9/token",
+        });
+        let cfg = json!({
+            "project_id": "p",
+            "auth": {"type": "service_account_key", "config": {"json": sa.to_string()}},
+            "query": "SELECT 1",
+        });
+        let policy = faucet_core::RetryPolicy::default();
+        let src = build_source("bigquery", cfg, &AuthCatalog::new(), Some(&policy))
+            .await
+            .unwrap();
+        assert_eq!(src.connector_name(), "bigquery");
     }
 
     #[test]

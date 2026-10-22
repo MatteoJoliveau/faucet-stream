@@ -4803,7 +4803,7 @@
           }
         },
         {
-          "description": "Offset/limit pagination that writes the offset and limit into the JSON\n**request body** (POST-query APIs), rather than the query string\n([`Offset`](Self::Offset)) or a cursor token\n([`CursorInBody`](Self::CursorInBody)). Each request sends\n`body[offset_field] = <offset>` and `body[limit_field] = <limit>`; the\noffset advances by the page's record count. With `stop_when_short`\n(default `true`) a page shorter than `limit` ends pagination; a zero-record\npage always ends it, and a repeated identical page trips a loop guard.\nEither field may be a JSON Pointer (`/page/offset`) for a nested\nlocation, with the same rules as `CursorInBody.body_cursor_field`.",
+          "description": "Offset/limit pagination that writes the offset and limit into the JSON\n**request body** (POST-query APIs), rather than the query string\n([`Offset`](Self::Offset)) or a cursor token\n([`CursorInBody`](Self::CursorInBody)). Each request sends\n`body[offset_field] = <offset>` and `body[limit_field] = <limit>`; the\noffset advances by the page's record count (or by `rows_path`, which\nis required when `records_path` fans out to nested children or\n`record_ancestors` is set, as for [`Offset`](Self::Offset)). A\nzero-record page ends pagination, a readable `total_path` ends it once\nthe offset reaches the total, and a repeated identical page trips a\nloop guard. With `stop_when_short` (default `false`) a page shorter than\n`limit` also ends it — only for servers that never cap a page below\n`limit`, since a capped page would end the run with rows unread.\nEither field may be a JSON Pointer (`/page/offset`) for a nested\nlocation, with the same rules as `CursorInBody.body_cursor_field`.",
           "type": "object",
           "properties": {
             "offset_field": {
@@ -4825,7 +4825,7 @@
                 "boolean",
                 "string"
               ],
-              "default": true
+              "default": false
             },
             "rows_path": {
               "description": "JSONPath whose matches are counted to advance the offset and detect a\nshort page, instead of the extracted record count — for report APIs\nwhose whole response is one record (`$.rows`). An array counts its\nelements, an object 1, null or no match 0 (which ends pagination).",
@@ -4848,7 +4848,7 @@
           }
         },
         {
-          "description": "Keyset pagination by the running max/min of a record field (#554). After\neach page the aggregate of `field` over its records is injected into the\nnext request (as a query param or body field per `into`) at `param`. With\n`stop_when_short` (default `true`) a page shorter than `page_size` ends\npagination; a zero-record page always ends it, and a non-advancing cursor\ntrips a loop guard.",
+          "description": "Keyset pagination by the running max/min of a record field (#554). After\neach page the aggregate of `field` over its records is injected into the\nnext request (as a query param or body field per `into`) at `param`. With\n`stop_when_short` (default `true`) a page shorter than `page_size` ends\npagination; a zero-record page always ends it, and a non-advancing cursor\ntrips a loop guard.\n\nWith the default exclusive bound the server must return rows strictly\npast the cursor, so `field` must be unique: rows sharing the boundary\nvalue at a page cut are never read (a warning names it when a page ends\non such a tie). Set `inclusive: true` for a server that returns rows\n`>=` the cursor: rows already emitted at the boundary value are dropped\nby whole-record fingerprint, so a non-unique field (`updated_at`) reads\nevery row exactly once.",
           "type": "object",
           "properties": {
             "field": {
@@ -4885,6 +4885,14 @@
               ],
               "format": "uint",
               "minimum": 0
+            },
+            "inclusive": {
+              "description": "The server returns rows `>=` the cursor (default `false`: strictly\ngreater/less). Required for a non-unique cursor field.",
+              "type": [
+                "boolean",
+                "string"
+              ],
+              "default": false
             },
             "type": {
               "type": "string",
@@ -4972,7 +4980,8 @@
           "type": [
             "string",
             "null"
-          ]
+          ],
+          "x-faucet-resource": "path"
         },
         "pkcs12_password": {
           "description": "Password for the PKCS#12 file (omit or empty if the file is unencrypted).",
@@ -6213,7 +6222,8 @@
           "type": [
             "string",
             "null"
-          ]
+          ],
+          "x-faucet-resource": "path"
         },
         "pkcs12_password": {
           "description": "Password for the PKCS#12 file (omit or empty if the file is unencrypted).",
@@ -6664,7 +6674,8 @@
           "type": [
             "string",
             "null"
-          ]
+          ],
+          "x-faucet-resource": "path"
         },
         "pkcs12_password": {
           "description": "Password for the PKCS#12 file (omit or empty if the file is unencrypted).",
@@ -15410,6 +15421,13 @@
                         }
                       ]
                     },
+                    "replication_key_ordered": {
+                      "description": "Declares that the query returns records in ascending `replication_key`\norder. Only then may a run that stops before the last page (`max_pages`,\nor a cursor loop) advance the bookmark: otherwise unread pages could\nhold older keys the next run would skip, so the bookmark stays put.",
+                      "type": [
+                        "boolean",
+                        "string"
+                      ]
+                    },
                     "retry_on_response": {
                       "description": "Responses to treat as throttling and retry — including a `200` whose\nbody reports it (`match_success: true` with\n`body_path: \"$.errors[*].extensions.code\"`, `values: [THROTTLED]`). A\nrule's `backoff_from` reads the wait from the response (`cost_bucket`\nfor a leaky-bucket cost report, or a reset header / body value).\nChecked before the response's `errors[]` are classified; a match\nretries the whole request, so partial `data` is never emitted.",
                       "type": "array",
@@ -17704,6 +17722,16 @@
                       "$ref": "#/$defs/source_sftp__ParquetReadOptions",
                       "default": {}
                     },
+                    "max_object_bytes": {
+                      "default": 2147483648,
+                      "description": "Largest file, in bytes, a format read whole into memory (JSON array,\nraw text, CSV, XML, Excel, Avro, ORC) may reach; a larger one fails\nwith an error naming it instead of exhausting memory. `jsonl` and\n`parquet` stream and are not capped. Default 2 GiB.",
+                      "format": "uint64",
+                      "minimum": 0,
+                      "type": [
+                        "integer",
+                        "string"
+                      ]
+                    },
                     "connect_timeout_secs": {
                       "default": 30,
                       "description": "Seconds the TCP connect, SSH handshake, authentication and the SFTP\nsubsystem start together may take (default 30). A server that accepts and then stalls fails the run\ninstead of hanging it.",
@@ -19513,6 +19541,16 @@
                       "description": "What to do with a value that is not valid UTF-8 (msgpack, gzip, …):\n`base64` (default) emits it base64-encoded, `lossy` replaces invalid\nsequences with U+FFFD, `error` fails the run naming the key.",
                       "$ref": "#/$defs/source_redis__RedisBinary",
                       "default": "base64"
+                    },
+                    "max_tracked_keys": {
+                      "description": "`Keys` mode: how many matched key names the scan remembers to emit a\nkey `SCAN` returns twice only once (16 bytes plus set overhead each,\nabout 48 MB at the default 1,000,000). Past the limit the scan stops\nremembering new keys, so a later duplicate can be emitted again (a\nwarning says so) while memory stays bounded. `0` turns de-duplication\noff.",
+                      "type": [
+                        "integer",
+                        "string"
+                      ],
+                      "format": "uint",
+                      "minimum": 0,
+                      "default": 1000000
                     }
                   }
                 },
@@ -21830,11 +21868,11 @@
                       "$ref": "#/$defs/source_snowflake__AuthSpec"
                     },
                     "query": {
-                      "description": "SQL statement to execute. May contain `${field.path}` placeholders that\nare resolved against the parent-record context at runtime; resolved\nvalues are sent as positional bind parameters appended after\n[`params`](Self::params).",
+                      "description": "SQL statement to execute. May contain `${field.path}` placeholders that\nare resolved against the parent-record context at runtime; resolved\nvalues are sent as positional bind parameters at the position of their\ntoken, interleaved with [`params`](Self::params) in textual order.",
                       "type": "string"
                     },
                     "params": {
-                      "description": "Positional bind parameters for the query, applied in order before any\ncontext-derived values. Snowflake's SQL REST API uses 1-based positional\nbinds in the JSON request body (see the `bindings` field in the\n[SQL API docs](https://docs.snowflake.com/en/developer-guide/sql-api/submitting-requests#using-bind-variables-in-a-statement)).",
+                      "description": "Positional bind parameters for the query, one per `?` marker the query\nholds, in order (a `?` inside a string literal, quoted identifier or\ncomment is not a marker). Snowflake's SQL REST API uses 1-based positional\nbinds in the JSON request body (see the `bindings` field in the\n[SQL API docs](https://docs.snowflake.com/en/developer-guide/sql-api/submitting-requests#using-bind-variables-in-a-statement)).",
                       "type": "array",
                       "items": true,
                       "default": []

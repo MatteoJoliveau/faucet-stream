@@ -9,6 +9,7 @@ description = "Shared credentials and client construction for the faucet-stream 
 readme = "README.md"
 keywords = ["bigquery", "gcp", "etl", "pipeline", "faucet"]
 categories.workspace = true
+exclude = ["tests/fixtures/**"]
 
 [dependencies]
 faucet-core.workspace = true
@@ -19,11 +20,12 @@ reqwest-bq = { package = "reqwest", version = "0.12", default-features = false }
 schemars.workspace = true
 serde = { workspace = true, features = ["derive"] }
 serde_json.workspace = true
-tokio = { workspace = true, features = ["fs"] }
+tokio = { workspace = true, features = ["fs", "rt", "sync", "time"] }
 tracing.workspace = true
 
 [dev-dependencies]
-tokio = { workspace = true, features = ["macros", "rt"] }
+tokio = { workspace = true, features = ["macros", "rt", "rt-multi-thread"] }
+wiremock = "0.6"
 
 [package.metadata.docs.rs]
 all-features = true

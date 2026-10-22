@@ -605,6 +605,30 @@ async fn a_widened_parquet_schema_carries_the_open_file_and_leaves_no_scratch() 
 
 #[cfg(feature = "file-format-parquet")]
 #[tokio::test]
+async fn a_big_integer_and_a_fraction_on_one_page_are_refused() {
+    let dir = tempfile::tempdir().unwrap();
+    let w = local(
+        dir.path(),
+        "one.parquet",
+        WriteSettings::new(FileFormat::Parquet, Compression::None),
+    );
+    let e = w
+        .write_rows(&[json!({"v": 9_007_199_254_740_993_i64}), json!({"v": 1.5})])
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(e.contains("'v'") && e.contains("2^53"), "{e}");
+    // Whole numbers a float holds exactly still mix with fractions.
+    w.write_rows(&[json!({"v": 7}), json!({"v": 1.5})])
+        .await
+        .unwrap();
+    w.flush().await.unwrap();
+    let bytes = std::fs::read(dir.path().join("one.parquet")).unwrap();
+    assert_eq!(parquet_shape(bytes), (2, 1));
+}
+
+#[cfg(feature = "file-format-parquet")]
+#[tokio::test]
 async fn a_float_widening_that_would_round_integers_is_refused() {
     let big = 9_007_199_254_740_993_i64;
     let dir = tempfile::tempdir().unwrap();
@@ -1318,4 +1342,151 @@ fn writer_sink_capabilities_agree_with_the_config_helper() {
             "{config}"
         );
     }
+}
+
+#[cfg(feature = "file-format-csv")]
+#[test]
+fn appending_to_a_headerless_csv_file_is_refused() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut s = WriteSettings::new(FileFormat::Csv, Compression::None);
+    s.opts.csv.has_headers = false;
+    s.if_exists = IfExists::Append;
+    let full = dir.path().join("x.csv");
+    let (_, t) =
+        NameTemplate::from_path(full.to_str().unwrap(), s.format, s.codec, s.rolls_over()).unwrap();
+    let e = s.validate_for(&t).unwrap_err().to_string();
+    assert!(e.contains("without a header row"), "{e}");
+    s.opts.csv.has_headers = true;
+    assert!(s.validate_for(&t).is_ok());
+}
+
+#[cfg(all(feature = "file-format-csv", feature = "encryption"))]
+#[tokio::test]
+async fn an_encrypted_headerless_csv_keeps_its_column_order_after_a_flush() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut s = WriteSettings::new(FileFormat::Csv, Compression::None);
+    s.opts.csv.has_headers = false;
+    let spec: faucet_core::EncryptionSpec = serde_json::from_value(json!({"key": "k"})).unwrap();
+    s.encryption = Some(spec.clone());
+    let w = local(dir.path(), "e.csv", s);
+    w.write_rows(&[json!({"b": 1})]).await.unwrap();
+    w.flush().await.unwrap();
+    w.write_rows(&[json!({"a": 2, "b": 3})]).await.unwrap();
+    w.flush().await.unwrap();
+    let sealed = std::fs::read(dir.path().join("e.csv")).unwrap();
+    let plain = faucet_core::CompiledEncryption::compile(&spec)
+        .unwrap()
+        .decrypt(&sealed)
+        .unwrap();
+    // Row 1 is padded to the grown header; `b` stays the first column.
+    assert_eq!(String::from_utf8(plain).unwrap(), "1,\n3,2\n");
+}
+
+/// Two overwrite runs of one remote output at once: each run's begin, writer
+/// and commit instances share its run token and swap area, so neither begin
+/// drops the other's files and each commit moves in only its own. A tokened
+/// begin drops the untokened area and an area a run abandoned a day ago.
+#[tokio::test]
+async fn concurrent_remote_overwrite_runs_keep_their_own_files() {
+    use faucet_core::idempotency::new_overwrite_run_token;
+    let mem = Arc::new(Mem::default());
+    let tag = overwrite_remote(&mem).template().swap_dir_name();
+    for key in [
+        format!("pre/d/{tag}/part-00001.jsonl"),
+        format!("pre/d/{tag}.run-10000000aaaaaa/part-00001.jsonl"),
+    ] {
+        mem.objects.lock().unwrap().insert(key, b"stale\n".to_vec());
+    }
+    let run = |token: &str| {
+        let w = overwrite_remote(&mem);
+        w.join_overwrite_run(token).unwrap();
+        w
+    };
+    let (a, b) = (new_overwrite_run_token(), new_overwrite_run_token());
+    run(&a).begin_overwrite().await.unwrap();
+    run(&b).begin_overwrite().await.unwrap();
+    let keys = mem.keys();
+    assert!(
+        !keys
+            .iter()
+            .any(|k| k.contains("aaaaaa") || k.contains(&format!("{tag}/"))),
+        "{keys:?}"
+    );
+    let wa = run(&a);
+    wa.write_rows(&rows(2)).await.unwrap();
+    wa.flush().await.unwrap();
+    let wb = run(&b);
+    wb.write_rows(&[json!({"b": 1})]).await.unwrap();
+    wb.flush().await.unwrap();
+    // The untokened status probe sees the live runs' areas.
+    assert!(overwrite_remote(&mem).swap_area_exists().await.unwrap());
+    run(&a).commit_overwrite().await.unwrap();
+    let dest: Vec<String> = mem
+        .keys()
+        .into_iter()
+        .filter(|k| !k.contains(&tag))
+        .collect();
+    assert_eq!(dest, ["pre/d/part-00001.jsonl", "pre/d/part-00002.jsonl"]);
+    run(&b).commit_overwrite().await.unwrap();
+    assert_eq!(mem.keys(), ["pre/d/part-00001.jsonl"]);
+    assert_eq!(
+        mem.objects.lock().unwrap()["pre/d/part-00001.jsonl"],
+        b"{\"b\":1}\n".to_vec()
+    );
+    assert!(!overwrite_remote(&mem).swap_area_exists().await.unwrap());
+    let w = overwrite_remote(&mem);
+    w.join_overwrite_run(&a).unwrap();
+    assert!(w.join_overwrite_run(&b).is_err());
+    assert!(w.join_overwrite_run("../x").is_err());
+}
+
+/// The same race against a local directory.
+#[tokio::test]
+async fn concurrent_local_overwrite_runs_keep_their_own_files() {
+    use faucet_core::idempotency::new_overwrite_run_token;
+    let dir = tempfile::tempdir().unwrap();
+    let mut s = jsonl();
+    s.write_mode = FileWriteMode::Overwrite;
+    let open = || local(dir.path(), "out/data.jsonl", s.clone());
+    let tag = open().template().swap_dir_name();
+    let out = dir.path().join("out");
+    for area in [tag.clone(), format!("{tag}.run-10000000aaaaaa")] {
+        std::fs::create_dir_all(out.join(&area)).unwrap();
+        std::fs::write(out.join(&area).join("data.jsonl"), "stale\n").unwrap();
+    }
+    let run = |token: &str| {
+        let w = open();
+        w.join_overwrite_run(token).unwrap();
+        w
+    };
+    let (a, b) = (new_overwrite_run_token(), new_overwrite_run_token());
+    run(&a).begin_overwrite().await.unwrap();
+    run(&b).begin_overwrite().await.unwrap();
+    assert!(!out.join(&tag).exists());
+    assert!(!out.join(format!("{tag}.run-10000000aaaaaa")).exists());
+    let wa = run(&a);
+    wa.write_rows(&[json!({"a": 1})]).await.unwrap();
+    wa.flush().await.unwrap();
+    let wb = run(&b);
+    wb.write_rows(&[json!({"b": 1})]).await.unwrap();
+    wb.flush().await.unwrap();
+    assert!(open().swap_area_exists().await.unwrap());
+    run(&a).commit_overwrite().await.unwrap();
+    assert_eq!(
+        std::fs::read_to_string(out.join("data.jsonl")).unwrap(),
+        "{\"a\":1}\n"
+    );
+    assert!(out.join(format!("{tag}.run-{b}")).exists());
+    run(&b).commit_overwrite().await.unwrap();
+    assert_eq!(
+        std::fs::read_to_string(out.join("data.jsonl")).unwrap(),
+        "{\"b\":1}\n"
+    );
+    let left: Vec<_> = std::fs::read_dir(&out)
+        .unwrap()
+        .flatten()
+        .map(|e| e.file_name().to_string_lossy().into_owned())
+        .collect();
+    assert_eq!(left, ["data.jsonl"]);
+    assert!(!open().swap_area_exists().await.unwrap());
 }

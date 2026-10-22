@@ -3,7 +3,7 @@
 
 use std::sync::Arc;
 
-use faucet_common_azure::{AzureBackend, build_store};
+use faucet_common_azure::{AzureBackend, build_azure};
 use faucet_common_file::write::{FileSink, SinkIdentity};
 use faucet_core::{FaucetError, FileFormat};
 use serde_json::Value;
@@ -30,17 +30,16 @@ impl AzureBlobSink {
     /// across calls.
     pub async fn new(config: AzureBlobSinkConfig) -> Result<Self, FaucetError> {
         config.validate()?;
-        let store = build_store(&config.connection)?;
+        let store = build_azure(&config.connection)?;
         let write = config.write_config();
         let settings = write.settings()?;
         let (base, template) = write.object_layout(&settings)?;
-        let backend = AzureBackend::builder(store, config.container())
+        let backend = AzureBackend::builder_for(store, config.container())
             .concurrency(config.concurrency)
             .scratch_dir(config.scratch_dir.as_deref().map(std::path::Path::new))
             .build(base, &template)?;
         let identity = AzureIdentity {
-            container: config.container().to_string(),
-            prefix: config.prefix.clone(),
+            dataset_uri: dataset_uri(&config),
         };
         Ok(Self {
             inner: FileSink::build(settings, template, Arc::new(backend), identity)?,
@@ -53,14 +52,70 @@ impl AzureBlobSink {
     }
 }
 
+impl AzureBlobSink {
+    /// Join the overwrite run `token`
+    /// ([`faucet_core::idempotency::OVERWRITE_RUN_KEY`]): every instance of
+    /// one run (begin, writers, commit) stages in that run's own swap area,
+    /// so a concurrent overwrite run of the same output neither drops nor
+    /// moves in the other's files.
+    pub fn with_overwrite_run(mut self, token: &str) -> Result<Self, FaucetError> {
+        self.inner = self.inner.with_overwrite_run(token)?;
+        Ok(self)
+    }
+}
+
 faucet_common_file::delegate_sink!(AzureBlobSink, inner);
 
 /// What the Azure Blob sink supplies to the shared sink; requests, metering
 /// and the preflight probe are the backend's.
 struct AzureIdentity {
-    container: String,
-    prefix: String,
+    dataset_uri: String,
 }
+
+/// The dataset a run writes: `az://<account>/<container>/<prefix><path>`.
+/// Container names are only unique within a storage account, so the account
+/// is part of the identity whenever the config names one (explicitly, in a
+/// connection string, or through the emulator); `path` is the key template.
+fn dataset_uri(config: &AzureBlobSinkConfig) -> String {
+    let key = format!(
+        "{}{}",
+        config.prefix,
+        config.path.as_deref().unwrap_or_default()
+    );
+    match account_name(&config.connection) {
+        Some(account) => format!("az://{account}/{}/{key}", config.container()),
+        None => format!("az://{}/{key}", config.container()),
+    }
+}
+
+/// The storage account a connection addresses, when the config says.
+fn account_name(conn: &faucet_common_azure::AzureConnection) -> Option<String> {
+    if let Some(account) = conn.account.as_deref().map(str::trim)
+        && !account.is_empty()
+    {
+        return Some(account.to_string());
+    }
+    let mut dev_storage = false;
+    if let faucet_common_azure::AzureCredentials::ConnectionString { connection_string } =
+        &conn.auth
+    {
+        for segment in connection_string.split(';') {
+            match segment.trim().split_once('=') {
+                Some((k, v)) if k.trim() == "AccountName" && !v.trim().is_empty() => {
+                    return Some(v.trim().to_string());
+                }
+                Some((k, v)) if k.trim() == "UseDevelopmentStorage" => {
+                    dev_storage = v.trim().eq_ignore_ascii_case("true");
+                }
+                _ => {}
+            }
+        }
+    }
+    (dev_storage || conn.use_emulator).then(|| EMULATOR_ACCOUNT.to_string())
+}
+
+/// The account name of the Azurite storage emulator.
+const EMULATOR_ACCOUNT: &str = "devstoreaccount1";
 
 impl SinkIdentity for AzureIdentity {
     fn connector_name(&self) -> &'static str {
@@ -73,7 +128,7 @@ impl SinkIdentity for AzureIdentity {
     }
 
     fn dataset_uri(&self) -> String {
-        format!("az://{}/{}", self.container, self.prefix)
+        self.dataset_uri.clone()
     }
 }
 
@@ -112,8 +167,38 @@ mod tests {
         let sink = AzureBlobSink::new(config).await.unwrap();
         assert_eq!(sink.connector_name(), "azure-blob");
         assert_eq!(sink.format(), FileFormat::JsonLines);
-        assert_eq!(sink.dataset_uri(), "az://cont/out/");
+        assert_eq!(sink.dataset_uri(), "az://devstoreaccount1/cont/out/");
         assert_eq!(sink.inner.backend().container(), "cont");
         assert!(sink.config_schema().is_object());
+    }
+
+    #[test]
+    fn dataset_uri_names_the_account_and_the_path() {
+        let mut a = AzureBlobSinkConfig::new("exports").account("prodeu");
+        a.path = Some("orders/part-{part}.parquet".into());
+        let mut b = AzureBlobSinkConfig::new("exports").account("produs");
+        b.path = Some("users.csv".into());
+        assert_eq!(
+            dataset_uri(&a),
+            "az://prodeu/exports/orders/part-{part}.parquet"
+        );
+        assert_eq!(dataset_uri(&b), "az://produs/exports/users.csv");
+        assert_ne!(dataset_uri(&a), dataset_uri(&b));
+    }
+
+    #[test]
+    fn account_comes_from_a_connection_string() {
+        let mut c = AzureBlobSinkConfig::new("cont").prefix("p/");
+        c.connection.auth = faucet_common_azure::AzureCredentials::ConnectionString {
+            connection_string: "DefaultEndpointsProtocol=https;AccountName=acct;AccountKey=k=="
+                .into(),
+        };
+        assert_eq!(dataset_uri(&c), "az://acct/cont/p/");
+        c.connection.auth = faucet_common_azure::AzureCredentials::ConnectionString {
+            connection_string: "UseDevelopmentStorage=true".into(),
+        };
+        assert_eq!(dataset_uri(&c), "az://devstoreaccount1/cont/p/");
+        c.connection.auth = faucet_common_azure::AzureCredentials::default();
+        assert_eq!(dataset_uri(&c), "az://cont/p/");
     }
 }

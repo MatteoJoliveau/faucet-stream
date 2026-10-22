@@ -374,7 +374,7 @@ Drive it end-to-end via `Pipeline::new(source, sink).run()`.
 
 ## How it works
 
-1. `MysqlSink::new()` builds a `sqlx::MySqlPool` **once** with the configured `max_connections`.
+1. `MysqlSink::new()` builds a `sqlx::MySqlPool` **once** with the configured `max_connections`. Every pooled connection adds `STRICT_ALL_TABLES` to its session `sql_mode` (keeping the server's other modes), so on a server that is not strict an over-long string, an out-of-range number or non-numeric text for a number column fails the write (or goes to the DLQ) instead of being stored truncated, clamped or as `0`.
 2. `write_batch()` slices the input into `batch_size`-row chunks (or forwards the whole slice when `batch_size = 0`) and inserts each chunk with a single multi-row `INSERT` in its own transaction.
 3. **JSON mode** — each record is serialized to a JSON string: `INSERT INTO t (col) VALUES (?), (?), ...`.
 4. **AutoMap mode** — column names are read from `INFORMATION_SCHEMA.COLUMNS` for the current database; a multi-row INSERT is built dynamically with `?` placeholders, bound as native MySQL types. The column set is the union of record keys across the batch; the INSERT is sub-chunked so `rows × columns` stays under the 65,535-placeholder limit.
@@ -497,7 +497,7 @@ loads anything: InnoDB would re-point the children at the renamed-away table,
 and a `DELETE` would cascade into or be blocked by them.
 
 
-**Leftover staging.** `overwrite_staging_exists()` probes for the `<table>__faucet_ovw` table (or the `<table>__faucet_ovw_old` an interrupted `RENAME` swap leaves) read-only; `faucet status --probe` uses it to report staging a crashed or aborted overwrite left behind (`present` / `absent`). The next overwrite run replaces it.
+**Leftover staging.** `overwrite_staging_exists()` probes for the `<table>__faucet_ovw` table (or the `<table>__faucet_ovw_old` an interrupted `RENAME` swap leaves) read-only; `faucet status --probe` uses it to report staging a crashed or aborted overwrite left behind (`present` / `absent`). Under the CLI each overwrite run stages in its own `<table>__faucet_ovw_<token>` (the run token is shared by the run's begin, writer and commit instances, so a concurrent overwrite of the same table neither drops nor shares it); the probe then also reports any run's tokened staging. A run's begin drops the untokened `<table>__faucet_ovw` and another run's tokened staging only once that run's token is more than 24 hours old (an abandoned crash); a younger one may still be in use and is left alone.
 
 ## Rollback (`faucet rollback`, #706)
 

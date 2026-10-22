@@ -527,6 +527,17 @@ async fn run_expanded_unredacted(
     opts: ExecuteOptions,
 ) -> CliResult<RunSummary> {
     check_budget_sinks(&nodes, opts.budget.as_ref())?;
+    // A root's state key depends only on the run's names, so an invalid one
+    // fails the run before anything is written rather than mid-run.
+    for node in nodes.iter().filter(|n| matches!(n.role, NodeRole::Root)) {
+        let uses_state = node.state.is_some() || opts.state_path_override.is_some();
+        let key = opts
+            .state_scope
+            .key(&opts.pipeline_name)
+            .with_row(node.id.as_str())
+            .render();
+        validate_unit_state_key(&node.id, uses_state, &key)?;
+    }
     if !opts.dry_run {
         check_overwrite_plan(&nodes, &opts).await?;
     }
@@ -751,7 +762,15 @@ async fn run_expanded_unredacted(
                     let uses_state = node.state.is_some() || opts.state_path_override.is_some();
                     let key = opts.state_scope.key(&opts.pipeline_name);
                     let state_key = key.clone().with_row(node.id.as_str()).render();
-                    validate_unit_state_key(&node.id, uses_state, &state_key)?;
+                    if let Err(e) = validate_unit_state_key(&node.id, uses_state, &state_key) {
+                        pre_outcomes.push(synthetic_outcome(
+                            &node.id,
+                            None,
+                            e.to_string(),
+                            classify_error(&e),
+                        ));
+                        continue;
+                    }
                     let legacy_state_keys = node
                         .legacy_state_ids
                         .iter()
@@ -787,10 +806,19 @@ async fn run_expanded_unredacted(
                     } else {
                         // Chained discovery (#531): fan out over the upstream
                         // dimensions, running the enumeration once per tuple.
-                        let resolved = match resolve_product_dims(dims, &discovered, id).await? {
-                            Some(r) => r,
-                            None => {
+                        let resolved = match resolve_product_dims(dims, &discovered, id).await {
+                            Ok(Some(r)) => r,
+                            Ok(None) => {
                                 skipped_subtrees.insert(id.clone());
+                                continue;
+                            }
+                            Err(e) => {
+                                pre_outcomes.push(synthetic_outcome(
+                                    id,
+                                    None,
+                                    e.to_string(),
+                                    classify_error(&e),
+                                ));
                                 continue;
                             }
                         };
@@ -822,10 +850,19 @@ async fn run_expanded_unredacted(
                     // are guaranteed present: each dim is in this row's
                     // `depends_on`, so a skipped/failed dim already skipped this
                     // row above. The guard inside is defensive.
-                    let resolved = match resolve_product_dims(dims, &discovered, id).await? {
-                        Some(r) => r,
-                        None => {
+                    let resolved = match resolve_product_dims(dims, &discovered, id).await {
+                        Ok(Some(r)) => r,
+                        Ok(None) => {
                             skipped_subtrees.insert(id.clone());
+                            continue;
+                        }
+                        Err(e) => {
+                            pre_outcomes.push(synthetic_outcome(
+                                id,
+                                None,
+                                e.to_string(),
+                                classify_error(&e),
+                            ));
                             continue;
                         }
                     };
@@ -893,9 +930,23 @@ async fn run_expanded_unredacted(
                             .as_ref()
                             .map(value_to_string_brief)
                             .unwrap_or_else(|| "(missing)".to_string());
+                        // Every keyless parent would share one bookmark, so a
+                        // later parent would resume from another's watermark.
+                        if let Err(e) =
+                            check_parent_key(&node.id, parent_key, pk_value.as_ref(), uses_state)
+                        {
+                            pre_outcomes.push(synthetic_outcome(
+                                &node.id,
+                                Some(pk_string),
+                                e.to_string(),
+                                InvocationErrorKind::Other,
+                            ));
+                            continue;
+                        }
                         let (state_key, legacy_state_keys) = child_state_keys(
                             opts.state_scope.key(&opts.pipeline_name),
                             &node.id,
+                            pk_value.as_ref(),
                             &pk_string,
                         );
                         if let Err(e) =
@@ -937,7 +988,17 @@ async fn run_expanded_unredacted(
         let (overwrite_groups, overwrite_task_group) = if opts.dry_run {
             (Vec::new(), HashMap::new())
         } else {
-            plan_overwrite_groups(&units, opts.as_ref()).await?
+            let (plan, failed) = plan_overwrite_units(&units, opts.as_ref()).await;
+            if !failed.is_empty() {
+                let keys: HashSet<(String, Option<String>)> =
+                    failed.iter().map(|(k, _)| k.clone()).collect();
+                units.retain(|u| !keys.contains(&(u.node.id.clone(), u.parent_record_key.clone())));
+                for ((row, parent_key), e) in failed {
+                    let kind = classify_error(&e);
+                    pre_outcomes.push(synthetic_outcome(&row, parent_key, e.to_string(), kind));
+                }
+            }
+            plan
         };
         // A group whose begin fails does not run; the error becomes its
         // members' outcome rather than aborting the whole run (#789 CLI-80).
@@ -993,11 +1054,14 @@ async fn run_expanded_unredacted(
         // panic (surfaced as a JoinError, which doesn't carry the unit) can be
         // attributed to the right invocation.
         let mut task_meta: HashMap<tokio::task::Id, (String, Option<String>)> = HashMap::new();
-        for unit in units {
+        for mut unit in units {
             if level_cancel.is_cancelled() && matches!(on_error, OnError::Stop) {
                 break;
             }
             let group_key = (unit.node.id.clone(), unit.parent_record_key.clone());
+            if let Some(gi) = overwrite_task_group.get(&group_key) {
+                inject_overwrite_run(&mut unit.node.sink.config, &overwrite_groups[*gi].run_token);
+            }
             if let Some(err) = overwrite_task_group
                 .get(&group_key)
                 .and_then(|gi| begin_failed.get(gi))
@@ -1211,6 +1275,18 @@ async fn run_expanded_unredacted(
                             group.dest
                         ),
                     );
+                } else if level_cancelled && opts.limit.is_none() {
+                    // A `--limit` sample is discarded on purpose (warned
+                    // above); a stopped or cancelled run's members did not
+                    // land either.
+                    unswapped.insert(
+                        gi,
+                        format!(
+                            "overwrite of '{}' discarded because the run was stopped or \
+                             cancelled before the group finished; the destination is unchanged",
+                            group.dest
+                        ),
+                    );
                 }
             } else if let Err(e) = sink.commit_overwrite().await {
                 tracing::error!(error = %e, dest = %group.dest, "overwrite: commit failed");
@@ -1382,6 +1458,20 @@ struct OverwriteGroup {
     /// only safe swap, so the BigQuery sink is told to stage (`_overwrite_staging`)
     /// rather than load directly. A single-member group is a solo overwrite.
     members: usize,
+    /// The group's overwrite run token
+    /// ([`faucet_core::idempotency::OVERWRITE_RUN_KEY`]): set in `cfg` and in
+    /// every member's sink config, so the begin, writer and commit instances
+    /// of this run share one staging target that no concurrent run touches.
+    run_token: String,
+}
+
+/// Join a sink config to an overwrite run (see [`OverwriteGroup::run_token`]).
+/// An explicit value already in the config wins.
+fn inject_overwrite_run(cfg: &mut Value, token: &str) {
+    if let Value::Object(map) = cfg {
+        map.entry(faucet_core::idempotency::OVERWRITE_RUN_KEY)
+            .or_insert_with(|| Value::String(token.to_string()));
+    }
 }
 
 /// Inject the internal `_overwrite_staging` flag into a **bigquery** sink config
@@ -1584,7 +1674,29 @@ type OverwriteTaskGroup = HashMap<(String, Option<String>), usize>;
 /// (#552) The planned overwrite groups plus the invocation → group-index map.
 type OverwritePlan = (Vec<OverwriteGroup>, OverwriteTaskGroup);
 
+/// [`plan_overwrite_units`] that fails on the first unit whose destination
+/// does not resolve.
+#[cfg(test)]
 async fn plan_overwrite_groups(units: &[Unit], opts: &ExecuteOptions) -> CliResult<OverwritePlan> {
+    let (plan, failed) = plan_overwrite_units(units, opts).await;
+    match failed.into_iter().next() {
+        Some((_, e)) => Err(e),
+        None => Ok(plan),
+    }
+}
+
+/// An invocation, by `(row_id, parent_key)`, whose overwrite destination did
+/// not resolve, with why.
+type OverwritePlanFailure = ((String, Option<String>), CliError);
+
+/// Plan the overwrite groups. A unit whose destination does not resolve (a
+/// parent record missing a field its sink names) is returned as a failure of
+/// that one invocation, not of the whole run.
+async fn plan_overwrite_units(
+    units: &[Unit],
+    opts: &ExecuteOptions,
+) -> (OverwritePlan, Vec<OverwritePlanFailure>) {
+    let mut failed: Vec<OverwritePlanFailure> = Vec::new();
     let mut groups: Vec<OverwriteGroup> = Vec::new();
     let mut task_group: HashMap<(String, Option<String>), usize> = HashMap::new();
     let mut index_by_key: HashMap<String, usize> = HashMap::new();
@@ -1598,7 +1710,13 @@ async fn plan_overwrite_groups(units: &[Unit], opts: &ExecuteOptions) -> CliResu
             continue;
         }
         let kind = unit.node.sink.kind.clone();
-        let cfg = resolved_sink_destination(unit, opts)?;
+        let cfg = match resolved_sink_destination(unit, opts) {
+            Ok(cfg) => cfg,
+            Err(e) => {
+                failed.push(((unit.node.id.clone(), unit.parent_record_key.clone()), e));
+                continue;
+            }
+        };
         // Keyed on the destination identity, not the whole config: two rows
         // on one table that differ only in a write knob (`batch_size`, `key`)
         // stage into the same `{table}__faucet_ovw`, so they must share one
@@ -1628,11 +1746,15 @@ async fn plan_overwrite_groups(units: &[Unit], opts: &ExecuteOptions) -> CliResu
             }
             None => {
                 let gi = groups.len();
+                let run_token = faucet_core::idempotency::new_overwrite_run_token();
+                let mut cfg = cfg;
+                inject_overwrite_run(&mut cfg, &run_token);
                 groups.push(OverwriteGroup {
                     dest: describe_sink_dest(&kind, &cfg),
                     kind: kind.clone(),
                     cfg,
                     members: 1,
+                    run_token,
                 });
                 gi
             }
@@ -1643,7 +1765,7 @@ async fn plan_overwrite_groups(units: &[Unit], opts: &ExecuteOptions) -> CliResu
         }
         task_group.insert((unit.node.id.clone(), unit.parent_record_key.clone()), gi);
     }
-    Ok((groups, task_group))
+    ((groups, task_group), failed)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1949,13 +2071,20 @@ fn boxed_run_one_invocation<'a>(
 /// `None` for preview / `--limit` / shard runs and memory or absent state,
 /// whose markers would describe nothing durable.
 /// A child invocation's state key, and the keys earlier key schemes rendered
-/// for it (the pre-#840 verbatim parent key, #862 M-021).
+/// for it (the pre-#840 verbatim parent key, #862 M-021; the untyped parent
+/// key that let the number `1` and the string `"1"` share a key). `parent` is
+/// the parent record's key value; without one, `fallback` names the key.
 fn child_state_keys(
     base: impl Into<StateKeyBase>,
     row: &str,
-    parent_key: &str,
+    parent: Option<&Value>,
+    fallback: &str,
 ) -> (String, Vec<String>) {
-    let key = base.into().0.with_row(row).with_parent_key(parent_key);
+    let key = base.into().0.with_row(row);
+    let key = match parent {
+        Some(v) => key.with_parent_value(v),
+        None => key.with_parent_key(fallback),
+    };
     (key.render(), key.legacy_renderings())
 }
 
@@ -2040,7 +2169,27 @@ async fn run_discovery(
         .await?;
         source.set_run_clock(opts.clock.to_utc());
         let records = source.fetch_with_context(&binds).await?;
-        let values = crate::discovery_matrix::project_dedup(&records, select);
+        let projection = crate::discovery_matrix::project_dedup_counted(&records, select);
+        if projection.skipped > 0 {
+            if projection.values.is_empty() {
+                tracing::warn!(
+                    row = %node.id,
+                    select,
+                    records = records.len(),
+                    "fan_out.select matched no value in any record: the rows that fan out \
+                     over it run zero times"
+                );
+            } else {
+                tracing::warn!(
+                    row = %node.id,
+                    select,
+                    skipped = projection.skipped,
+                    records = records.len(),
+                    "fan_out.select was missing or null in some records; they were skipped"
+                );
+            }
+        }
+        let values = projection.values;
         let n = values.len();
         if collect {
             // Publish one list per upstream tuple, keyed by the tuple, so a
@@ -2128,6 +2277,25 @@ fn validate_unit_state_key(node_id: &str, uses_state: bool, state_key: &str) -> 
                 reason: e.to_string(),
             }
         })?;
+    }
+    Ok(())
+}
+
+/// A child invocation that keeps state needs its parent record's
+/// `parent_key`: without one its state key would be shared by every keyless
+/// parent, across runs as well as within one.
+fn check_parent_key(
+    row: &str,
+    parent_key: &str,
+    value: Option<&Value>,
+    uses_state: bool,
+) -> CliResult<()> {
+    let keyless = value.is_none_or(|v| v.is_null() || v.as_str().is_some_and(str::is_empty));
+    if uses_state && keyless {
+        return Err(CliError::Config(format!(
+            "row '{row}': a parent record has no `{parent_key}` (missing, null or empty); a child \
+             that keeps state needs it to name its bookmark, so this invocation is skipped"
+        )));
     }
     Ok(())
 }
@@ -2585,7 +2753,8 @@ async fn run_one_invocation(
             crate::sql_bind::bind_source_query(&node.source.kind, &mut source_cfg, &fanout_ctx)?;
         let (source_before, sink_before) = (source_cfg.clone(), sink_cfg.clone());
         resolve_xml_body_fields(&node.source.kind, &mut source_cfg, &fanout_ctx)?;
-        resolve_url_path_fields(&node.source.kind, &mut source_cfg, &fanout_ctx)?;
+        resolve_resource_fields(true, &node.source.kind, &mut source_cfg, &fanout_ctx)?;
+        resolve_resource_fields(false, &node.sink.kind, &mut sink_cfg, &fanout_ctx)?;
         resolve_inplace(&mut source_cfg, &fanout_ctx)?;
         resolve_inplace(&mut sink_cfg, &fanout_ctx)?;
         let is_fanout = |id: &str| fanout_ctx.contains_key(id);
@@ -3740,21 +3909,69 @@ fn resolve_xml_body_fields(
     Ok(())
 }
 
-/// Resolve fan-out tokens in a source's URL path field with percent-encoded
-/// values (#862 L-122): `rest` and `webhook` `path`. The generic pass then
-/// finds no token left in it.
-fn resolve_url_path_fields(
+/// Resolve fan-out tokens in the fields of a connector config that name a
+/// resource, so a value from an upstream record fills one part of it and
+/// cannot re-target it (#862 L-122):
+///
+/// * a request path appended to a base URL (`rest`, `webhook`, `xml` `path`)
+///   and every field the connector schema annotates `x-faucet-resource: url`
+///   take percent-encoded values ([`crate::interpolate::interpolate_record_path`]);
+/// * every field annotated `path` refuses a value holding a path separator or
+///   `..` ([`crate::interpolate::interpolate_record_file_path`]).
+///
+/// The generic pass then finds no token left in them.
+fn resolve_resource_fields(
+    is_source: bool,
     kind: &str,
     cfg: &mut Value,
     ctx: &HashMap<String, Value>,
 ) -> CliResult<()> {
-    if !matches!(kind, "rest" | "webhook") {
-        return Ok(());
-    }
-    if let Some(Value::String(s)) = cfg.pointer_mut("/path") {
+    use faucet_core::resolve::ResourceKind;
+    if is_source
+        && matches!(kind, "rest" | "webhook" | "xml")
+        && let Some(Value::String(s)) = cfg.pointer_mut("/path")
+    {
         *s = crate::interpolate::interpolate_record_path(s, ctx)?;
     }
+    let Some(schema) = connector_schema(is_source, kind) else {
+        return Ok(());
+    };
+    for r in faucet_core::resolve::annotated_resources(&schema, cfg) {
+        if !r.value.contains("${") {
+            continue;
+        }
+        let Some(Value::String(s)) = cfg.pointer_mut(&r.pointer) else {
+            continue;
+        };
+        *s = match r.kind {
+            ResourceKind::Url => crate::interpolate::interpolate_record_path(s, ctx)?,
+            ResourceKind::Path => crate::interpolate::interpolate_record_file_path(s, ctx)?,
+            _ => continue,
+        };
+    }
     Ok(())
+}
+
+/// A connector's config schema, built once per kind.
+fn connector_schema(is_source: bool, kind: &str) -> Option<Arc<Value>> {
+    type Cache = std::sync::RwLock<HashMap<(bool, String), Option<Arc<Value>>>>;
+    static CACHE: std::sync::OnceLock<Cache> = std::sync::OnceLock::new();
+    let cache = CACHE.get_or_init(Default::default);
+    let key = (is_source, kind.to_string());
+    if let Some(hit) = cache.read().ok().and_then(|c| c.get(&key).cloned()) {
+        return hit;
+    }
+    let schema = if is_source {
+        crate::registry::source_schema(kind)
+    } else {
+        crate::registry::sink_schema(kind)
+    }
+    .ok()
+    .map(Arc::new);
+    if let Ok(mut c) = cache.write() {
+        c.insert(key, schema.clone());
+    }
+    schema
 }
 
 /// In-place runtime interpolation against a parent-record context. Walks every
@@ -3808,23 +4025,67 @@ mod xml_body_tests {
     }
 
     #[test]
+    fn xml_url_path_fan_out_values_are_percent_encoded() {
+        let ctx: HashMap<String, Value> =
+            HashMap::from([("p".into(), json!({"acct": "../admin/export?all=1#"}))]);
+        let mut cfg = json!({"path": "/accounts/${p.acct}/invoices"});
+        resolve_resource_fields(true, "xml", &mut cfg, &ctx).unwrap();
+        assert_eq!(
+            cfg["path"],
+            "/accounts/..%2Fadmin%2Fexport%3Fall%3D1%23/invoices"
+        );
+    }
+
+    #[test]
     fn url_path_fan_out_values_are_percent_encoded() {
         let ctx: HashMap<String, Value> =
             HashMap::from([("p".into(), json!({"id": "a/b", "href": "/x/1"}))]);
-        for kind in ["rest", "webhook"] {
+        for kind in ["rest", "webhook", "xml"] {
             let mut cfg = json!({"path": "/items/${p.id}", "base_url": "https://h/${p.id}"});
-            resolve_url_path_fields(kind, &mut cfg, &ctx).unwrap();
-            assert_eq!(cfg["path"], "/items/a%2Fb");
-            assert_eq!(cfg["base_url"], "https://h/${p.id}");
+            resolve_resource_fields(true, kind, &mut cfg, &ctx).unwrap();
+            assert_eq!(cfg["path"], "/items/a%2Fb", "{kind}");
+        }
+        // `base_url` is annotated as a URL on rest and xml.
+        for kind in ["rest", "xml"] {
+            let mut cfg = json!({"path": "/x", "base_url": "https://h/${p.id}?q=1"});
+            resolve_resource_fields(true, kind, &mut cfg, &ctx).unwrap();
+            assert_eq!(cfg["base_url"], "https://h/a%2Fb?q=1", "{kind}");
         }
         let mut whole = json!({"path": "${p.href}"});
-        resolve_url_path_fields("rest", &mut whole, &ctx).unwrap();
+        resolve_resource_fields(true, "rest", &mut whole, &ctx).unwrap();
         assert_eq!(whole["path"], "/x/1");
-        let mut other = json!({"path": "/items/${p.id}"});
-        resolve_url_path_fields("graphql", &mut other, &ctx).unwrap();
-        assert_eq!(other["path"], "/items/${p.id}");
         let mut no_path = json!({"base_url": "https://h"});
-        resolve_url_path_fields("rest", &mut no_path, &ctx).unwrap();
+        resolve_resource_fields(true, "rest", &mut no_path, &ctx).unwrap();
+        // The http sink's `url`.
+        let mut http = json!({"url": "https://hook/${p.id}/events"});
+        resolve_resource_fields(false, "http", &mut http, &ctx).unwrap();
+        assert_eq!(http["url"], "https://hook/a%2Fb/events");
+        let dots = HashMap::from([("p".into(), json!({"id": ".."}))]);
+        let mut cfg = json!({"path": "/accounts/${p.id}/invoices"});
+        assert!(resolve_resource_fields(true, "xml", &mut cfg, &dots).is_err());
+    }
+
+    #[test]
+    fn file_path_fan_out_values_cannot_leave_their_directory() {
+        let ok = HashMap::from([("p".into(), json!({"name": "acme"}))]);
+        let mut cfg = json!({"path": "./out/${p.name}.jsonl"});
+        resolve_resource_fields(false, "file", &mut cfg, &ok).unwrap();
+        assert_eq!(cfg["path"], "./out/acme.jsonl");
+        for bad in ["../../etc/cron.d/x", "a/b", "..", "a\\b", "x\u{0}y"] {
+            let ctx = HashMap::from([("p".into(), json!({ "name": bad }))]);
+            let mut cfg = json!({"path": "./out/${p.name}.jsonl"});
+            assert!(
+                resolve_resource_fields(false, "file", &mut cfg, &ctx).is_err(),
+                "{bad}"
+            );
+        }
+        let whole = HashMap::from([("p".into(), json!({"name": "out/../../x"}))]);
+        let mut cfg = json!({"path": "${p.name}"});
+        assert!(resolve_resource_fields(false, "file", &mut cfg, &whole).is_err());
+        let fine = HashMap::from([("p".into(), json!({"name": "out/x.jsonl"}))]);
+        let mut cfg = json!({"path": "${p.name}"});
+        resolve_resource_fields(false, "file", &mut cfg, &fine).unwrap();
+        assert_eq!(cfg["path"], "out/x.jsonl");
     }
 }
 
@@ -5190,6 +5451,79 @@ mod tests {
         );
     }
 
+    /// An overwrite whose staging is discarded because a sibling failed under
+    /// `on_error: stop` reports its members failed: nothing landed.
+    #[tokio::test]
+    async fn an_overwrite_discarded_by_a_stopped_level_is_not_reported_written() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_url = format!("sqlite:{}", dir.path().join("ow.db").display());
+        seed_table(&db_url).await;
+        std::fs::write(dir.path().join("a.csv"), "id,v\n1,NEW\n").unwrap();
+        let yaml = format!(
+            "version: 1\nname: ow\nexecution:\n  max_concurrent: 1\n  on_error: stop\npipeline:\n  sources:\n    a: {{ type: csv, config: {{ path: '{a}' }} }}\n    b: {{ type: csv, config: {{ path: '{b}' }} }}\n  sinks:\n    t: {{ type: sqlite, config: {{ database_url: '{db_url}', table_name: t, column_mapping: auto_map, write_mode: overwrite }} }}\n    broken: {{ type: sqlite, config: {{ database_url: 'sqlite:{broken}', table_name: t }} }}\nmatrix:\n  - id: a\n    source: {{ ref: a }}\n    sink: {{ ref: t }}\n  - id: b\n    source: {{ ref: b }}\n    sink: {{ ref: broken }}\n",
+            a = dir.path().join("a.csv").display(),
+            b = dir.path().join("a.csv").display(),
+            broken = dir.path().join("no-such-dir").join("x.db").display(),
+        );
+        let cfg = PipelineConfig::from_text(&yaml, &dir.path().join("ow.yaml")).unwrap();
+        let mut opts = exec_opts("ow");
+        opts.execution = cfg.execution.clone();
+        let summary = run_expanded(expand(&cfg).unwrap(), opts).await.unwrap();
+        let b = summary
+            .invocations
+            .iter()
+            .find(|o| o.row_id == "b")
+            .unwrap();
+        assert!(b.error.is_some(), "the sibling must fail: {summary:?}");
+        let a = summary
+            .invocations
+            .iter()
+            .find(|o| o.row_id == "a")
+            .unwrap();
+        assert!(
+            a.error
+                .as_deref()
+                .is_some_and(|e| e.contains("destination is unchanged")),
+            "{a:?}"
+        );
+        assert_eq!(read_table_vs(&db_url).await, vec!["OLD".to_string()]);
+    }
+
+    /// A parent record missing a field an overwrite child's sink names fails
+    /// that one invocation; the run still returns every other outcome.
+    #[tokio::test]
+    async fn an_unresolvable_overwrite_destination_fails_only_its_invocation() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_url = format!("sqlite:{}", dir.path().join("ow.db").display());
+        std::fs::write(
+            dir.path().join("parents.jsonl"),
+            "{\"id\":\"1\",\"region\":\"eu\"}\n{\"id\":\"2\"}\n",
+        )
+        .unwrap();
+        std::fs::write(dir.path().join("child.csv"), "id,v\n1,A\n").unwrap();
+        let yaml = format!(
+            "version: 1\nname: ow\nexecution:\n  max_concurrent: 1\npipeline:\n  sources:\n    parents: {{ type: file, config: {{ path: '{p}' }} }}\n    child: {{ type: csv, config: {{ path: '{c}' }} }}\n  sinks:\n    trash: {{ type: jsonl, config: {{ path: '{t}' }} }}\n    dst: {{ type: sqlite, config: {{ database_url: '{db_url}?mode=rwc', table_name: 't_${{p.region}}', column_mapping: auto_map, create_table: true, write_mode: overwrite }} }}\nmatrix:\n  - id: p\n    source: {{ ref: parents }}\n    sink: {{ ref: trash }}\n  - id: c\n    parent: p\n    parent_key: id\n    source: {{ ref: child }}\n    sink: {{ ref: dst }}\n",
+            p = dir.path().join("parents.jsonl").display(),
+            c = dir.path().join("child.csv").display(),
+            t = dir.path().join("trash.jsonl").display(),
+        );
+        let summary = run_yaml(&yaml, &dir.path().join("ow.yaml")).await;
+        let row = |id: &str, key: Option<&str>| {
+            summary
+                .invocations
+                .iter()
+                .find(|o| o.row_id == id && o.parent_record_key.as_deref() == key)
+                .unwrap_or_else(|| panic!("{id} {key:?}: {summary:?}"))
+        };
+        assert!(row("p", None).error.is_none(), "{summary:?}");
+        assert!(row("c", Some("1")).error.is_none(), "{summary:?}");
+        let failed = row("c", Some("2"));
+        assert!(
+            failed.error.as_deref().unwrap().contains("region"),
+            "{failed:?}"
+        );
+    }
+
     /// The invocation future must stay small enough to be *constructed* on a
     /// 2 MiB thread stack (the CI test threads), whatever passes are compiled
     /// in. A debug build reserves the full size of an awaited future in the
@@ -5560,6 +5894,94 @@ matrix:
         assert_eq!(summary.invocations.len(), 2);
         assert!(out_a.exists());
         assert!(out_b.exists());
+    }
+
+    /// A bookmark a scheme-2 run left under a number parent key's untyped key
+    /// is adopted by its typed key on the first scheme-3 run.
+    #[tokio::test]
+    async fn a_number_parent_keys_scheme_2_bookmark_is_adopted() {
+        use faucet_core::StateStore as _;
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("parents.jsonl"), "{\"id\":1}\n").unwrap();
+        std::fs::write(dir.path().join("child.csv"), "x\nA\n").unwrap();
+        let state = dir.path().join("state");
+        let yaml = format!(
+            r#"version: 1
+pipeline:
+  source: {{ type: file, config: {{ path: {out}/parents.jsonl }} }}
+  sink:   {{ type: jsonl, config: {{ path: {out}/parents-out.jsonl }} }}
+  state:  {{ type: file, config: {{ path: {state} }} }}
+matrix:
+  - id: parents
+  - id: child
+    parent: parents
+    source: {{ type: csv, config: {{ path: {out}/child.csv }} }}
+    sink:   {{ config: {{ path: '{out}/child-${{parents.id}}.jsonl' }} }}
+"#,
+            out = dir.path().display(),
+            state = state.display(),
+        );
+        let store = faucet_core::FileStateStore::new(&state);
+        store
+            .put("adopt::child::1", &json!({"cursor": 7}))
+            .await
+            .unwrap();
+        let cfg = crate::config::parse_with_extension(&yaml, "yaml").unwrap();
+        let summary = run_expanded(expand(&cfg).unwrap(), ExecuteOptions::for_tests("adopt"))
+            .await
+            .unwrap();
+        assert!(!summary.had_failures(), "{summary:?}");
+        assert_eq!(
+            store.get("adopt::child::_n.1").await.unwrap(),
+            Some(json!({"cursor": 7}))
+        );
+        assert_eq!(store.get("adopt::child::1").await.unwrap(), None);
+    }
+
+    #[tokio::test]
+    async fn a_keyless_parent_is_refused_for_a_child_that_keeps_state() {
+        let dir = tempfile::tempdir().unwrap();
+        let parent_csv = dir.path().join("parents.csv");
+        let child_csv = dir.path().join("child.csv");
+        std::fs::write(&parent_csv, "id,name\n1,alice\n,bob\n").unwrap();
+        std::fs::write(&child_csv, "x\nA\n").unwrap();
+        let yaml = format!(
+            r#"version: 1
+pipeline:
+  source: {{ type: csv, config: {{ path: {parent} }} }}
+  sink:   {{ type: jsonl, config: {{ path: {out}/parents.jsonl }} }}
+  state:  {{ type: file, config: {{ path: {out}/state }} }}
+matrix:
+  - id: parents
+  - id: child
+    parent: parents
+    source: {{ config: {{ path: {child} }} }}
+    sink:   {{ config: {{ path: '{out}/child-${{parents.id}}.jsonl' }} }}
+"#,
+            parent = parent_csv.display(),
+            child = child_csv.display(),
+            out = dir.path().display(),
+        );
+        let cfg = crate::config::parse_with_extension(&yaml, "yaml").unwrap();
+        let summary = run_expanded(expand(&cfg).unwrap(), ExecuteOptions::for_tests("keyless"))
+            .await
+            .unwrap();
+        let children: Vec<_> = summary
+            .invocations
+            .iter()
+            .filter(|i| i.row_id == "child")
+            .collect();
+        assert_eq!(children.len(), 2, "{summary:?}");
+        assert_eq!(children.iter().filter(|i| i.error.is_none()).count(), 1);
+        let refused = children.iter().find(|i| i.error.is_some()).unwrap();
+        assert!(
+            refused.error.as_deref().unwrap().contains("has no `id`"),
+            "{refused:?}"
+        );
+        assert!(check_parent_key("c", "id", None, false).is_ok());
+        assert!(check_parent_key("c", "id", Some(&Value::Null), true).is_err());
+        assert!(check_parent_key("c", "id", Some(&serde_json::json!("")), true).is_err());
+        assert!(check_parent_key("c", "id", Some(&serde_json::json!(7)), true).is_ok());
     }
 
     #[tokio::test]
@@ -7192,6 +7614,48 @@ matrix:
         assert!(cfg.get("_overwrite_staging").is_none());
     }
 
+    /// Every overwrite group carries a fresh run token in its lifecycle
+    /// config, and a second plan of the same destination (another run) gets
+    /// another one, so two concurrent runs never share staging.
+    #[tokio::test]
+    async fn overwrite_groups_carry_a_per_run_token() {
+        use faucet_core::idempotency::{OVERWRITE_RUN_KEY, is_overwrite_run_token};
+        let dir = tempfile::tempdir().unwrap();
+        let opts = exec_opts("t");
+        let mk = |node: &ExpandedNode, pid: &str, id: i64| Unit {
+            node: node.clone(),
+            parent_record: Some(std::sync::Arc::new(json!({ "id": id }))),
+            state_key: format!("t::c::{pid}"),
+            parent_record_key: Some(pid.to_string()),
+            product_ctx: None,
+            legacy_state_keys: Vec::new(),
+        };
+        let shared = overwrite_child_node(dir.path(), "orders");
+        let units = vec![mk(&shared, "1", 1), mk(&shared, "2", 2)];
+        let (groups, task_group) = plan_overwrite_groups(&units, &opts).await.unwrap();
+        assert_eq!((groups.len(), task_group.len()), (1, 2));
+        let token = groups[0].run_token.clone();
+        assert!(is_overwrite_run_token(&token), "{token}");
+        assert_eq!(groups[0].cfg[OVERWRITE_RUN_KEY], json!(token));
+        let (again, _) = plan_overwrite_groups(&units, &opts).await.unwrap();
+        assert_ne!(again[0].run_token, token, "each run gets its own token");
+
+        // The members are joined to the same run; an explicit value wins.
+        let mut cfg = shared.sink.config.clone();
+        inject_overwrite_run(&mut cfg, &token);
+        assert_eq!(cfg[OVERWRITE_RUN_KEY], json!(token));
+        inject_overwrite_run(&mut cfg, &again[0].run_token);
+        assert_eq!(cfg[OVERWRITE_RUN_KEY], json!(token));
+        let mut not_object = json!(null);
+        inject_overwrite_run(&mut not_object, &token);
+        assert!(not_object.is_null());
+        // The token is not part of the destination identity.
+        assert_eq!(
+            crate::destination::identity("sqlite", &cfg),
+            crate::destination::identity("sqlite", &shared.sink.config)
+        );
+    }
+
     #[tokio::test]
     async fn plan_overwrite_groups_counts_members() {
         // Two invocations to the same destination ⇒ one group, members == 2
@@ -7435,14 +7899,29 @@ matrix:
 
     #[test]
     fn child_state_keys_name_the_pre_840_key_only_when_it_differs() {
-        let (cur, legacy) = child_state_keys("p", "kid", "42");
+        let (cur, legacy) = child_state_keys("p", "kid", Some(&json!("42")), "42");
         assert_eq!((cur.as_str(), legacy.len()), ("p::kid::42", 0));
         let long = "a".repeat(80);
-        let (cur, legacy) = child_state_keys("p", "kid", &long);
+        let (cur, legacy) = child_state_keys("p", "kid", Some(&json!(long)), &long);
         assert_ne!(cur, format!("p::kid::{long}"));
         assert_eq!(legacy, vec![format!("p::kid::{long}")]);
-        let (_, legacy) = child_state_keys("p", "kid", "a b");
+        let (_, legacy) = child_state_keys("p", "kid", Some(&json!("a b")), "a b");
         assert!(legacy.is_empty(), "the verbatim form was never a valid key");
+    }
+
+    #[test]
+    fn number_and_string_parent_keys_get_different_child_keys() {
+        let (num, legacy) = child_state_keys("p", "kid", Some(&json!(1)), "1");
+        let (text, _) = child_state_keys("p", "kid", Some(&json!("1")), "1");
+        assert_ne!(num, text);
+        assert_eq!(num, "p::kid::_n.1");
+        assert_eq!(
+            legacy,
+            vec!["p::kid::1".to_string()],
+            "migrates from scheme 2"
+        );
+        let (none, _) = child_state_keys("p", "kid", None, "(missing)");
+        assert!(none.starts_with("p::kid::"), "{none}");
     }
 
     #[tokio::test]

@@ -545,7 +545,7 @@ replacing the rows would change the referencing table.
 table name, so it can never collide with the target or with each other.
 
 
-**Leftover staging.** `overwrite_staging_exists()` probes for the `<table>__faucet_ovw` table read-only; `faucet status --probe` uses it to report staging a crashed or aborted overwrite left behind (`present` / `absent`). The next overwrite run replaces it.
+**Leftover staging.** `overwrite_staging_exists()` probes for the `<table>__faucet_ovw` table read-only; `faucet status --probe` uses it to report staging a crashed or aborted overwrite left behind (`present` / `absent`). Under the CLI each overwrite run stages in its own `<table>__faucet_ovw_<token>` (the run token is shared by the run's begin, writer and commit instances, so a concurrent overwrite of the same table neither drops nor shares it); the probe then also reports any run's tokened staging. A run's begin drops the untokened `<table>__faucet_ovw` and another run's tokened staging only once that run's token is more than 24 hours old (an abandoned crash); a younger one may still be in use and is left alone.
 
 ## Rollback (`faucet rollback`, #706)
 
@@ -558,7 +558,9 @@ table as `<table>__faucet_prev` (a `CREATE TABLE … AS SELECT` inside the swap 
 deletes the run's appended rows, restores the journaled before-images, or
 swaps the previous table back — refusing (unless `--force`) when a later run
 changed the same keys — and rewinds the row's bookmark and exactly-once
-watermark. Sink hooks: `supports_rollback`, `rollback_run`, `forget_run`,
+watermark. For a scoped overwrite (`scope:`) only the window is checked and
+restored: rows outside it keep their earlier run ids without blocking the
+rollback, and stay as they are. Sink hooks: `supports_rollback`, `rollback_run`, `forget_run`,
 `rewind_commit_token`, `readback_source` (the `postgres` source config
 `faucet verify` reads the destination back with). See the [rollback
 cookbook](https://faucet-hq.github.io/faucet-stream/cookbook/rollback.html).

@@ -119,16 +119,21 @@ pub enum PaginationStyle {
     /// ([`Offset`](Self::Offset)) or a cursor token
     /// ([`CursorInBody`](Self::CursorInBody)). Each request sends
     /// `body[offset_field] = <offset>` and `body[limit_field] = <limit>`; the
-    /// offset advances by the page's record count. With `stop_when_short`
-    /// (default `true`) a page shorter than `limit` ends pagination; a zero-record
-    /// page always ends it, and a repeated identical page trips a loop guard.
+    /// offset advances by the page's record count (or by `rows_path`, which
+    /// is required when `records_path` fans out to nested children or
+    /// `record_ancestors` is set, as for [`Offset`](Self::Offset)). A
+    /// zero-record page ends pagination, a readable `total_path` ends it once
+    /// the offset reaches the total, and a repeated identical page trips a
+    /// loop guard. With `stop_when_short` (default `false`) a page shorter than
+    /// `limit` also ends it — only for servers that never cap a page below
+    /// `limit`, since a capped page would end the run with rows unread.
     /// Either field may be a JSON Pointer (`/page/offset`) for a nested
     /// location, with the same rules as `CursorInBody.body_cursor_field`.
     OffsetInBody {
         offset_field: String,
         limit_field: String,
         limit: usize,
-        #[serde(default = "default_true")]
+        #[serde(default)]
         stop_when_short: bool,
         /// JSONPath whose matches are counted to advance the offset and detect a
         /// short page, instead of the extracted record count — for report APIs
@@ -148,6 +153,14 @@ pub enum PaginationStyle {
     /// `stop_when_short` (default `true`) a page shorter than `page_size` ends
     /// pagination; a zero-record page always ends it, and a non-advancing cursor
     /// trips a loop guard.
+    ///
+    /// With the default exclusive bound the server must return rows strictly
+    /// past the cursor, so `field` must be unique: rows sharing the boundary
+    /// value at a page cut are never read (a warning names it when a page ends
+    /// on such a tie). Set `inclusive: true` for a server that returns rows
+    /// `>=` the cursor: rows already emitted at the boundary value are dropped
+    /// by whole-record fingerprint, so a non-unique field (`updated_at`) reads
+    /// every row exactly once.
     RecordFieldCursor {
         /// Record field whose value drives the cursor.
         field: String,
@@ -164,6 +177,10 @@ pub enum PaginationStyle {
         stop_when_short: bool,
         /// Expected page size, used for the short-page stop check.
         page_size: usize,
+        /// The server returns rows `>=` the cursor (default `false`: strictly
+        /// greater/less). Required for a non-unique cursor field.
+        #[serde(default)]
+        inclusive: bool,
     },
 }
 
@@ -202,6 +219,49 @@ pub struct PaginationState {
     /// (request ids, timestamps) would never repeat. Consumed per page.
     #[doc(hidden)]
     pub current_records_fingerprint: Option<u64>,
+    /// Every token / next-link this pass has followed. The loop guards stop on
+    /// a repeat of **any** earlier value, not just the previous one, so a
+    /// server cycling A→B→A cannot paginate forever.
+    #[doc(hidden)]
+    pub seen_tokens: std::collections::HashSet<String>,
+    /// Every page fingerprint the content-stagnation guards have seen this
+    /// pass (same reason as [`Self::seen_tokens`]).
+    #[doc(hidden)]
+    pub seen_page_fingerprints: std::collections::HashSet<u64>,
+    /// [`PaginationStyle::RecordFieldCursor`] with `inclusive`: how many copies
+    /// of each record (by fingerprint) were already emitted at the current
+    /// cursor value, so the next `>=` page drops exactly those.
+    #[doc(hidden)]
+    pub record_cursor_boundary: std::collections::HashMap<String, usize>,
+}
+
+impl PaginationState {
+    /// Record `token` as followed; `true` when it was already followed this
+    /// pass (a pagination cycle).
+    fn token_repeats(&mut self, token: Option<&String>) -> bool {
+        match token {
+            Some(t) => {
+                Some(t) == self.previous_token.as_ref() || !self.seen_tokens.insert(t.clone())
+            }
+            None => false,
+        }
+    }
+
+    /// Record the URL just fetched (when the transport tagged it), so a next
+    /// link pointing back at an earlier page is caught too.
+    fn note_request_url(&mut self, headers: &HeaderMap) {
+        if let Some(url) = headers
+            .get(crate::url_util::REQUEST_URL_HEADER)
+            .and_then(|v| v.to_str().ok())
+        {
+            self.seen_tokens.insert(url.to_owned());
+        }
+    }
+
+    /// Record `fp` as seen; `true` when an earlier page this pass had it.
+    fn page_repeats(&mut self, fp: u64) -> bool {
+        self.previous_page_fingerprint == Some(fp) || !self.seen_page_fingerprints.insert(fp)
+    }
 }
 
 /// Fingerprint of a page's extracted records for
@@ -307,8 +367,8 @@ impl PaginationStyle {
     /// Advance pagination state based on the response body and headers.
     /// Returns `true` if there is a next page to fetch.
     ///
-    /// Includes **loop detection**: if a cursor or next-link value is identical
-    /// to the previous page's value, pagination stops with a warning instead of
+    /// Includes **loop detection**: if a cursor or next-link value repeats one
+    /// already followed this pass (or a page repeats an earlier page's content), pagination stops with a warning instead of
     /// looping forever.
     pub fn advance(
         &self,
@@ -324,7 +384,8 @@ impl PaginationStyle {
             } => {
                 let has_next = cursor::advance(body, next_token_path, &mut state.next_token)?;
                 if has_next {
-                    if state.next_token == state.previous_token {
+                    let next = state.next_token.clone();
+                    if state.token_repeats(next.as_ref()) {
                         tracing::warn!(
                             "pagination loop detected: cursor {:?} repeated — stopping",
                             state.next_token
@@ -342,7 +403,8 @@ impl PaginationStyle {
                 // from `Cursor` is where the cursor is applied (body, not param).
                 let has_next = cursor::advance(body, next_token_path, &mut state.next_token)?;
                 if has_next {
-                    if state.next_token == state.previous_token {
+                    let next = state.next_token.clone();
+                    if state.token_repeats(next.as_ref()) {
                         tracing::warn!(
                             "pagination loop detected: body cursor {:?} repeated — stopping",
                             state.next_token
@@ -356,7 +418,8 @@ impl PaginationStyle {
             PaginationStyle::LinkHeader => match link_header::extract_next_link(headers) {
                 Some(link) => {
                     let link = resolve_against_request(headers, &link)?;
-                    if Some(&link) == state.previous_token.as_ref() {
+                    state.note_request_url(headers);
+                    if state.token_repeats(Some(&link)) {
                         tracing::warn!(
                             "pagination loop detected: link {link:?} repeated — stopping"
                         );
@@ -383,7 +446,9 @@ impl PaginationStyle {
                                 ))
                             })?);
                     }
-                    if state.next_link == state.previous_token {
+                    state.note_request_url(headers);
+                    let next = state.next_link.clone();
+                    if state.token_repeats(next.as_ref()) {
                         tracing::warn!(
                             "pagination loop detected: next_link {:?} repeated — stopping",
                             state.next_link
@@ -404,7 +469,7 @@ impl PaginationStyle {
                 // would loop until `max_pages` and duplicate records. Stop if
                 // this page's body is identical to the previous one (#78/#15).
                 let fp = page_fingerprint(state, body);
-                if state.previous_page_fingerprint == Some(fp) {
+                if state.page_repeats(fp) {
                     tracing::warn!(
                         "pagination loop detected: PageNumber returned an identical page — stopping"
                     );
@@ -457,7 +522,7 @@ impl PaginationStyle {
                 // be mistaken for stagnation.
                 if has_next && total_path.is_none() {
                     let fp = page_fingerprint(state, body);
-                    if state.previous_page_fingerprint == Some(fp) {
+                    if state.page_repeats(fp) {
                         tracing::warn!(
                             "pagination loop detected: Offset returned an identical page \
                              (server likely ignoring the offset parameter) — stopping"
@@ -502,7 +567,7 @@ impl PaginationStyle {
                 // Content-stagnation guard: a server ignoring the body offset
                 // would re-return the identical page forever.
                 let fp = page_fingerprint(state, body);
-                if state.previous_page_fingerprint == Some(fp) {
+                if state.page_repeats(fp) {
                     tracing::warn!(
                         "pagination loop detected: OffsetInBody returned an identical page \
                          (server likely ignoring the body offset) — stopping"
@@ -571,6 +636,71 @@ impl PaginationStyle {
                 });
             }
         }
+    }
+
+    /// [`PaginationStyle::RecordFieldCursor`] keyset step for one page: drop
+    /// the rows an `inclusive` server re-returned at the boundary value, move
+    /// the cursor, and remember the rows now emitted at the new boundary.
+    /// Returns the records to emit; every other style gets `records` back
+    /// unchanged. Call with the page's records *before*
+    /// [`advance`](Self::advance) (which still takes the server's row count).
+    pub fn keyset_page(&self, mut records: Vec<Value>, state: &mut PaginationState) -> Vec<Value> {
+        let PaginationStyle::RecordFieldCursor {
+            field,
+            inclusive,
+            page_size,
+            ..
+        } = self
+        else {
+            return records;
+        };
+        let before = state.record_field_cursor.clone();
+        if *inclusive && let Some(boundary) = &before {
+            records.retain(|r| {
+                if r.get(field) != Some(boundary) {
+                    return true;
+                }
+                let fp = faucet_core::replication::cursor::row_fingerprint(r);
+                match state.record_cursor_boundary.get_mut(&fp) {
+                    Some(n) if *n > 0 => {
+                        *n -= 1;
+                        false
+                    }
+                    _ => true,
+                }
+            });
+        }
+        self.update_record_cursor(&records, state);
+        let after = state.record_field_cursor.clone();
+        let Some(cursor) = after else {
+            return records;
+        };
+        if *inclusive {
+            if before.as_ref() != Some(&cursor) {
+                state.record_cursor_boundary.clear();
+            }
+            for r in records.iter().filter(|r| r.get(field) == Some(&cursor)) {
+                *state
+                    .record_cursor_boundary
+                    .entry(faucet_core::replication::cursor::row_fingerprint(r))
+                    .or_insert(0) += 1;
+            }
+        } else if records.len() >= *page_size
+            && records
+                .iter()
+                .filter(|r| r.get(field) == Some(&cursor))
+                .count()
+                > 1
+        {
+            tracing::warn!(
+                field = %field,
+                "rest: RecordFieldCursor page ended on several rows sharing the cursor value; \
+                 with an exclusive bound, more rows at that value are never read — use a \
+                 unique cursor field or set `inclusive: true` for a server that returns \
+                 rows >= the cursor"
+            );
+        }
+        records
     }
 
     /// The JSONPath a cursor style reads its next-page token from
@@ -692,6 +822,33 @@ mod new_style_tests {
             rows_path: None,
             total_path: None,
         }
+    }
+
+    #[test]
+    fn an_absent_token_never_repeats() {
+        let mut state = PaginationState::default();
+        assert!(!state.token_repeats(None));
+        assert!(!state.token_repeats(None));
+        let t = "a".to_string();
+        assert!(!state.token_repeats(Some(&t)));
+        assert!(state.token_repeats(Some(&t)));
+    }
+
+    #[test]
+    fn keyset_page_without_the_cursor_field_keeps_the_page_and_cursor() {
+        let style = PaginationStyle::RecordFieldCursor {
+            field: "updated_at".into(),
+            into: RecordCursorTarget::default(),
+            param: "since".into(),
+            agg: RecordCursorAgg::default(),
+            stop_when_short: true,
+            page_size: 2,
+            inclusive: true,
+        };
+        let mut state = PaginationState::default();
+        let page = vec![json!({"id": 1}), json!({"id": 2})];
+        assert_eq!(style.keyset_page(page.clone(), &mut state), page);
+        assert_eq!(state.record_field_cursor, None);
     }
 
     #[test]
@@ -822,6 +979,7 @@ mod new_style_tests {
             agg: RecordCursorAgg::Max,
             stop_when_short: true,
             page_size: 2,
+            inclusive: false,
         }
     }
 
@@ -906,6 +1064,7 @@ mod new_style_tests {
             agg: RecordCursorAgg::Max,
             stop_when_short: false,
             page_size: 2,
+            inclusive: false,
         };
         let mut state = PaginationState::default();
         let short = vec![json!({"JournalNumber": 9})];
@@ -932,6 +1091,7 @@ mod new_style_tests {
             agg: RecordCursorAgg::Min,
             stop_when_short: true,
             page_size: 2,
+            inclusive: false,
         };
         let mut state = PaginationState::default();
         style.update_record_cursor(&[json!({"seq": 10}), json!({"seq": 4})], &mut state);

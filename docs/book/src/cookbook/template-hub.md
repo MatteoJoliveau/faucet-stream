@@ -232,8 +232,10 @@ write_mode_aliases:
 The composer records the substitution (`overwrite→append` in `faucet hub
 check`) and validates it against the connector registry: the target mode must
 be one the connector supports, an alias for a natively supported mode is
-refused as redundant, and keyed modes (`upsert`, `delete`) cannot be aliased —
-only a sink that dedups by key can honour them. `overwrite: append` is refused
+refused as redundant, and `overwrite: append` is the only alias: keyed modes
+(`upsert`, `delete`) can neither be aliased — only a sink that dedups by key can
+honour them — nor be an alias's target (`overwrite: delete` would delete
+exactly the rows each run fetched), and no mode may stand in for `overwrite`. `overwrite: append` is refused
 for a built-in sink that, as configured, keeps what earlier runs wrote (an
 appending file, a queue, an object store with unique names, a warehouse): every
 overwrite stream would re-append the whole table on each run. A plugin sink is
@@ -496,9 +498,11 @@ org exactly like any other namespace, and marked **official**. A bare name is
 shorthand for it: `--source erp` means `faucet-hq/erp`; when there is
 none, the CLI lists the community variants instead of guessing.
 
-A community template — any owner other than `faucet-hq`, and any template at
-all from a hub other than the `faucet-hq/template-hub` repository, whatever
-its `owner:` says — may not read the machine it runs on: one that uses `${env:…}`, `${file:…}` or a secret-manager
+A community template — any owner other than `faucet-hq`, any file outside the
+catalog's `faucet-hq/` directory, and any template at all from a hub other
+than the `faucet-hq/template-hub` repository at its default branch (a pinned
+`@<ref>` or `/<path>` is not reviewed), whatever its `owner:` says — may not
+read the machine it runs on: one that uses `${env:…}`, `${file:…}` or a secret-manager
 directive is refused, since it could send a credential to a URL it chooses.
 Hand it credentials through its declared params (`--param`, `--param-env`),
 or review it and pass `--trust <owner>` (or `--trust <owner/name>`).

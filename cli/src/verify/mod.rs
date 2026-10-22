@@ -290,6 +290,17 @@ pub async fn verify_node_guarded(
     };
     #[cfg(not(feature = "masking"))]
     let masking: Option<()> = None;
+    // A backend digests the raw source rows, but the destination holds them
+    // masked, so a masked row's server digests could never agree: every range
+    // would bisect to its leaves. Digest client-side, over masked rows.
+    #[cfg(feature = "masking")]
+    let server_columns = match &masking {
+        Some(m) if !m.is_empty() => {
+            tracing::info!(row = %node.id, "verify: masking rewrites this row; digesting client-side");
+            None
+        }
+        _ => server_columns,
+    };
 
     let mut session = Session {
         source: source.as_ref(),
@@ -316,30 +327,30 @@ pub async fn verify_node_guarded(
         session.verify_full().await?;
         "full"
     };
-    // Cap what is reported; the tally still counts everything found.
     let total = session.report.differences.len();
-    if total > spec.max_differences {
-        session.report.differences.truncate(spec.max_differences);
-        session.report.truncated = true;
-    }
     let mut report = session.report;
     let source_rows = session.source_rows;
 
+    // The repair covers every difference found; `max_differences` caps only
+    // what is reported, below.
     let repair = inputs.repair || spec.repair;
     if repair && !report.differences.is_empty() {
-        let allow_delete = inputs.allow_delete || spec.allow_delete;
         let (ups, dels) = repair_node(
             node,
             &key,
             &report.differences,
             &source_rows,
-            allow_delete,
+            spec,
             inputs,
             guards,
         )
         .await?;
         report.repaired_upserts = Some(ups);
         report.repaired_deletes = Some(dels);
+    }
+    if total > spec.max_differences {
+        report.differences.truncate(spec.max_differences);
+        report.truncated = true;
     }
 
     metrics::record(
@@ -445,23 +456,41 @@ impl Session<'_> {
         })
     }
 
+    /// Rows either side may still fetch under `max_rows_scanned`.
+    fn budget_left(&self) -> Option<u64> {
+        self.max_rows.map(|cap| {
+            cap.saturating_sub(self.report.rows_fetched_source + self.report.rows_fetched_dest)
+        })
+    }
+
     /// Fetch the source side of `range` (whole dataset for `ALL`), shaped as
-    /// the pipeline would write it.
-    async fn fetch_source(&mut self, range: &KeyRange) -> CliResult<Vec<Value>> {
-        let rows = fetch_range(self.source, range, self.key, "source").await?;
+    /// the pipeline would write it. `None` = the scan budget ran out reading
+    /// it (the report is marked truncated).
+    async fn fetch_source(&mut self, range: &KeyRange) -> CliResult<Option<Vec<Value>>> {
+        let left = self.budget_left();
+        let (rows, complete) = fetch_range(self.source, range, self.key, "source", left).await?;
         self.report.rows_fetched_source += rows.len() as u64;
+        if !complete {
+            self.report.truncated = true;
+            return Ok(None);
+        }
         #[cfg(feature = "masking")]
         let rows = match self.masking {
             Some(m) => faucet_core::apply_masking(rows, m).records,
             None => rows,
         };
-        Ok(rows)
+        Ok(Some(rows))
     }
 
-    async fn fetch_dest(&mut self, range: &KeyRange) -> CliResult<Vec<Value>> {
-        let rows = fetch_range(self.dest, range, self.key, "destination").await?;
+    async fn fetch_dest(&mut self, range: &KeyRange) -> CliResult<Option<Vec<Value>>> {
+        let left = self.budget_left();
+        let (rows, complete) = fetch_range(self.dest, range, self.key, "destination", left).await?;
         self.report.rows_fetched_dest += rows.len() as u64;
-        Ok(rows)
+        if !complete {
+            self.report.truncated = true;
+            return Ok(None);
+        }
+        Ok(Some(rows))
     }
 
     /// Whole-dataset comparison: one fetch of each side, one keyed diff.
@@ -470,10 +499,16 @@ impl Session<'_> {
         self.diff_leaf(&KeyRange::ALL).await
     }
 
-    /// Fetch both sides of a leaf range and record the keyed differences.
+    /// Fetch both sides of a leaf range and record the keyed differences. A
+    /// side cut short by `max_rows_scanned` is not diffed: a partial set would
+    /// report the unread rows as missing.
     async fn diff_leaf(&mut self, range: &KeyRange) -> CliResult<()> {
-        let src = self.fetch_source(range).await?;
-        let dst = self.fetch_dest(range).await?;
+        let Some(src) = self.fetch_source(range).await? else {
+            return Ok(());
+        };
+        let Some(dst) = self.fetch_dest(range).await? else {
+            return Ok(());
+        };
         let diffs = diff_rows(&src, &dst, self.key, self.columns, self.exclude, self.norm);
         if diffs.is_empty() {
             return Ok(());
@@ -559,8 +594,12 @@ impl Session<'_> {
                     .ok_or_else(|| FaucetError::Source("range digest vanished".into()))?;
                 (a.same(&b), a.rows.max(b.rows), a.bounds_union(&b))
             } else {
-                let a = self.client_digest(&range, true).await?;
-                let b = self.client_digest(&range, false).await?;
+                let (Some(a), Some(b)) = (
+                    self.client_digest(&range, true).await?,
+                    self.client_digest(&range, false).await?,
+                ) else {
+                    break;
+                };
                 (a.same(&b), a.rows.max(b.rows), a.bounds_union(&b))
             };
             if same {
@@ -583,11 +622,14 @@ impl Session<'_> {
         &mut self,
         range: &KeyRange,
         is_source: bool,
-    ) -> CliResult<faucet_core::diff::ContentDigest> {
+    ) -> CliResult<Option<faucet_core::diff::ContentDigest>> {
         let rows = if is_source {
             self.fetch_source(range).await?
         } else {
             self.fetch_dest(range).await?
+        };
+        let Some(rows) = rows else {
+            return Ok(None);
         };
         let mut acc = DigestAccumulator::new();
         for r in &rows {
@@ -596,17 +638,21 @@ impl Session<'_> {
                 faucet_core::diff::key_int(r, self.key),
             );
         }
-        Ok(acc.finish())
+        Ok(Some(acc.finish()))
     }
 }
 
-/// Read one key range from a source. `ALL` clears any applied range.
+/// Read one key range from a source. `ALL` clears any applied range. With a
+/// `limit` the read is streamed and stops past it; the flag says whether the
+/// range was read completely.
 async fn fetch_range(
     src: &dyn Source,
     range: &KeyRange,
     key: &[String],
     side: &str,
-) -> CliResult<Vec<Value>> {
+    limit: Option<u64>,
+) -> CliResult<(Vec<Value>, bool)> {
+    use futures::StreamExt as _;
     if key.len() == 1 && (range.lo.is_some() || range.hi.is_some()) {
         src.apply_shard(&range.to_shard(&key[0]))
             .await
@@ -614,11 +660,26 @@ async fn fetch_range(
                 CliError::Config(format!("verify: narrowing the {side} to {range}: {e}"))
             })?;
     }
-    src.fetch_all().await.map_err(|e| {
+    let read_err = |e: FaucetError| {
         CliError::Faucet(FaucetError::Source(format!(
             "verify: reading the {side}: {e}"
         )))
-    })
+    };
+    let Some(limit) = limit else {
+        return Ok((src.fetch_all().await.map_err(read_err)?, true));
+    };
+    let context = HashMap::new();
+    let batch = usize::try_from(limit.clamp(1, 10_000)).unwrap_or(10_000);
+    let mut pages = src.stream_pages(&context, batch);
+    let mut rows = Vec::new();
+    while let Some(page) = pages.next().await {
+        rows.extend(page.map_err(read_err)?.records);
+        if rows.len() as u64 > limit {
+            rows.truncate(usize::try_from(limit).unwrap_or(usize::MAX));
+            return Ok((rows, false));
+        }
+    }
+    Ok((rows, true))
 }
 
 /// The key range a PK shard descriptor covers (the whole space for a
@@ -701,10 +762,12 @@ async fn repair_node(
     key: &[String],
     differences: &[Difference],
     source_rows: &HashMap<String, Value>,
-    allow_delete: bool,
+    spec: &VerifySpec,
     inputs: &VerifyInputs,
     guards: &RunGuards,
 ) -> CliResult<(u64, u64)> {
+    let allow_delete = inputs.allow_delete || spec.allow_delete;
+    let norm = &spec.normalize;
     if !crate::registry::sink_capabilities(&node.sink.kind, &node.sink.config)
         .supports_write_mode(faucet_core::WriteMode::Upsert)
     {
@@ -714,15 +777,19 @@ async fn repair_node(
             node.sink.kind
         )));
     }
-    let norm = Normalizer::default();
     let mut upserts: Vec<Value> = Vec::new();
     let mut deletes: Vec<Value> = Vec::new();
     for d in differences {
-        let kt = key_text(&d.key, key, &norm);
+        // The same normalizer the session keyed `source_rows` with.
+        let kt = key_text(&d.key, key, norm);
         if d.needs_upsert() {
-            if let Some(row) = source_rows.get(&kt) {
-                upserts.push(row.clone());
-            }
+            let row = source_rows.get(&kt).ok_or_else(|| {
+                CliError::Config(format!(
+                    "verify --repair: no source row was kept for differing key {kt}; nothing \
+                     was written"
+                ))
+            })?;
+            upserts.push(row.clone());
         } else if d.needs_delete() && allow_delete {
             deletes.push(d.key.clone());
         }
@@ -943,6 +1010,139 @@ mod tests {
             .unwrap();
         assert_eq!(outcome.key, key);
         assert!(!outcome.report.differences.is_empty(), "{outcome:?}");
+    }
+
+    /// A SQLite database holding `src` (the source table) and an empty `t`
+    /// (the destination), and the root node mirroring one into the other.
+    #[cfg(all(feature = "source-sqlite", feature = "sink-sqlite"))]
+    async fn sqlite_mirror(
+        dir: &std::path::Path,
+        key: &[&str],
+        rows: &[(i64, &str, &str)],
+        extra: &str,
+    ) -> ExpandedNode {
+        let db = dir.join("m.db");
+        let url = format!("sqlite:{}?mode=rwc", db.display());
+        let pool = sqlx::SqlitePool::connect(&url).await.unwrap();
+        let pk = key.join(", ");
+        for table in ["src", "t"] {
+            sqlx::query(&format!(
+                "CREATE TABLE {table} (id INTEGER, ts TEXT, v TEXT, PRIMARY KEY ({pk}))"
+            ))
+            .execute(&pool)
+            .await
+            .unwrap();
+        }
+        for (id, ts, v) in rows {
+            sqlx::query("INSERT INTO src (id, ts, v) VALUES (?, ?, ?)")
+                .bind(id)
+                .bind(ts)
+                .bind(v)
+                .execute(&pool)
+                .await
+                .unwrap();
+        }
+        pool.close().await;
+        let yaml = format!(
+            "version: 1\nname: m\npipeline:\n  source: {{ type: sqlite, config: {{ database_url: \"sqlite:{db}\", query: \"SELECT id, ts, v FROM src\" }} }}\n  sink: {{ type: sqlite, config: {{ database_url: \"sqlite:{db}\", table_name: t, column_mapping: auto_map, write_mode: upsert, key: [{pk}] }} }}\n{extra}",
+            db = db.display()
+        );
+        let cfg = PipelineConfig::from_text(&yaml, std::path::Path::new("m.yaml")).unwrap();
+        expand(&cfg).unwrap().remove(0)
+    }
+
+    #[cfg(all(feature = "source-sqlite", feature = "sink-sqlite"))]
+    fn repair_inputs() -> VerifyInputs {
+        VerifyInputs {
+            row: None,
+            repair: true,
+            allow_delete: false,
+            dry_run: false,
+            pipeline_name: "m".into(),
+            execution: None,
+            auth: Default::default(),
+            clock: chrono::Utc::now().fixed_offset(),
+        }
+    }
+
+    /// `max_differences` caps what is reported, never what is repaired.
+    #[cfg(all(feature = "source-sqlite", feature = "sink-sqlite"))]
+    #[tokio::test]
+    async fn repair_covers_differences_beyond_the_reporting_cap() {
+        let dir = tempfile::tempdir().unwrap();
+        let rows: Vec<(i64, &str, &str)> = (1..=5).map(|i| (i, "x", "v")).collect();
+        let node = sqlite_mirror(dir.path(), &["id"], &rows, "").await;
+        let spec = VerifySpec {
+            max_differences: 2,
+            ..Default::default()
+        };
+        let out = verify_node(&node, &spec, &repair_inputs()).await.unwrap();
+        assert_eq!(out.report.differences.len(), 2);
+        assert!(out.report.truncated);
+        assert_eq!(out.report.repaired_upserts, Some(5), "{out:?}");
+
+        let check = VerifyInputs {
+            repair: false,
+            ..repair_inputs()
+        };
+        let again = verify_node(&node, &spec, &check).await.unwrap();
+        assert!(again.report.differences.is_empty(), "{again:?}");
+    }
+
+    /// The repair looks rows up under the spec's normalizer, so a non-default
+    /// `normalize` still re-syncs a timestamp-keyed row.
+    #[cfg(all(feature = "source-sqlite", feature = "sink-sqlite"))]
+    #[tokio::test]
+    async fn repair_uses_the_specs_normalizer_for_key_lookup() {
+        let dir = tempfile::tempdir().unwrap();
+        let rows = [(7, "2026-01-01 00:00:00", "a")];
+        let node = sqlite_mirror(dir.path(), &["id", "ts"], &rows, "").await;
+        let spec = VerifySpec {
+            key: vec!["id".into(), "ts".into()],
+            normalize: Normalizer {
+                timestamps: false,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let out = verify_node(&node, &spec, &repair_inputs()).await.unwrap();
+        assert_eq!(out.report.repaired_upserts, Some(1), "{out:?}");
+    }
+
+    /// `max_rows_scanned` bounds a whole-dataset comparison too: the read
+    /// stops past the cap, the report is truncated, and a partial set is not
+    /// diffed into false "missing" rows.
+    #[cfg(all(feature = "source-sqlite", feature = "sink-sqlite"))]
+    #[tokio::test]
+    async fn the_scan_cap_bounds_a_full_comparison() {
+        let dir = tempfile::tempdir().unwrap();
+        let rows: Vec<(i64, &str, &str)> = (1..=5).map(|i| (i, "t", "v")).collect();
+        let node = sqlite_mirror(dir.path(), &["id", "ts"], &rows, "").await;
+        let spec = VerifySpec {
+            key: vec!["id".into(), "ts".into()],
+            max_rows_scanned: Some(3),
+            ..Default::default()
+        };
+        let check = VerifyInputs {
+            repair: false,
+            ..repair_inputs()
+        };
+        let out = verify_node(&node, &spec, &check).await.unwrap();
+        assert_eq!(out.strategy, "full");
+        assert!(out.report.truncated, "{out:?}");
+        assert!(out.report.rows_fetched_source <= 3, "{out:?}");
+        assert!(out.report.differences.is_empty(), "{out:?}");
+        let uncapped = verify_node(
+            &node,
+            &VerifySpec {
+                max_rows_scanned: None,
+                ..spec
+            },
+            &check,
+        )
+        .await
+        .unwrap();
+        assert_eq!(uncapped.report.differences.len(), 5);
     }
 
     #[test]

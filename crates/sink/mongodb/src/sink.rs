@@ -248,22 +248,34 @@ fn retry_commit(error: &impl std::fmt::Display, unknown: bool, attempt: &mut usi
     true
 }
 
-/// The outcome of an `insert_partial` call the call context cut short: an
-/// outer `Err` while nothing was inserted, else every pending document fails
-/// per row (earlier documents committed).
-fn cut_short(
-    e: FaucetError,
-    inserted_any: bool,
+/// The outcome of an `insert_partial` call that ended with an insert whose
+/// outcome is unknown (a call the context cut short, or a batch whose
+/// re-sends all failed without per-document errors): the server may have
+/// applied it, so an outer `Err` — "nothing committed" under the per-row
+/// contract — would be untrue. Every pending document fails per row instead.
+fn outcome_unknown(
+    e: impl std::fmt::Display,
     pending: &[(usize, Document)],
     mut outcomes: Vec<faucet_core::RowOutcome>,
 ) -> Result<Vec<faucet_core::RowOutcome>, FaucetError> {
-    if !inserted_any {
-        return Err(e);
-    }
     for (i, _) in pending {
-        outcomes[*i] = Err(FaucetError::Sink(format!("MongoDB insert_many: {e}")));
+        outcomes[*i] = Err(FaucetError::Sink(format!(
+            "MongoDB insert_many failed (the document may have been inserted): {e}"
+        )));
     }
     Ok(outcomes)
+}
+
+/// Whether a failed `insert_many` provably never reached the server: the
+/// driver refused it (an invalid or oversized document) or found no server
+/// to send it to. Any other failure may follow an applied insert.
+fn never_sent(e: &mongodb::error::Error) -> bool {
+    matches!(
+        e.kind.as_ref(),
+        mongodb::error::ErrorKind::InvalidArgument { .. }
+            | mongodb::error::ErrorKind::BsonSerialization(_)
+            | mongodb::error::ErrorKind::ServerSelection { .. }
+    )
 }
 
 /// How many times [`insert_partial`](MongoSink) re-sends a batch whose
@@ -440,6 +452,9 @@ pub(crate) struct MongoDriver {
     /// must exist up front on MongoDB < 4.4; pre-creating keeps the
     /// exactly-once path portable and removes a first-run failure mode.
     eo_collections_ready: tokio::sync::OnceCell<()>,
+    /// The overwrite run this instance belongs to: staging is then
+    /// `<collection>__faucet_ovw_<token>`, apart from any concurrent run's.
+    overwrite_run: Option<String>,
 }
 
 impl MongoSink {
@@ -448,6 +463,17 @@ impl MongoSink {
         Ok(Self {
             inner: DriverSink::new(MongoDriver::new(config).await?),
         })
+    }
+
+    /// Join the overwrite run `token`
+    /// ([`faucet_core::idempotency::OVERWRITE_RUN_KEY`]): every instance of
+    /// one run (begin, writers, commit) stages in
+    /// `<collection>__faucet_ovw_<token>`, so a concurrent overwrite run of the
+    /// same collection neither drops nor shares it.
+    pub fn with_overwrite_run(mut self, token: &str) -> Result<Self, FaucetError> {
+        faucet_core::idempotency::check_overwrite_run_token(token)?;
+        self.inner.driver_mut().overwrite_run = Some(token.to_string());
+        Ok(self)
     }
 
     #[cfg(test)]
@@ -481,6 +507,7 @@ impl MongoDriver {
             config,
             client,
             eo_collections_ready: tokio::sync::OnceCell::new(),
+            overwrite_run: None,
         })
     }
 
@@ -535,10 +562,12 @@ impl MongoDriver {
     /// under `ordered: true` the batch resumes after the rejected document.
     /// A batch that fails without per-document errors (a dropped connection, a
     /// server error) is re-sent up to [`INSERT_RESENDS`] times; documents keep
-    /// the `_id` they were given, so a re-send cannot insert one twice. An
-    /// outer `Err` is returned only while nothing has been inserted, so a
-    /// failed call never leaves rows that a DLQ replay would duplicate; after
-    /// that, the documents still pending fail per row.
+    /// the `_id` they were given, so a re-send cannot insert one twice. Once a
+    /// document may be in the collection — an insert confirmed, or one that
+    /// failed or was cut mid-flight without saying which documents landed —
+    /// a failure fails every pending document per row, never with an outer
+    /// `Err`, which promises that nothing committed. An insert the driver
+    /// refused before sending it leaves that promise intact.
     async fn insert_partial(
         &self,
         calls: &CallSlot,
@@ -570,8 +599,11 @@ impl MongoDriver {
         } else {
             self.config.batch_size
         };
-        let mut inserted_any = false;
         let mut resends = 0u32;
+        // Whether any document may already be in the collection: confirmed
+        // inserts, or an insert that failed or was cut without telling which
+        // documents landed. While false, a failure is an outer `Err`.
+        let mut maybe_committed = false;
         let mut pending: &[(usize, Document)] = &docs;
         while !pending.is_empty() {
             let take = chunk.min(pending.len());
@@ -582,6 +614,10 @@ impl MongoDriver {
             let opts = mongodb::options::InsertManyOptions::builder()
                 .ordered(ordered)
                 .build();
+            let expired = calls
+                .get()
+                .deadline()
+                .is_some_and(|d| d <= tokio::time::Instant::now());
             let called = calls
                 .call_once("insert", async {
                     Ok(collection
@@ -591,10 +627,12 @@ impl MongoDriver {
                 })
                 .await;
             // The run's deadline cut the call: its outcome is unknown, like a
-            // transport failure without a re-send left.
+            // transport failure without a re-send left — unless the deadline
+            // had already passed, so the insert was never sent.
             let result = match called {
                 Ok(result) => result,
-                Err(e) => return cut_short(e, inserted_any, pending, outcomes),
+                Err(e) if expired && !maybe_committed => return Err(e),
+                Err(e) => return outcome_unknown(e, pending, outcomes),
             };
             let rejected: Vec<(usize, i32, String)> = match result {
                 Ok(_) => Vec::new(),
@@ -628,26 +666,25 @@ impl MongoDriver {
                     // before giving up (#862 L-104).
                     _ if resends < INSERT_RESENDS => {
                         resends += 1;
+                        maybe_committed |= !never_sent(&e);
                         tracing::warn!(error = %e, resends, "MongoDB insert_many failed; re-sending the batch");
                         let backoff = std::time::Duration::from_millis(200 << resends);
                         if let Err(e) = calls.wait(backoff).await {
-                            return cut_short(e, inserted_any, pending, outcomes);
+                            if !maybe_committed {
+                                return Err(e);
+                            }
+                            return outcome_unknown(e, pending, outcomes);
                         }
                         continue;
                     }
-                    _ if !inserted_any => {
+                    // Every re-send failed: any of them may have landed.
+                    _ if maybe_committed || !never_sent(&e) => {
+                        return outcome_unknown(e, pending, outcomes);
+                    }
+                    _ => {
                         return Err(FaucetError::Sink(format!(
                             "MongoDB insert_many failed: {e}"
                         )));
-                    }
-                    _ => {
-                        // Earlier documents committed: report the rest per row.
-                        for (i, _) in pending {
-                            outcomes[*i] = Err(FaucetError::Sink(format!(
-                                "MongoDB insert_many failed: {e}"
-                            )));
-                        }
-                        return Ok(outcomes);
                     }
                 },
             };
@@ -655,12 +692,12 @@ impl MongoDriver {
                 generated.contains(&batch[pos].0)
             });
             let step = insert_step(take, ordered, &rejected);
+            maybe_committed |= step.consumed > step.failed.len();
             for (pos, msg) in &step.failed {
                 outcomes[batch[*pos].0] = Err(FaucetError::Sink(format!(
                     "MongoDB rejected the document: {msg}"
                 )));
             }
-            inserted_any |= step.consumed > step.failed.len();
             resends = 0;
             pending = &pending[step.consumed..];
         }
@@ -672,8 +709,65 @@ impl MongoDriver {
         format!(
             "{}{}",
             self.config.collection,
-            faucet_core::idempotency::OVERWRITE_STAGING_SUFFIX
+            faucet_core::idempotency::overwrite_staging_suffix(self.overwrite_run.as_deref())
         )
+    }
+
+    /// The database's collections named like any run's tokened staging of
+    /// the destination.
+    async fn tokened_staging(&self) -> Result<Vec<String>, FaucetError> {
+        let names = self
+            .client
+            .database(&self.config.database)
+            .list_collection_names()
+            .await
+            .map_err(|e| FaucetError::Sink(format!("mongodb staging listing failed: {e}")))?;
+        Ok(names
+            .into_iter()
+            .filter(|n| {
+                faucet_core::idempotency::overwrite_staging_token(&self.config.collection, n)
+                    .is_some()
+            })
+            .collect())
+    }
+
+    /// At a tokened begin: drop the untokened staging an earlier release (or
+    /// a run without a token) left, and every tokened staging another run
+    /// abandoned ([`faucet_core::idempotency::abandoned_overwrite_staging`]).
+    /// A live run's staging and this run's own are never touched.
+    async fn sweep_staging(&self) -> Result<(), FaucetError> {
+        if self.overwrite_run.is_none() {
+            return Ok(());
+        }
+        let db = self.client.database(&self.config.database);
+        let legacy = format!(
+            "{}{}",
+            self.config.collection,
+            faucet_core::idempotency::OVERWRITE_STAGING_SUFFIX
+        );
+        ignore_error(
+            "mongodb overwrite: untokened staging drop before begin (ignored)",
+            db.collection::<Document>(&legacy).drop().await,
+        );
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        for name in self.tokened_staging().await? {
+            if faucet_core::idempotency::abandoned_overwrite_staging(
+                &self.config.collection,
+                &name,
+                self.overwrite_run.as_deref(),
+                now,
+            ) {
+                tracing::warn!(staging = %name, "mongodb overwrite: dropping staging an earlier run abandoned");
+                ignore_error(
+                    "mongodb overwrite: abandoned staging drop (ignored)",
+                    db.collection::<Document>(&name).drop().await,
+                );
+            }
+        }
+        Ok(())
     }
 
     /// The collection the append/insert path targets. For `write_mode:
@@ -1124,6 +1218,7 @@ impl StagingDriver for MongoDriver {
                         .drop()
                         .await,
                 );
+                self.sweep_staging().await?;
                 self.clone_destination_shape().await
             })
             .await
@@ -1175,7 +1270,8 @@ impl StagingDriver for MongoDriver {
             .await
     }
 
-    /// Probe for the `<collection>__faucet_ovw` staging collection (read-only).
+    /// Probe for this run's staging collection (read-only); without a run
+    /// token (the `faucet status` probe) the untokened staging or any run's.
     async fn staged(&self, calls: &CallSlot) -> Result<bool, FaucetError> {
         calls
             .call_once("overwrite_staging_exists", async {
@@ -1186,7 +1282,10 @@ impl StagingDriver for MongoDriver {
                     .filter(bson::doc! { "name": self.staging_collection() })
                     .await
                     .map_err(|e| FaucetError::Sink(format!("mongodb staging probe failed: {e}")))?;
-                Ok(!names.is_empty())
+                if !names.is_empty() {
+                    return Ok(true);
+                }
+                Ok(self.overwrite_run.is_none() && !self.tokened_staging().await?.is_empty())
             })
             .await
     }
@@ -1494,18 +1593,27 @@ mod tests {
     use serde_json::json;
 
     #[test]
-    fn a_cut_call_fails_whole_until_something_landed() {
+    fn an_unknown_outcome_fails_pending_rows_never_the_whole_call() {
+        // The cut insert may have landed, so even with nothing confirmed the
+        // call reports per row rather than "nothing committed".
         let pending = vec![(1usize, Document::new())];
-        let outcomes = || vec![Ok(()), Ok(())];
-        let cut = || FaucetError::Sink("deadline".into());
-        assert!(cut_short(cut(), false, &pending, outcomes()).is_err());
-        let rows = cut_short(cut(), true, &pending, outcomes()).unwrap();
+        let rows = outcome_unknown("deadline", &pending, vec![Ok(()), Ok(())]).unwrap();
         assert!(rows[0].is_ok());
         let msg = rows[1].as_ref().unwrap_err().to_string();
         assert!(
-            msg.contains("MongoDB insert_many: ") && msg.contains("deadline"),
+            msg.contains("may have been inserted") && msg.contains("deadline"),
             "{msg}"
         );
+    }
+
+    #[test]
+    fn a_transport_failure_may_have_been_applied() {
+        // A dropped connection can follow an insert the server applied; only
+        // a driver-side refusal (covered against a live server by the
+        // oversized-document test) proves nothing was sent.
+        let io = mongodb::error::Error::from(std::io::Error::other("connection reset"));
+        assert!(!never_sent(&io));
+        assert!(!never_sent(&mongodb::error::Error::custom("boom")));
     }
 
     #[test]

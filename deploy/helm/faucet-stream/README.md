@@ -118,6 +118,14 @@ serve:
   or use `auth.token` / `auth.existingSecret`), `none` (`--no-auth --allow-unauthenticated-network`:
   the pod listens on `0.0.0.0`, so anything that can reach the Service can run
   pipelines; never expose it externally), or `rbac` (inline `auth.rbacConfig` principals → mounted file).
+  Changing `auth.token` or `auth.rbacConfig` rolls the serve pods, so a rotated
+  token or a removed principal stops working at once; after rotating a value in
+  `auth.existingSecret`, run `kubectl rollout restart deployment/<release>-faucet-stream`.
+  **GitOps (Argo CD, `helm template | kubectl apply`)**: the generated token
+  relies on Helm's `lookup`, which is empty when the chart renders without
+  cluster access, so each sync would mint a new token and overwrite the Secret
+  while running pods keep the old one. Create the Secret yourself and set
+  `auth.existingSecret` (or `auth.token`) for those renderers.
 - **History**: `memory` (ephemeral), `sqlite` (needs `persistence.enabled` for
   durability), or `postgres` (required for `cluster.enabled` multi-instance
   failover). The URL reaches the pod as the `FAUCET_SERVE_HISTORY` env var,
@@ -262,8 +270,9 @@ The vault key reaches the pod as `FAUCET_VAULT_KEY` from your Secret and never
 sits in Helm values. Each previous key is read from its Secret into
 `FAUCET_VAULT_PREVIOUS_KEY_<n>` and joined into `FAUCET_VAULT_PREVIOUS_KEYS`, so
 it stays out of both the pod spec and the process arguments. The render
-fails when tenants are enabled without a vault key or with `memory` history
-(tenants and their sealed connections live in the run history).
+fails when tenants are enabled without a vault key, or with `memory` history
+or `sqlite` history without `serve.persistence` (tenants and their sealed
+connections live in the run history, and an emptyDir is lost on restart).
 `serve.connectProviders` requires `serve.tenants`.
 
 ### Approvals and MCP
@@ -314,7 +323,8 @@ upgrades and floods it with runs, then reports what held. See
 ### Render-time checks
 
 The render fails on: a feature block enabled with zero or several file sources;
-`tenants` without a vault key or with `memory` history; `connectProviders`
+`tenants` or `cluster` with `memory` history, or with `sqlite` history but no
+`serve.persistence`; `tenants` without a vault key; `connectProviders`
 without `tenants`; an unknown approval kind, a zero expiry, or template
 approvals with template sync; `mcp.allowMutations` without `mcp.enabled`;
 `serve.otel` content that drops `logs` while `otel.logs` is on. Template sync

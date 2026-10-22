@@ -87,7 +87,8 @@ impl GcsRangeReader {
     }
 
     async fn fetch(&self, range: Range<u64>) -> Result<Bytes, ParquetError> {
-        let wanted = range.end.saturating_sub(range.start);
+        check_range(&self.key, &range, self.len)?;
+        let wanted = range.end - range.start;
         if wanted == 0 {
             return Ok(Bytes::new());
         }
@@ -108,11 +109,18 @@ impl GcsRangeReader {
                     Ok(r) => r,
                     Err(e) => return Ok(Err(failed(&self.key, &range, "", e))),
                 };
-                let mut buf = Vec::with_capacity(wanted as usize);
+                let mut buf = Vec::with_capacity(initial_capacity(wanted));
                 let mut stream = resp.into_stream();
                 loop {
                     match stream.try_next().await {
-                        Ok(Some(chunk)) => buf.extend_from_slice(&chunk),
+                        Ok(Some(chunk)) => {
+                            buf.extend_from_slice(&chunk);
+                            if buf.len() as u64 > wanted {
+                                // More than asked for: stop rather than buffer
+                                // whatever the server keeps sending.
+                                break;
+                            }
+                        }
                         Ok(None) => break,
                         Err(e) => return Ok(Err(failed(&self.key, &range, " mid-stream", e))),
                     }
@@ -127,6 +135,27 @@ impl GcsRangeReader {
         }
         Ok(Bytes::from(buf))
     }
+}
+
+/// The most a range read reserves up front; a larger range grows as it arrives.
+const MAX_INITIAL_CAPACITY: u64 = 8 * 1024 * 1024;
+
+fn initial_capacity(wanted: u64) -> usize {
+    usize::try_from(wanted.min(MAX_INITIAL_CAPACITY)).unwrap_or(0)
+}
+
+/// Refuse a range outside the object before reading or allocating anything.
+/// The ranges come from the object's own footer, so a corrupt or hostile file
+/// could otherwise ask for an allocation far larger than the object.
+fn check_range(key: &str, range: &Range<u64>, len: u64) -> Result<(), ParquetError> {
+    if range.start > range.end || range.end > len {
+        return Err(ParquetError::General(format!(
+            "'{key}' asks for bytes {}..{} but the object is {len} bytes — its Parquet \
+             metadata is corrupt",
+            range.start, range.end
+        )));
+    }
+    Ok(())
 }
 
 /// A range read that failed outright.
@@ -181,6 +210,19 @@ impl AsyncFileReader for GcsRangeReader {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_range_outside_the_object_is_refused_before_reading() {
+        assert!(super::check_range("k", &(0..10), 10).is_ok());
+        assert!(super::check_range("k", &(10..10), 10).is_ok());
+        let err = super::check_range("k", &(0..(1 << 40)), 1_000_000).unwrap_err();
+        assert!(err.to_string().contains("corrupt"), "{err}");
+        #[allow(clippy::reversed_empty_ranges)]
+        let reversed = 9..3;
+        assert!(super::check_range("k", &reversed, 10).is_err());
+        assert_eq!(super::initial_capacity(1 << 40), 8 * 1024 * 1024);
+        assert_eq!(super::initial_capacity(100), 100);
+    }
+
     use super::*;
     use faucet_common_gcs::{GcsCredentials, build_storage};
 
@@ -251,5 +293,35 @@ mod tests {
             msg.contains("truncated"),
             "the message must say what it means: {msg}"
         );
+    }
+
+    /// A server that sends more than the range asked for: the read stops
+    /// instead of buffering the rest, and the oversize is refused.
+    #[test]
+    fn an_overlong_range_response_is_cut_off_and_refused() {
+        faucet_conformance::block_on_large_stack(async {
+            use faucet_conformance::hung::{Reply, StallingBodyServer};
+            let server = StallingBodyServer::start(|_method, _target| {
+                Reply::full("application/octet-stream", vec![7u8; 64])
+                    .header("x-goog-generation", "1")
+                    .header("x-goog-metageneration", "1")
+                    .header("x-goog-stored-content-length", "64")
+                    .header("x-goog-storage-class", "STANDARD")
+            })
+            .await
+            .expect("server");
+            let storage = build_storage(&GcsCredentials::Anonymous, Some(&server.http_url()))
+                .await
+                .expect("storage");
+            let reader =
+                GcsRangeReader::open(&storage, "projects/_/buckets/b", "o.parquet", 1_024, None)
+                    .await
+                    .expect("opens");
+            let msg = reader.fetch(0..10).await.unwrap_err().to_string();
+            assert!(
+                msg.contains("64 bytes") && msg.contains("o.parquet"),
+                "{msg}"
+            );
+        });
     }
 }

@@ -674,6 +674,10 @@ pub struct Stmts {
     /// `upsert` that leaves an existing row alone.
     pub insert_new: String,
     pub select_body: String,
+    /// A run's owner and status (lease-ownership check).
+    pub select_run_owner: String,
+    /// A shard's owner and status (lease-ownership check).
+    pub select_shard_owner: String,
     pub select_status: String,
     pub select_submitted: String,
     pub delete: String,
@@ -1210,6 +1214,10 @@ impl Stmts {
                 VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9) ON CONFLICT (run_id) DO NOTHING"
                 .into(),
             select_body: "SELECT body FROM faucet_serve_runs WHERE run_id=$1".into(),
+            select_run_owner: "SELECT owner, status FROM faucet_serve_runs WHERE run_id=$1".into(),
+            select_shard_owner: "SELECT owner, status FROM faucet_serve_shards \
+                WHERE run_id=$1 AND shard_id=$2"
+                .into(),
             select_status: "SELECT status FROM faucet_serve_runs WHERE run_id=$1".into(),
             select_submitted: "SELECT submitted_at FROM faucet_serve_runs WHERE run_id=$1".into(),
             delete: "DELETE FROM faucet_serve_runs WHERE run_id=$1".into(),
@@ -1646,8 +1654,10 @@ impl Stmts {
             catalog_select_snapshot_pipelines: "SELECT pipeline FROM faucet_config_snapshots".into(),
             catalog_delete_config_snapshot:
                 "DELETE FROM faucet_config_snapshots WHERE pipeline=$1".into(),
-            template_max_version: "SELECT COALESCE(MAX(CAST(version AS BIGINT)), 0) AS v \
-                FROM faucet_templates WHERE id=$1"
+            template_max_version: "SELECT GREATEST(\
+                COALESCE((SELECT MAX(CAST(version AS BIGINT)) FROM faucet_templates WHERE id=$1), 0), \
+                COALESCE((SELECT CAST(value AS BIGINT) FROM faucet_serve_meta \
+                    WHERE key='template_hwm:' || $1), 0)) AS v"
                 .into(),
             template_insert: "INSERT INTO faucet_templates \
                 (id, version, name, created_at, body) VALUES ($1,$2,$3,$4,$5)"
@@ -1770,6 +1780,10 @@ impl Stmts {
                 VALUES (?,?,?,?,?,?,?,?,?) ON CONFLICT (run_id) DO NOTHING"
                 .into(),
             select_body: "SELECT body FROM faucet_serve_runs WHERE run_id=?".into(),
+            select_run_owner: "SELECT owner, status FROM faucet_serve_runs WHERE run_id=?".into(),
+            select_shard_owner: "SELECT owner, status FROM faucet_serve_shards \
+                WHERE run_id=? AND shard_id=?"
+                .into(),
             select_status: "SELECT status FROM faucet_serve_runs WHERE run_id=?".into(),
             select_submitted: "SELECT submitted_at FROM faucet_serve_runs WHERE run_id=?".into(),
             delete: "DELETE FROM faucet_serve_runs WHERE run_id=?".into(),
@@ -2198,8 +2212,10 @@ impl Stmts {
             catalog_select_snapshot_pipelines: "SELECT pipeline FROM faucet_config_snapshots".into(),
             catalog_delete_config_snapshot:
                 "DELETE FROM faucet_config_snapshots WHERE pipeline=?".into(),
-            template_max_version: "SELECT COALESCE(MAX(CAST(version AS INTEGER)), 0) AS v \
-                FROM faucet_templates WHERE id=?"
+            template_max_version: "SELECT MAX(\
+                COALESCE((SELECT MAX(CAST(version AS INTEGER)) FROM faucet_templates WHERE id=?1), 0), \
+                COALESCE((SELECT CAST(value AS INTEGER) FROM faucet_serve_meta \
+                    WHERE key='template_hwm:' || ?1), 0)) AS v"
                 .into(),
             template_insert: "INSERT INTO faucet_templates \
                 (id, version, name, created_at, body) VALUES (?,?,?,?,?)"
@@ -2518,6 +2534,18 @@ pub fn transience_of_code(code: Option<&str>) -> Transience {
 
 pub fn encode_body(rec: &RunRecord) -> Result<String, HistoryError> {
     serde_json::to_string(rec).map_err(|e| HistoryError::Backend(format!("encode run record: {e}")))
+}
+
+/// Whether a row in one of the `live` statuses is held by an instance other
+/// than `me` (or by none: requeued for a peer to claim).
+pub fn held_by_peer(owner: Option<&str>, status: &str, me: &str, live: &[&str]) -> bool {
+    live.contains(&status) && owner != Some(me)
+}
+
+/// How many candidate rows a claim reads for `limit` free slots: a margin
+/// past `limit` so rows it must skip do not starve the ones behind them.
+pub fn claim_window(limit: usize) -> usize {
+    limit.saturating_add(limit.max(16))
 }
 
 pub fn decode_body(body: &str) -> Result<RunRecord, HistoryError> {
@@ -3048,7 +3076,13 @@ macro_rules! impl_sql_history {
                 let mut count = 0usize;
                 for r in &rows {
                     let body: String = r.try_get("body").map_err(backend)?;
-                    let mut rec = sql::decode_body(&body)?;
+                    let mut rec = match sql::decode_body(&body) {
+                        Ok(rec) => rec,
+                        Err(e) => {
+                            tracing::warn!(error = %e, "orphan recovery: unreadable run record; skipped");
+                            continue;
+                        }
+                    };
                     rec.status = RunStatus::Failed;
                     rec.finished_at = Some(now);
                     rec.error = Some(
@@ -3075,6 +3109,56 @@ macro_rules! impl_sql_history {
                     count += failed as usize;
                 }
                 Ok(count)
+            }
+
+            async fn lease_lost(
+                &self,
+                run_id: &str,
+            ) -> Result<bool, $crate::serve::history::HistoryError> {
+                use sqlx::Row as _;
+                let backend = $crate::serve::history::sql::classify_backend_error;
+                let row = sqlx::query(&self.stmts.select_run_owner)
+                    .bind(run_id)
+                    .fetch_optional(&self.pool)
+                    .await
+                    .map_err(backend)?;
+                let Some(row) = row else {
+                    return Ok(false);
+                };
+                let owner: Option<String> = row.try_get("owner").map_err(backend)?;
+                let status: String = row.try_get("status").map_err(backend)?;
+                Ok($crate::serve::history::sql::held_by_peer(
+                    owner.as_deref(),
+                    &status,
+                    &self.instance_id,
+                    &["pending", "queued", "running"],
+                ))
+            }
+
+            async fn shard_lease_lost(
+                &self,
+                run_id: &str,
+                shard_id: &str,
+            ) -> Result<bool, $crate::serve::history::HistoryError> {
+                use sqlx::Row as _;
+                let backend = $crate::serve::history::sql::classify_backend_error;
+                let row = sqlx::query(&self.stmts.select_shard_owner)
+                    .bind(run_id)
+                    .bind(shard_id)
+                    .fetch_optional(&self.pool)
+                    .await
+                    .map_err(backend)?;
+                let Some(row) = row else {
+                    return Ok(false);
+                };
+                let owner: Option<String> = row.try_get("owner").map_err(backend)?;
+                let status: String = row.try_get("status").map_err(backend)?;
+                Ok($crate::serve::history::sql::held_by_peer(
+                    owner.as_deref(),
+                    &status,
+                    &self.instance_id,
+                    &["pending", "running"],
+                ))
             }
 
             async fn renew_leases(&self) -> Result<usize, $crate::serve::history::HistoryError> {
@@ -3107,8 +3191,11 @@ macro_rules! impl_sql_history {
                 let lease = sql::fmt_ts(now + self.lease_ttl);
 
                 // 1. Candidate pending runs (oldest first), with their bodies.
+                //    The window looks past `limit` so a few records this
+                //    binary cannot read (a newer instance's, mid-upgrade) do
+                //    not hold back every run behind them.
                 let rows = sqlx::query(&self.stmts.select_pending)
-                    .bind(limit as i64)
+                    .bind(sql::claim_window(limit) as i64)
                     .fetch_all(&self.pool)
                     .await
                     .map_err(backend)?;
@@ -3116,27 +3203,55 @@ macro_rules! impl_sql_history {
                 // Per-row conditional claim (1 SELECT + N guarded UPDATEs). The
                 // batch is bounded by the caller's free permits (small), and this
                 // is portable across Postgres + SQLite — deliberately NOT a
-                // Postgres-only `FOR UPDATE SKIP LOCKED`.
+                // Postgres-only `FOR UPDATE SKIP LOCKED`. One row's problem
+                // never discards the runs already won: those are owned by this
+                // instance now, and must be returned to be run.
                 let mut claimed = Vec::new();
                 for row in &rows {
-                    let run_id: String = row.try_get("run_id").map_err(backend)?;
-                    let body: String = row.try_get("body").map_err(backend)?;
+                    if claimed.len() >= limit {
+                        break;
+                    }
+                    let (run_id, body): (String, String) =
+                        match (row.try_get("run_id"), row.try_get("body")) {
+                            (Ok(id), Ok(body)) => (id, body),
+                            (Err(e), _) | (_, Err(e)) => {
+                                tracing::warn!(error = %e, "claim: unreadable pending row; skipped");
+                                continue;
+                            }
+                        };
                     // Flip the record to Running and rewrite the body so the column
                     // and the (source-of-truth) body stay consistent — a GET right
                     // after the claim must not show a stale `pending`.
-                    let mut r = sql::decode_body(&body)?;
+                    let mut r = match sql::decode_body(&body) {
+                        Ok(r) => r,
+                        Err(e) => {
+                            tracing::warn!(
+                                run_id = %run_id,
+                                error = %e,
+                                "claim: this instance cannot read the pending run's record; left \
+                                 for an instance that can"
+                            );
+                            continue;
+                        }
+                    };
                     r.status = RunStatus::Running;
                     let new_body = sql::encode_body(&r)?;
                     // 2. Conditional claim — only the first committer wins.
-                    let won = sqlx::query(&self.stmts.claim_one)
+                    let won = match sqlx::query(&self.stmts.claim_one)
                         .bind(&self.instance_id)
                         .bind(&lease)
                         .bind(&new_body)
                         .bind(&run_id)
                         .execute(&self.pool)
                         .await
-                        .map_err(backend)?
-                        .rows_affected();
+                    {
+                        Ok(done) => done.rows_affected(),
+                        Err(e) if claimed.is_empty() => return Err(backend(e)),
+                        Err(e) => {
+                            tracing::warn!(run_id = %run_id, error = %e, "claim: stopped early; keeping the runs already claimed");
+                            break;
+                        }
+                    };
                     if won == 1 {
                         claimed.push(r);
                     }
@@ -3166,7 +3281,15 @@ macro_rules! impl_sql_history {
                 let mut report = ReclaimReport::default();
                 for row in &rows {
                     let body: String = row.try_get("body").map_err(backend)?;
-                    let mut rec = sql::decode_body(&body)?;
+                    // A record this binary cannot read is left for an instance
+                    // that can, rather than stopping every other reclaim.
+                    let mut rec = match sql::decode_body(&body) {
+                        Ok(rec) => rec,
+                        Err(e) => {
+                            tracing::warn!(error = %e, "reclaim: unreadable run record; skipped");
+                            continue;
+                        }
+                    };
                     let next_attempt = rec.attempt + 1;
                     // Cap is on the attempts already made: a run that has been
                     // reclaimed fewer than `max_attempts` times gets another try;
@@ -3505,33 +3628,54 @@ macro_rules! impl_sql_history {
                 // 1. Candidate pending shards (largest estimated size first),
                 //    joined to their parent run body.
                 let rows = sqlx::query(&self.stmts.claim_shards_select)
-                    .bind(limit as i64)
+                    .bind(sql::claim_window(limit) as i64)
                     .fetch_all(&self.pool)
                     .await
                     .map_err(backend)?;
 
                 // 2. Per-row conditional claim (portable; not FOR UPDATE SKIP LOCKED).
+                //    Each row is decoded before it is claimed, and a later
+                //    row's failure never discards a shard already won.
                 let mut claimed = Vec::new();
                 for row in &rows {
-                    let run_id: String = row.try_get("run_id").map_err(backend)?;
-                    let shard_id: String = row.try_get("shard_id").map_err(backend)?;
-                    let descriptor_s: String = row.try_get("descriptor").map_err(backend)?;
-                    let body: String = row.try_get("body").map_err(backend)?;
-                    let won = sqlx::query(&self.stmts.claim_shard_one)
+                    if claimed.len() >= limit {
+                        break;
+                    }
+                    let decoded = (|| -> Result<_, HistoryError> {
+                        let run_id: String = row.try_get("run_id").map_err(backend)?;
+                        let shard_id: String = row.try_get("shard_id").map_err(backend)?;
+                        let descriptor_s: String = row.try_get("descriptor").map_err(backend)?;
+                        let body: String = row.try_get("body").map_err(backend)?;
+                        let descriptor: serde_json::Value = serde_json::from_str(&descriptor_s)
+                            .map_err(|e| {
+                                HistoryError::Backend(format!("decode shard descriptor: {e}"))
+                            })?;
+                        let run = sql::decode_body(&body)?;
+                        Ok((run_id, shard_id, descriptor, run))
+                    })();
+                    let (run_id, shard_id, descriptor, run) = match decoded {
+                        Ok(d) => d,
+                        Err(e) => {
+                            tracing::warn!(error = %e, "claim: unreadable shard row; left for an instance that can read it");
+                            continue;
+                        }
+                    };
+                    let won = match sqlx::query(&self.stmts.claim_shard_one)
                         .bind(&self.instance_id)
                         .bind(&lease)
                         .bind(&run_id)
                         .bind(&shard_id)
                         .execute(&self.pool)
                         .await
-                        .map_err(backend)?
-                        .rows_affected();
+                    {
+                        Ok(done) => done.rows_affected(),
+                        Err(e) if claimed.is_empty() => return Err(backend(e)),
+                        Err(e) => {
+                            tracing::warn!(run_id = %run_id, shard_id = %shard_id, error = %e, "claim: stopped early; keeping the shards already claimed");
+                            break;
+                        }
+                    };
                     if won == 1 {
-                        let descriptor: serde_json::Value = serde_json::from_str(&descriptor_s)
-                            .map_err(|e| {
-                                HistoryError::Backend(format!("decode shard descriptor: {e}"))
-                            })?;
-                        let run = sql::decode_body(&body)?;
                         claimed.push(ClaimedShard {
                             run_id,
                             shard_id,
@@ -3783,6 +3927,13 @@ macro_rules! impl_sql_history {
             async fn finalize_completed_sharded_parents(
                 &self,
             ) -> Result<usize, $crate::serve::history::HistoryError> {
+                Ok(self.finalize_completed_sharded_parents_records().await?.len())
+            }
+
+            async fn finalize_completed_sharded_parents_records(
+                &self,
+            ) -> Result<Vec<$crate::serve::history::RunRecord>, $crate::serve::history::HistoryError>
+            {
                 use sqlx::Row as _;
                 use $crate::serve::history::RunStatus;
                 use $crate::serve::history::sql;
@@ -3796,7 +3947,7 @@ macro_rules! impl_sql_history {
                     .await
                     .map_err(backend)?;
 
-                let mut finalized = 0usize;
+                let mut finalized = Vec::new();
                 for row in &rows {
                     let run_id: String = row.try_get("run_id").map_err(backend)?;
                     let progress = self.shard_progress(&run_id).await?;
@@ -3838,7 +3989,6 @@ macro_rules! impl_sql_history {
                         .map_err(backend)?
                         .rows_affected();
                     if n == 1 {
-                        finalized += 1;
                         $crate::serve::metrics::record_run_finished(
                             rec.status,
                             rec.status.finished_reason(),
@@ -3849,6 +3999,7 @@ macro_rules! impl_sql_history {
                             failed = progress.failed,
                             "sharded run finalized by sweep (F11)"
                         );
+                        finalized.push(rec);
                     }
                 }
                 Ok(finalized)
@@ -5372,6 +5523,18 @@ macro_rules! impl_sql_history {
                         .bind(sql::encode_json(&record, "pipeline template")?)
                         .execute(&mut *tx)
                         .await;
+                    // The high-water mark outlives a deleted newest version,
+                    // so its number is never reassigned to another body.
+                    let insert = match insert {
+                        Ok(done) => sqlx::query(&self.stmts.meta_upsert)
+                            .bind(format!("template_hwm:{id}"))
+                            .bind(next.to_string())
+                            .bind(sql::fmt_ts(record.created_at))
+                            .execute(&mut *tx)
+                            .await
+                            .map(|_| done),
+                        Err(e) => Err(e),
+                    };
                     match insert {
                         Ok(_) => {
                             // The commit is as contention-prone as every other

@@ -37,7 +37,7 @@ impl GcsSink {
             .build(base, &template)?;
         let identity = GcsIdentity {
             bucket: config.bucket.clone(),
-            prefix: config.prefix.clone(),
+            key: object_key_layout(&config.prefix, config.path.as_deref()),
         };
         Ok(Self {
             inner: FileSink::build(settings, template, Arc::new(backend), identity)?,
@@ -50,13 +50,25 @@ impl GcsSink {
     }
 }
 
+impl GcsSink {
+    /// Join the overwrite run `token`
+    /// ([`faucet_core::idempotency::OVERWRITE_RUN_KEY`]): every instance of
+    /// one run (begin, writers, commit) stages in that run's own swap area,
+    /// so a concurrent overwrite run of the same output neither drops nor
+    /// moves in the other's files.
+    pub fn with_overwrite_run(mut self, token: &str) -> Result<Self, FaucetError> {
+        self.inner = self.inner.with_overwrite_run(token)?;
+        Ok(self)
+    }
+}
+
 faucet_common_file::delegate_sink!(GcsSink, inner);
 
 /// What the GCS sink supplies to the shared sink; requests, metering and the
 /// preflight probe are the backend's.
 struct GcsIdentity {
     bucket: String,
-    prefix: String,
+    key: String,
 }
 
 impl SinkIdentity for GcsIdentity {
@@ -69,8 +81,14 @@ impl SinkIdentity for GcsIdentity {
     }
 
     fn dataset_uri(&self) -> String {
-        format!("gs://{}/{}", self.bucket, self.prefix)
+        format!("gs://{}/{}", self.bucket, self.key)
     }
+}
+
+/// The object-key layout a run writes under: `prefix` followed by the `path`
+/// template, so two pipelines writing different paths are different datasets.
+fn object_key_layout(prefix: &str, path: Option<&str>) -> String {
+    format!("{prefix}{}", path.unwrap_or_default())
 }
 
 #[cfg(test)]
@@ -91,5 +109,20 @@ mod tests {
         assert_eq!(sink.format(), FileFormat::JsonLines);
         assert_eq!(sink.inner.backend().bucket(), "b");
         assert!(sink.config_schema().is_object());
+    }
+
+    #[tokio::test]
+    async fn dataset_uri_names_the_path_template() {
+        let uri = |path: &str| {
+            let config: GcsSinkConfig = serde_json::from_value(serde_json::json!({
+                "bucket": "b", "prefix": "p/", "path": path, "storage_host": "http://127.0.0.1:9", "auth": {"type": "anonymous"}
+            }))
+            .unwrap();
+            async move { GcsSink::new(config).await.unwrap().dataset_uri() }
+        };
+        let orders = uri("orders/part-{part}.parquet").await;
+        let users = uri("users.csv").await;
+        assert_eq!(orders, "gs://b/p/orders/part-{part}.parquet");
+        assert_eq!(users, "gs://b/p/users.csv");
     }
 }

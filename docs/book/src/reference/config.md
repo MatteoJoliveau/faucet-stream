@@ -178,10 +178,13 @@ Three stages resolve placeholders:
 - **Runtime:** `${row_id.dotted.path}` tokens are resolved per parent record in
   DAG runs. `${now.*}` tokens are resolved per invocation at run time (see
   below). A value lands in the field shaped for it: an `xml` source's `body` /
-  `soap.body_inner` gets it XML-escaped, a `rest` / `webhook` `path` gets an
-  embedded token percent-encoded into one segment (a `path` that is exactly one
-  token takes the value raw), and a SQL source's query gets it as a bind
-  parameter.
+  `soap.body_inner` gets it XML-escaped, a `rest` / `webhook` / `xml` `path`
+  and every URL field (`base_url`, the `http` sink's `url`, a connection URL)
+  get an embedded token percent-encoded into one segment, a file or object path
+  (a file sink's `path`, a SQLite `database_url`, a `prefix`) refuses a value
+  holding `/`, `\`, NUL or `..` (a field that is exactly one token takes the
+  value whole; a file path still may not climb out with `..`), and a SQL
+  source's query gets it as a bind parameter.
 
 Reference cycles surface as a clear `InterpolationCycle` error.
 
@@ -1500,7 +1503,7 @@ table) and `snapshot.source` the discovery connection.
 | `tables.destination` | mapping | per sink kind | Sink-config patch per table; strings may use `{table}`, `{table_name}`, `{schema}`. Required for sinks without a single table field (file sinks). |
 | `tables.on_table_error` | `pause` / `fail` | `pause` | A table whose pipeline keeps failing is paused (the rest continue) or fails the mirror. |
 | `tables.max_table_failures` | int | `3` | Consecutive failed cycles before a table is paused. |
-| `tables.retry_paused_secs` | int | `300` | Seconds before a paused table is re-snapshotted (`0` = stay paused until restart). |
+| `tables.retry_paused_secs` | int | `300` | Seconds before a paused table is re-snapshotted (`0` = stay paused until restart). Every start of `faucet mirror` — including each one-shot (`continuous: false`) run — retries paused tables. |
 | `tables.lag_warning_secs` | int | `300` | Flag an active table as lagging past this many seconds without a confirmed position. |
 | `per_table.<table>.key` | list | discovered PK | Upsert key. |
 | `per_table.<table>.write_mode` | string | template's, else `upsert` | Destination write mode. |

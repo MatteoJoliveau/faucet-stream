@@ -1030,6 +1030,21 @@ impl SqlExecutor for MysqlConn<'_> {
     }
 }
 
+/// Add `STRICT_ALL_TABLES` to a connection's `sql_mode`. A server whose mode
+/// lacks it turns an over-long string, an out-of-range number or non-numeric
+/// text for a number column into a warning and writes a truncated, clamped or
+/// zero value; strict mode makes each a statement error, so the page fails
+/// (or the row goes to the DLQ) instead of landing changed. The server's other
+/// modes are kept.
+pub(crate) const STRICT_SQL_MODE: &str =
+    "SET SESSION sql_mode = CONCAT_WS(',', NULLIF(@@SESSION.sql_mode, ''), 'STRICT_ALL_TABLES')";
+
+async fn strict_session(conn: &mut sqlx::MySqlConnection) -> Result<(), sqlx::Error> {
+    sqlx::Executor::execute(conn, STRICT_SQL_MODE)
+        .await
+        .map(|_| ())
+}
+
 impl MysqlSink {
     /// Create a new MySQL sink. Establishes a connection pool.
     pub async fn new(config: MysqlSinkConfig) -> Result<Self, FaucetError> {
@@ -1048,6 +1063,7 @@ impl MysqlSink {
 
         let pool = MySqlPoolOptions::new()
             .max_connections(config.max_connections)
+            .after_connect(|conn, _meta| Box::pin(async move { strict_session(conn).await }))
             .connect(&config.connection_url)
             .await
             .map_err(|e| FaucetError::Sink(format!("MySQL connection failed: {e}")))?;
@@ -1081,6 +1097,20 @@ impl MysqlSink {
         Ok(Self {
             inner: DriverSink::new(SqlSinkDriver::new(driver)),
         })
+    }
+}
+
+impl MysqlSink {
+    /// Join the overwrite run `token`
+    /// ([`faucet_core::idempotency::OVERWRITE_RUN_KEY`]): every instance of
+    /// one run (begin, writers, commit) stages in `<table>__faucet_ovw_<token>`,
+    /// so a concurrent overwrite run of the same table neither drops nor
+    /// shares it.
+    pub fn with_overwrite_run(mut self, token: &str) -> Result<Self, FaucetError> {
+        faucet_core::idempotency::check_overwrite_run_token(token)?;
+        let driver = self.inner.driver_mut().driver_mut();
+        driver.layout = driver.layout.clone().overwrite_run(Some(token.to_string()));
+        Ok(self)
     }
 }
 
@@ -1154,11 +1184,35 @@ impl MysqlDriver {
 
     /// The table the current-target-old is renamed to during the atomic swap.
     pub(crate) fn old_table_name(&self) -> String {
-        format!(
-            "{}{}",
-            self.config.table_name,
-            faucet_core::idempotency::OVERWRITE_STAGING_OLD_SUFFIX
+        match &self.layout.overwrite_run {
+            // One per run, so two runs' swaps never rename onto one name.
+            Some(_) => format!("{}_old", self.staging_table_name()),
+            None => format!(
+                "{}{}",
+                self.config.table_name,
+                faucet_core::idempotency::OVERWRITE_STAGING_OLD_SUFFIX
+            ),
+        }
+    }
+
+    /// Every table in the database named like a tokened staging of the target.
+    async fn tokened_staging_tables(&self) -> Result<Vec<String>, FaucetError> {
+        let pattern = format!(
+            "{}%",
+            faucet_core::idempotency::like_literal(
+                &faucet_core::idempotency::overwrite_staging_prefix(&self.config.table_name),
+                '\\'
+            )
+        );
+        let names: Vec<String> = sqlx::query_scalar(
+            "SELECT CAST(table_name AS CHAR) FROM information_schema.tables \
+             WHERE table_schema = DATABASE() AND table_name LIKE ?",
         )
+        .bind(pattern)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|e| FaucetError::Sink(format!("mysql overwrite: list staging tables: {e}")))?;
+        Ok(names)
     }
 
     /// The table the data-write path targets. For `write_mode: overwrite` every
@@ -1542,6 +1596,10 @@ impl SqlDriver for MysqlDriver {
 
     async fn table_exists(&self, table: &str) -> Result<bool, FaucetError> {
         MysqlDriver::table_exists(self, table).await
+    }
+
+    async fn overwrite_staging_tables(&self) -> Result<Vec<String>, FaucetError> {
+        self.tokened_staging_tables().await
     }
 
     async fn ddl(&self, sql: &str, what: &'static str) -> Result<(), FaucetError> {

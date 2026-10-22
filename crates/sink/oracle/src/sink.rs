@@ -15,20 +15,19 @@ use faucet_core::check::{CheckContext, CheckReport, Probe};
 use faucet_core::driver::{
     CommitTokenDriver, DriverSink, PageWrite, RowPolicy, SchemaDriver, SinkDriver, StagingDriver,
 };
-use faucet_core::idempotency::OVERWRITE_STAGING_SUFFIX;
 use faucet_core::{CallSlot, FaucetError, RowOutcome, Sink, WriteMode, WritePlan, WriteReport};
 use serde_json::Value;
 
 use crate::config::{IdentifierCase, OracleColumnMapping, OracleSinkConfig};
 use crate::plan::{
     BindKind, COLUMNS_SQL, ColumnInfo, ColumnRow, ORA_NAME_IN_USE, PreparedRows,
-    REFERENCING_TABLES_SQL, TABLE_EXISTS_SQL, add_column_sql, case_records, clone_table_sql,
-    column_from_row, create_json_table_sql, create_table_sql, delete_sql, dictionary_binds,
-    drop_table_sql, drops_unknown, fold_names, fold_page, ignoring, insert_sql, insertable_names,
-    merge_sql, no_columns_error, overwrite_swap_sql, pick_table, prepare_rows,
-    referenced_overwrite_error, relax_null_sql, rename_sql, schema_from_columns,
-    staging_fixups_sql, token_delete_sql, token_merge_sql, token_select_sql, token_table,
-    token_table_ddl, upsert_groups, widen_column_sql,
+    REFERENCING_TABLES_SQL, TABLE_EXISTS_SQL, TOKENED_STAGING_SQL, add_column_sql, case_records,
+    clone_table_sql, column_from_row, create_json_table_sql, create_table_sql, delete_sql,
+    dictionary_binds, drop_table_sql, drops_unknown, fold_names, fold_page, ignoring, insert_sql,
+    insertable_names, merge_sql, no_columns_error, overwrite_swap_sql, pick_table, prepare_rows,
+    qualify, referenced_overwrite_error, relax_null_sql, rename_sql, schema_from_columns,
+    staging_fixups_sql, staging_table_name, token_delete_sql, token_merge_sql, token_select_sql,
+    token_table, token_table_ddl, upsert_groups, widen_column_sql,
 };
 
 /// Oracle Database sink.
@@ -53,6 +52,9 @@ struct Inner {
     target_quoted: String,
     staging: String,
     staging_quoted: String,
+    /// The overwrite run this instance belongs to: staging is then
+    /// `<table>__faucet_ovw_<token>`, apart from any concurrent run's.
+    overwrite_run: Option<String>,
     token_table: String,
     columns: Mutex<Option<Vec<ColumnInfo>>>,
     ready: AtomicBool,
@@ -77,8 +79,45 @@ fn run_batch(
     rows: &[Vec<Option<String>>],
     collect_errors: bool,
 ) -> Result<Vec<(usize, String)>, FaucetError> {
+    execute_batch(conn, sql, kinds, rows, collect_errors)?.map_err(|e| sink_err("write", &e))
+}
+
+/// ORA-00001: unique constraint violated.
+const ORA_UNIQUE_VIOLATION: i32 = 1;
+
+/// Run a keyed `MERGE` batch. Two sessions merging one new key can both take
+/// the insert branch, and the later one fails with ORA-00001. Oracle rolls
+/// back only that statement, so running it once more updates the row the
+/// other session committed.
+fn run_merge(
+    conn: &Connection,
+    sql: &str,
+    kinds: &[BindKind],
+    rows: &[Vec<Option<String>>],
+) -> Result<(), FaucetError> {
+    match execute_batch(conn, sql, kinds, rows, false)? {
+        Ok(_) => Ok(()),
+        Err(e) if is_unique_violation(faucet_common_oracle::ora_code(&e)) => {
+            run_batch(conn, sql, kinds, rows, false).map(|_| ())
+        }
+        Err(e) => Err(sink_err("write", &e)),
+    }
+}
+
+fn is_unique_violation(code: Option<i32>) -> bool {
+    code == Some(ORA_UNIQUE_VIOLATION)
+}
+
+/// [`run_batch`] keeping the execution error, so a caller can inspect its code.
+fn execute_batch(
+    conn: &Connection,
+    sql: &str,
+    kinds: &[BindKind],
+    rows: &[Vec<Option<String>>],
+    collect_errors: bool,
+) -> Result<Result<Vec<(usize, String)>, oracle::Error>, FaucetError> {
     if rows.is_empty() {
-        return Ok(Vec::new());
+        return Ok(Ok(Vec::new()));
     }
     let mut builder = conn.batch(sql, rows.len());
     if collect_errors {
@@ -94,16 +133,16 @@ fn run_batch(
         let refs: Vec<&dyn ToSql> = row.iter().map(|v| v as &dyn ToSql).collect();
         batch.append_row(&refs).map_err(|e| sink_err("bind", &e))?;
     }
-    match batch.execute() {
+    Ok(match batch.execute() {
         Ok(()) => Ok(Vec::new()),
         Err(e) => match e.batch_errors() {
             Some(errs) if collect_errors => Ok(errs
                 .iter()
                 .map(|d| (d.offset() as usize, d.message().to_string()))
                 .collect()),
-            _ => Err(sink_err("write", &e)),
+            _ => Err(e),
         },
-    }
+    })
 }
 
 /// Commit `body`'s work, or roll it back when it fails.
@@ -150,6 +189,67 @@ impl Inner {
             .query_row_as(TABLE_EXISTS_SQL, &[&owner, &name])
             .map_err(|e| sink_err("table probe", &e))?;
         Ok(n > 0)
+    }
+
+    /// Tables named like a tokened staging of the target (any run's).
+    fn tokened_staging(&self, conn: &Connection) -> Result<Vec<String>, FaucetError> {
+        let (owner, name) = dictionary_binds(&self.target)?;
+        let pattern = format!(
+            "{}%",
+            faucet_core::idempotency::like_literal(
+                &faucet_core::idempotency::overwrite_staging_prefix(&name),
+                '\\'
+            )
+        );
+        let rows = conn
+            .query_as::<String>(TOKENED_STAGING_SQL, &[&owner, &pattern])
+            .map_err(|e| sink_err("list staging", &e))?;
+        let mut out = Vec::new();
+        for r in rows {
+            let t = r.map_err(|e| sink_err("list staging", &e))?;
+            if faucet_core::idempotency::overwrite_staging_token(&name, &t).is_some() {
+                out.push(t);
+            }
+        }
+        Ok(out)
+    }
+
+    /// At a tokened begin: drop the untokened staging an earlier release (or
+    /// a run without a token) left, and every tokened staging another run
+    /// abandoned ([`faucet_core::idempotency::abandoned_overwrite_staging`]).
+    /// A live run's staging and this run's own are never touched.
+    fn sweep_staging(&self, conn: &Connection) -> Result<(), FaucetError> {
+        if self.overwrite_run.is_none() {
+            return Ok(());
+        }
+        let legacy = staging_table_name(&self.target, None);
+        exec(
+            conn,
+            &drop_table_sql(&quote_table_oracle(&legacy)?),
+            "drop stale staging",
+        )?;
+        let (owner, name) = dictionary_binds(&self.target)?;
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        for t in self.tokened_staging(conn)? {
+            if faucet_core::idempotency::abandoned_overwrite_staging(
+                &name,
+                &t,
+                self.overwrite_run.as_deref(),
+                now,
+            ) {
+                let table = qualify(owner.as_deref(), &t);
+                tracing::warn!(staging = %table, "oracle overwrite: dropping staging an earlier run abandoned");
+                exec(
+                    conn,
+                    &drop_table_sql(&quote_table_oracle(&table)?),
+                    "drop abandoned staging",
+                )?;
+            }
+        }
+        Ok(())
     }
 
     /// Refuse an overwrite of a table other tables reference by foreign key.
@@ -342,7 +442,7 @@ impl Inner {
                 })
                 .collect::<Result<Vec<_>, _>>()?;
             let sql = merge_sql(&self.target_quoted, key, &cols)?;
-            run_batch(conn, &sql, &kinds, &rows, false)?;
+            run_merge(conn, &sql, &kinds, &rows)?;
             affected += rows.len();
         }
         if !plan.deletes.is_empty() {
@@ -508,10 +608,11 @@ impl OracleSink {
         let pool = connect_pool(&config.connection, config.max_connections).await?;
         let timeout = call_timeout(config.statement_timeout_secs);
         let target = resolve_table(&pool, timeout, config.table.clone()).await?;
-        let staging = format!("{target}{OVERWRITE_STAGING_SUFFIX}");
+        let staging = staging_table_name(&target, None);
         let inner = Inner {
             target_quoted: quote_table_oracle(&target)?,
             staging_quoted: quote_table_oracle(&staging)?,
+            overwrite_run: None,
             token_table: token_table(&target)?,
             pool,
             timeout,
@@ -534,6 +635,22 @@ impl OracleSink {
         Ok(Self {
             inner: DriverSink::new(driver),
         })
+    }
+
+    /// Join the overwrite run `token`
+    /// ([`faucet_core::idempotency::OVERWRITE_RUN_KEY`]): every instance of
+    /// one run (begin, writers, commit) stages in `<table>__faucet_ovw_<token>`,
+    /// so a concurrent overwrite run of the same table neither drops nor
+    /// shares it.
+    pub fn with_overwrite_run(mut self, token: &str) -> Result<Self, FaucetError> {
+        faucet_core::idempotency::check_overwrite_run_token(token)?;
+        let inner = Arc::get_mut(&mut self.inner.driver_mut().inner).ok_or_else(|| {
+            FaucetError::Config("oracle sink: join an overwrite run before the first write".into())
+        })?;
+        inner.staging = staging_table_name(&inner.target, Some(token));
+        inner.staging_quoted = quote_table_oracle(&inner.staging)?;
+        inner.overwrite_run = Some(token.to_string());
+        Ok(self)
     }
 }
 
@@ -751,6 +868,7 @@ impl StagingDriver for OracleDriver {
         self.run(calls, "begin_overwrite", |i| {
             let conn = i.conn()?;
             exec(&conn, &drop_table_sql(&i.staging_quoted), "drop staging")?;
+            i.sweep_staging(&conn)?;
             i.forget_columns();
             i.ready.store(false, Ordering::Relaxed);
             let exists = i.table_exists(&conn, &i.target)?;
@@ -820,11 +938,15 @@ impl StagingDriver for OracleDriver {
         .await
     }
 
-    /// Whether the `<table>__faucet_ovw` staging table exists (read-only).
+    /// Whether this run's staging exists (read-only); without a run token
+    /// (the `faucet status` probe) the untokened staging or any run's.
     async fn staged(&self, calls: &CallSlot) -> Result<bool, FaucetError> {
         self.run(calls, "overwrite_staging_exists", |i| {
             let conn = i.conn()?;
-            i.table_exists(&conn, &i.staging)
+            if i.table_exists(&conn, &i.staging)? {
+                return Ok(true);
+            }
+            Ok(i.overwrite_run.is_none() && !i.tokened_staging(&conn)?.is_empty())
         })
         .await
     }
@@ -939,5 +1061,17 @@ impl SchemaDriver for OracleDriver {
             Ok(())
         })
         .await
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn only_ora_00001_re_runs_a_merge() {
+        assert!(is_unique_violation(Some(1)));
+        assert!(!is_unique_violation(Some(2290)));
+        assert!(!is_unique_violation(None));
     }
 }

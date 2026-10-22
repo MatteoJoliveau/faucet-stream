@@ -47,7 +47,7 @@ impl S3Sink {
             .build(base, &template)?;
         let identity = S3Identity {
             bucket: config.bucket.clone(),
-            prefix: config.prefix.clone(),
+            key: object_key_layout(&config.prefix, config.path.as_deref()),
         };
         Ok(Self {
             inner: FileSink::build(settings, template, Arc::new(backend), identity)?,
@@ -60,13 +60,25 @@ impl S3Sink {
     }
 }
 
+impl S3Sink {
+    /// Join the overwrite run `token`
+    /// ([`faucet_core::idempotency::OVERWRITE_RUN_KEY`]): every instance of
+    /// one run (begin, writers, commit) stages in that run's own swap area,
+    /// so a concurrent overwrite run of the same output neither drops nor
+    /// moves in the other's files.
+    pub fn with_overwrite_run(mut self, token: &str) -> Result<Self, FaucetError> {
+        self.inner = self.inner.with_overwrite_run(token)?;
+        Ok(self)
+    }
+}
+
 faucet_common_file::delegate_sink!(S3Sink, inner);
 
 /// What the S3 sink supplies to the shared sink; requests, metering and the
 /// preflight probe are the backend's.
 struct S3Identity {
     bucket: String,
-    prefix: String,
+    key: String,
 }
 
 impl SinkIdentity for S3Identity {
@@ -79,8 +91,14 @@ impl SinkIdentity for S3Identity {
     }
 
     fn dataset_uri(&self) -> String {
-        format!("s3://{}/{}", self.bucket, self.prefix)
+        format!("s3://{}/{}", self.bucket, self.key)
     }
+}
+
+/// The object-key layout a run writes under: `prefix` followed by the `path`
+/// template, so two pipelines writing different paths are different datasets.
+fn object_key_layout(prefix: &str, path: Option<&str>) -> String {
+    format!("{prefix}{}", path.unwrap_or_default())
 }
 
 #[cfg(test)]
@@ -101,5 +119,20 @@ mod tests {
         assert_eq!(sink.format(), FileFormat::JsonLines);
         assert_eq!(sink.inner.backend().bucket(), "b");
         assert!(sink.config_schema().is_object());
+    }
+
+    #[tokio::test]
+    async fn dataset_uri_names_the_path_template() {
+        let uri = |path: &str| {
+            let config: S3SinkConfig = serde_json::from_value(serde_json::json!({
+                "bucket": "b", "prefix": "p/", "path": path, "region": "us-east-1", "endpoint_url": "http://127.0.0.1:9"
+            }))
+            .unwrap();
+            async move { S3Sink::new(config).await.unwrap().dataset_uri() }
+        };
+        let orders = uri("orders/part-{part}.parquet").await;
+        let users = uri("users.csv").await;
+        assert_eq!(orders, "s3://b/p/orders/part-{part}.parquet");
+        assert_eq!(users, "s3://b/p/users.csv");
     }
 }

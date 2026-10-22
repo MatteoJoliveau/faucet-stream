@@ -27,7 +27,8 @@ For landing files in object storage without a warehouse, use
   checks nested keys against the declared type first and fails the page naming
   any it would drop (`payload.b`)
   — and `parse_json` over the value's JSON text for `VARIANT`, so a JSON string
-  stays a string), so the insert and staged paths can never land a value
+  stays a string; `to_binary(…, 'BASE64')` for `BINARY`, decoding the base64
+  text binary values travel as and failing on anything else), so the insert and staged paths can never land a value
   differently.
 - **Write modes** — `append`, `upsert` / `delete` via `MERGE` (with
   `delete_marker`), and `overwrite` via a staging table and an atomic swap.
@@ -144,8 +145,14 @@ need the crate's `staging` feature.
   one it did not, so an upsert never overwrites a stored value with `NULL`. The
   exactly-once append path likewise fills a column the page lacks with its
   `DEFAULT`.
-- **overwrite** — `begin` drops any leftover `<table>__faucet_ovw` and creates
-  it `LIKE` the target; every page lands in it; `commit` runs one
+- **overwrite** — `begin` drops any leftover staging and creates it `LIKE` the
+  target. Under the CLI the staging is `<table>__faucet_ovw_<token>`, with a run
+  token shared by the run's begin, writer and commit instances, so a concurrent
+  overwrite of the same table neither drops nor shares it; a tokened `begin` also
+  drops the untokened `<table>__faucet_ovw`, and another run's staging only once
+  its token is more than 24 hours old (an abandoned crash). Without a token the
+  staging is `<table>__faucet_ovw`, and the `faucet status --probe` check also
+  reports any run's tokened staging (from `information_schema.tables`); every page lands in it; `commit` runs one
   `INSERT OVERWRITE TABLE t SELECT * FROM <staging>` (with an explicit column
   list leaving out `GENERATED ALWAYS` identity / generated columns, which the
   target computes) (a single Delta commit —

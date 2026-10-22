@@ -144,7 +144,7 @@ Every change event is one JSON object:
 | Column type | JSON |
 |---|---|
 | `TIMESTAMP` | RFC 3339 UTC string |
-| `DATETIME` / `DATE` / `TIME` | `YYYY-MM-DD HH:MM:SS[.fff]` / `YYYY-MM-DD` / `HH:MM:SS[.fff]` strings |
+| `DATETIME` / `DATE` / `TIME` | RFC 3339 at `+00:00` (`2024-01-03T04:05:06.123456+00:00`, exactly as the `mysql` query source snapshots it; a zero date keeps `0000-00-00 00:00:00`) / `YYYY-MM-DD` / `HH:MM:SS[.fff]` strings |
 | `YEAR` | number |
 | `FLOAT` | the single-precision value's shortest decimal form |
 | `ENUM` / `SET` | the label / the comma-joined labels (needs `binlog_row_metadata=FULL`, already required) |
@@ -193,7 +193,7 @@ Both lists must use fully-qualified names (e.g. `appdb.users`); an unqualified e
 
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
-| `idle_timeout` | int (seconds) | `30` | End the fetch cycle after this long with no new events. The accumulated page is flushed and the bookmark saved. Must be `> 0`. |
+| `idle_timeout` | int (seconds) | `30` | End the fetch cycle after this long with no captured change (events of tables excluded by `include_tables` / `exclude_tables` do not count, so a busy server still ends the cycle). The accumulated page is flushed and the bookmark saved. Transactions with no captured rows still move the bookmark: on their own they are emitted as a bookmark-only page at most every 30 s. Must be `> 0`. |
 | `max_staged_records` | int \| null | `null` | Abort if a single in-progress transaction buffers more than this many rows. `null` = unbounded. Set it to guard against OOM on bulk transactions. Also caps the rows of transactions held behind an undecided XA transaction — not that transaction's own rows (1,000,000 when `null`). |
 | `batch_size` | int | `1000` | Records per page: committed transactions are coalesced until a page holds at least this many (a transaction is never split) or its oldest transaction has waited one second. `0` = accumulate all committed transactions into one trailing page (useful for tiny lookup tables). |
 

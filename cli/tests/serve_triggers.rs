@@ -379,6 +379,67 @@ async fn a_webhook_fire_with_quoted_and_embedded_tokens_runs() {
     assert_eq!(written.lines().count(), 1, "{written}");
 }
 
+/// The object_arrival cursor survives a restart: an object that arrived
+/// while the server was down is still fired (`start_at: now` applies to the
+/// first start only), and an object already fired is not fired again.
+#[cfg(feature = "triggers-object-store")]
+#[tokio::test]
+async fn object_arrival_cursor_survives_a_restart() {
+    use faucet_cli::serve::triggers::object_arrival::ObjectArrivalWatcher;
+    use faucet_cli::serve::triggers::spec::{ArrivalMode, StartAt};
+    use faucet_cli::serve::triggers::watcher::Watcher;
+    use object_store::memory::InMemory;
+    use object_store::path::Path as OPath;
+    use object_store::{ObjectStore, ObjectStoreExt};
+
+    let dir = tempfile::tempdir().unwrap();
+    let csv = dir.path().join("in.csv");
+    std::fs::write(&csv, "a\n1\n").unwrap();
+    let out = dir.path().join("out.jsonl");
+    let inline = inline_pipeline(csv.to_str().unwrap(), out.to_str().unwrap());
+    let file: faucet_cli::serve::triggers::spec::TriggersFile = serde_yaml::from_str(&format!(
+        "version: 1\ntriggers:\n  - name: drop\n    type: object_arrival\n    store: {{ type: s3, bucket: b }}\n    config: {}\n",
+        serde_json::to_string(&inline).unwrap()
+    ))
+    .unwrap();
+    let compiled = CompiledTriggers::compile(file).unwrap();
+    let state = build_state(&compiled);
+    let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let watcher = |now| {
+        ObjectArrivalWatcher::new(
+            Arc::new(compiled.triggers[0].clone()),
+            store.clone(),
+            "b".into(),
+            None,
+            ArrivalMode::PerObject,
+            Duration::from_secs(30),
+            StartAt::Now,
+            now,
+        )
+    };
+
+    let mut first = watcher(chrono::Utc::now() - chrono::Duration::seconds(60));
+    assert!(!first.poll(&state).await.unwrap(), "nothing there yet");
+    drop(first);
+    // Lands while no watcher runs; the next start's clock is past it.
+    store
+        .put(&OPath::from("incoming/a.json"), b"{}".to_vec().into())
+        .await
+        .unwrap();
+    let mut second = watcher(chrono::Utc::now() + chrono::Duration::seconds(60));
+    assert!(
+        second.poll(&state).await.unwrap(),
+        "an object that arrived while down is fired"
+    );
+    wait_for_runs(&state, 1).await;
+    drop(second);
+    let mut third = watcher(chrono::Utc::now() + chrono::Duration::seconds(120));
+    assert!(
+        !third.poll(&state).await.unwrap(),
+        "a fired object is not fired again"
+    );
+}
+
 #[cfg(feature = "triggers-object-store")]
 #[tokio::test]
 async fn object_arrival_enqueues_one_run_per_object_and_dedupes() {
@@ -1037,6 +1098,48 @@ async fn webhook_debounce_coalesces_second_fire() {
         1,
         "debounce must coalesce the second fire — exactly one run expected"
     );
+}
+
+/// A fire that does not go through leaves the debounce window open: the
+/// caller's retry is attempted again rather than answered `coalesced`.
+#[tokio::test(flavor = "multi_thread")]
+async fn webhook_debounce_is_not_consumed_by_a_failed_fire() {
+    let dir = tempfile::tempdir().unwrap();
+    // A config version this binary refuses: the submit fails, no run starts.
+    let inline = serde_json::json!({
+        "version": 99,
+        "pipeline": {
+            "source": { "type": "csv", "config": { "path": "in.csv" } },
+            "sink": { "type": "stdout", "config": {} }
+        }
+    });
+    let yaml = format!(
+        "version: 1\ntriggers:\n  - name: hook\n    type: webhook\n    methods: [POST]\n    debounce_secs: 60\n    config: {}\n",
+        serde_json::to_string(&inline).unwrap()
+    );
+    let triggers = dir.path().join("triggers.yaml");
+    std::fs::write(&triggers, yaml).unwrap();
+
+    let token = "test-token";
+    let base = spawn_serve_with_triggers(free_port(), Some(token), &triggers).await;
+    let client = reqwest::Client::new();
+    let url = format!("{base}/v1/triggers/hook");
+    for attempt in 0..2 {
+        let resp = client
+            .post(&url)
+            .bearer_auth(token)
+            .json(&serde_json::json!({}))
+            .send()
+            .await
+            .unwrap();
+        let status = resp.status();
+        let body = resp.text().await.unwrap();
+        assert!(
+            status.is_server_error() || status.is_client_error(),
+            "attempt {attempt}: a failed fire must not be acknowledged: {status} {body}"
+        );
+        assert!(!body.contains("coalesced"), "attempt {attempt}: {body}");
+    }
 }
 
 #[tokio::test(flavor = "multi_thread")]

@@ -1076,6 +1076,39 @@ async fn empty_media_load_stream_finalizes_cleanly() {
     );
 }
 
+/// A direct overwrite whose source was empty empties an existing target at
+/// the terminal flush, as the staged path's swap does; nothing is uploaded.
+#[tokio::test]
+async fn empty_direct_overwrite_truncates_an_existing_target() {
+    let server = MockServer::start().await;
+    mount_token_endpoint(&server).await;
+    mount_table_schema(&server).await;
+    mount_query_and_job(&server, "job-trunc").await;
+
+    let mut config = config_overwrite();
+    config.media_load = true;
+    config.create_table = false;
+    config.upload_base_url = Some(server.uri());
+    let config = with_sa_auth(config, &server);
+    let (sink, _sa) = build_sink(&server, config).await;
+
+    sink.begin_overwrite().await.expect("begin");
+    sink.flush().await.expect("flush");
+    sink.flush().await.expect("second flush");
+    sink.commit_overwrite().await.expect("commit");
+
+    let qs = queries(&server).await;
+    assert_eq!(
+        qs.iter()
+            .filter(|q| q.as_str() == "TRUNCATE TABLE `p.d.t`")
+            .count(),
+        1,
+        "{qs:?}"
+    );
+    let reqs = server.received_requests().await.expect("recording");
+    assert!(!reqs.iter().any(|r| r.url.path().starts_with("/upload/")));
+}
+
 /// Aborting a direct overwrite cancels the un-finalized resumable session
 /// (DELETE the session URI); no finalize PUT is sent.
 #[tokio::test]
@@ -2265,8 +2298,37 @@ async fn staging_probe_reports_present_and_absent() {
         })))
         .mount(&server)
         .await;
+    // Without a run token the probe also lists every run's tokened staging.
+    let listing = |names: &[String]| {
+        let rows: Vec<_> = names.iter().map(|n| json!({"f": [{"v": n}]})).collect();
+        ResponseTemplate::new(200).set_body_json(json!({
+            "kind": "bigquery#queryResponse",
+            "jobComplete": true,
+            "jobReference": {"projectId": PROJECT_ID, "jobId": "job-l"},
+            "schema": {"fields": [{"name": "table_name", "type": "STRING"}]},
+            "totalRows": rows.len().to_string(),
+            "rows": rows,
+        }))
+    };
+    Mock::given(method("POST"))
+        .and(path(format!("/projects/{PROJECT_ID}/queries")))
+        .respond_with(listing(&[]))
+        .up_to_n_times(1)
+        .with_priority(1)
+        .mount(&server)
+        .await;
     let (sink, _sa) = build_sink(&server, config_overwrite()).await;
     assert_eq!(sink.overwrite_staging_exists().await.unwrap(), Some(false));
+    let live = format!(
+        "{TABLE_ID}__faucet_ovw_{}",
+        faucet_core::idempotency::new_overwrite_run_token()
+    );
+    Mock::given(method("POST"))
+        .and(path(format!("/projects/{PROJECT_ID}/queries")))
+        .respond_with(listing(&[live]))
+        .mount(&server)
+        .await;
+    assert_eq!(sink.overwrite_staging_exists().await.unwrap(), Some(true));
 }
 
 /// The resumable-upload initiate body (the load-job JSON) of the first upload.
@@ -2389,5 +2451,143 @@ async fn append_uses_a_table_a_concurrent_writer_created_meanwhile() {
             .any(|q| q.contains("CREATE OR REPLACE TABLE `p.d.t` (")
                 || q.contains("CREATE TABLE IF NOT EXISTS `p.d.t` (")),
         "no table DDL once the table has a schema: {qs:?}"
+    );
+}
+
+/// A run joined to an overwrite run token stages under its own table, and its
+/// begin drops the untokened staging and staging a crashed run abandoned —
+/// never a live concurrent run's.
+#[tokio::test]
+async fn tokened_overwrite_stages_apart_and_sweeps_only_abandoned_runs() {
+    use faucet_core::idempotency::new_overwrite_run_token;
+    let server = MockServer::start().await;
+    mount_token_endpoint(&server).await;
+    mount_table_schema(&server).await;
+    let (own, live) = (new_overwrite_run_token(), new_overwrite_run_token());
+    let abandoned = "10000000aaaaaa";
+    let rows: Vec<_> = [
+        format!("{TABLE_ID}__faucet_ovw_{own}"),
+        format!("{TABLE_ID}__faucet_ovw_{live}"),
+        format!("{TABLE_ID}__faucet_ovw_{abandoned}"),
+        format!("{TABLE_ID}__faucet_ovw_{abandoned}_x"),
+    ]
+    .iter()
+    .map(|n| json!({"f": [{"v": n}]}))
+    .collect();
+    Mock::given(method("POST"))
+        .and(path(format!("/projects/{PROJECT_ID}/queries")))
+        .and(wiremock::matchers::body_string_contains(
+            "INFORMATION_SCHEMA",
+        ))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "kind": "bigquery#queryResponse",
+            "jobComplete": true,
+            "jobReference": {"projectId": PROJECT_ID, "jobId": "job-l"},
+            "schema": {"fields": [{"name": "table_name", "type": "STRING"}]},
+            "totalRows": rows.len().to_string(),
+            "rows": rows,
+        })))
+        .with_priority(1)
+        .mount(&server)
+        .await;
+    mount_query_and_job(&server, "job-o").await;
+
+    let (sink, _sa) = build_sink(&server, config_overwrite()).await;
+    let sink = sink.with_overwrite_run(&own).unwrap();
+    assert!(sink.with_overwrite_run("../x").is_err());
+    let (sink, _sa) = build_sink(&server, config_overwrite()).await;
+    let sink = sink.with_overwrite_run(&own).unwrap();
+    sink.begin_overwrite().await.expect("begin");
+
+    let qs = queries(&server).await;
+    let drops: Vec<&String> = qs.iter().filter(|q| q.starts_with("DROP")).collect();
+    assert_eq!(
+        drops,
+        [
+            &"DROP TABLE IF EXISTS `p.d.t__faucet_ovw`".to_string(),
+            &format!("DROP TABLE IF EXISTS `p.d.t__faucet_ovw_{abandoned}`"),
+        ],
+        "{qs:?}"
+    );
+    assert!(
+        qs.iter().any(|q| q.contains(&format!(
+            "CREATE OR REPLACE TABLE `p.d.t__faucet_ovw_{own}` LIKE `p.d.t`"
+        ))),
+        "{qs:?}"
+    );
+}
+
+/// Mount an `INFORMATION_SCHEMA` staging-listing response.
+async fn mount_staging_listing(server: &MockServer, body: serde_json::Value) {
+    Mock::given(method("POST"))
+        .and(path(format!("/projects/{PROJECT_ID}/queries")))
+        .and(wiremock::matchers::body_string_contains(
+            "INFORMATION_SCHEMA",
+        ))
+        .respond_with(ResponseTemplate::new(200).set_body_json(body))
+        .with_priority(1)
+        .mount(server)
+        .await;
+}
+
+/// A staging listing BigQuery does not finish inline is skipped: begin still
+/// succeeds and drops no tokened staging.
+#[tokio::test]
+async fn an_unfinished_staging_listing_is_skipped() {
+    use faucet_core::idempotency::new_overwrite_run_token;
+    let server = MockServer::start().await;
+    mount_token_endpoint(&server).await;
+    mount_table_schema(&server).await;
+    mount_staging_listing(
+        &server,
+        json!({
+            "kind": "bigquery#queryResponse",
+            "jobComplete": false,
+            "jobReference": {"projectId": PROJECT_ID, "jobId": "job-l"},
+        }),
+    )
+    .await;
+    mount_query_and_job(&server, "job-o").await;
+    let own = new_overwrite_run_token();
+    let (sink, _sa) = build_sink(&server, config_overwrite()).await;
+    let sink = sink.with_overwrite_run(&own).unwrap();
+    sink.begin_overwrite().await.expect("begin");
+    let qs = queries(&server).await;
+    let drops: Vec<&String> = qs.iter().filter(|q| q.starts_with("DROP")).collect();
+    assert_eq!(
+        drops,
+        [&"DROP TABLE IF EXISTS `p.d.t__faucet_ovw`".to_string()],
+        "{qs:?}"
+    );
+}
+
+/// A listing row whose name is not a string fails begin with a decode error.
+#[tokio::test]
+async fn an_undecodable_staging_listing_fails_begin() {
+    use faucet_core::idempotency::new_overwrite_run_token;
+    let server = MockServer::start().await;
+    mount_token_endpoint(&server).await;
+    mount_table_schema(&server).await;
+    mount_staging_listing(
+        &server,
+        json!({
+            "kind": "bigquery#queryResponse",
+            "jobComplete": true,
+            "jobReference": {"projectId": PROJECT_ID, "jobId": "job-l"},
+            "schema": {"fields": [{"name": "table_name", "type": "STRING"}]},
+            "totalRows": "1",
+            "rows": [{"f": [{"v": {"not": "a string"}}]}],
+        }),
+    )
+    .await;
+    mount_query_and_job(&server, "job-o").await;
+    let own = new_overwrite_run_token();
+    let (sink, _sa) = build_sink(&server, config_overwrite()).await;
+    let sink = sink.with_overwrite_run(&own).unwrap();
+    let err = sink.begin_overwrite().await.expect_err("decode failure");
+    assert!(
+        err.to_string()
+            .contains("BigQuery staging listing decode failed"),
+        "{err}"
     );
 }

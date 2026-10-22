@@ -475,6 +475,11 @@ pub fn expand(cfg: &PipelineConfig) -> CliResult<Vec<ExpandedNode>> {
                     "matrix row '{id}': `discover.select` must not be empty"
                 )));
             }
+            if let Err(e) = crate::discovery_matrix::check_select(&disc.select) {
+                return Err(CliError::Config(format!(
+                    "matrix row '{id}': `fan_out.select` is not a valid JSONPath: {e}"
+                )));
+            }
             if !is_ident(&disc.as_alias) {
                 return Err(CliError::Config(format!(
                     "matrix row '{id}': `discover.as` ('{}') must match ^[a-z0-9][a-z0-9_-]*$",
@@ -859,7 +864,6 @@ pub fn expand(cfg: &PipelineConfig) -> CliResult<Vec<ExpandedNode>> {
         let mut deferred = Vec::new();
         collect_deferred(&merged_source.config, &mut deferred);
         collect_deferred(&merged_sink.config, &mut deferred);
-        check_deferred_scope(row_id, &role, &deferred, &row_id_set)?;
 
         // Resolved readiness status (#371): `merged_source.status` already
         // carries the template→row `source.status` scalar merge; default to
@@ -895,6 +899,13 @@ pub fn expand(cfg: &PipelineConfig) -> CliResult<Vec<ExpandedNode>> {
             row_id,
         )?;
         apply_cdc_unwrap_key(&merged_sink.config, &mut transforms);
+        // The executor resolves `${parent.*}` in transform configs too (#568),
+        // so their tokens are scoped like the connector's and the parent's
+        // captured projection keeps the fields they read.
+        for t in &transforms {
+            collect_deferred(&t.config, &mut deferred);
+        }
+        check_deferred_scope(row_id, &role, &deferred, &row_id_set)?;
         let state = row.state.clone().or_else(|| cfg.pipeline.state.clone());
         // Row override wins; fall back to the top-level delivery mode.
         let delivery = row.delivery.unwrap_or(cfg.delivery);
@@ -1001,6 +1012,25 @@ pub fn expand(cfg: &PipelineConfig) -> CliResult<Vec<ExpandedNode>> {
         if let Some(ref spec) = masking {
             faucet_core::CompiledMasking::compile(spec)
                 .map_err(|e| CliError::Config(format!("masking (row `{row_id}`): {e}")))?;
+            // An `applies_to` entry naming no sink template, sink kind or the
+            // DLQ scopes its rule to nothing, leaving the fields unmasked.
+            let unknown = spec.unknown_applies_to(|t| {
+                t == crate::governance::DLQ_ID
+                    || registry.sinks.contains_key(t)
+                    || merged_sink.kind == t
+                    || crate::registry::is_known_sink_kind(t)
+            });
+            if !unknown.is_empty() {
+                let list: Vec<String> = unknown
+                    .iter()
+                    .map(|(rule, t)| format!("rule `{rule}` names `{t}`"))
+                    .collect();
+                return Err(CliError::Config(format!(
+                    "masking: {} — `applies_to` must name a sink template, a sink kind or \
+                     `dlq`; a rule scoped to an unknown name masks nothing",
+                    list.join(", ")
+                )));
+            }
         }
 
         // Resilience poison-pill cross-check: `poison.action: dlq` routes
@@ -2505,8 +2535,9 @@ fn check_cleanup_completeness(
     if crate::registry::source_reads_a_delta(&source.kind, &source.config) {
         return Err(CliError::Config(format!(
             "row '{row_id}': `complete_for.on_missing: delete` needs a complete fetch every run, \
-             but source '{}' reads only the messages that arrived since its last run, so its \
-             cleanup would delete every row in scope that did not arrive again",
+             but source '{}' reads only what arrived since its last run (a queue, a \
+             subscription, a listener), so its cleanup would delete every row in scope that did \
+             not arrive again",
             source.kind
         )));
     }
@@ -2734,6 +2765,37 @@ mod tests {
             kind: "cdc_unwrap".into(),
             config,
         }]
+    }
+
+    #[cfg(feature = "masking")]
+    #[test]
+    fn a_masking_rule_scoped_to_an_unknown_sink_is_refused() {
+        let yaml = |target: &str| {
+            format!(
+                r#"
+version: 1
+name: m
+pipeline:
+  source: {{ type: csv, config: {{ path: ./in.csv }} }}
+  sinks:
+    warehouse: {{ type: jsonl, config: {{ path: ./a.jsonl }} }}
+  masking:
+    rules:
+      - name: emails
+        match: {{ value_detector: email }}
+        action: {{ type: hash }}
+        applies_to: [{target}]
+matrix:
+  - id: r
+    sink: {{ ref: warehouse }}
+"#
+            )
+        };
+        let err = expand(&cfg(&yaml("warehose"))).unwrap_err().to_string();
+        assert!(err.contains("rule `emails` names `warehose`"), "{err}");
+        for ok in ["warehouse", "jsonl", "dlq"] {
+            expand(&cfg(&yaml(ok))).unwrap_or_else(|e| panic!("{ok}: {e}"));
+        }
     }
 
     #[test]
@@ -3765,6 +3827,44 @@ matrix:
         assert_eq!(posts.deferred_refs.len(), 1);
         assert_eq!(posts.deferred_refs[0].referenced_id, "users");
         assert_eq!(posts.deferred_refs[0].dotted_path, "id");
+    }
+
+    #[test]
+    fn transform_tokens_are_scoped_and_projected_like_connector_tokens() {
+        let c = cfg(r#"
+version: 1
+pipeline:
+  source: { type: rest, config: {} }
+  sink:   { type: jsonl, config: { path: ./o, append: true } }
+matrix:
+  - id: p
+  - id: c
+    parent: p
+    transforms: [{ type: set, config: { values: { pname: "${p.name}" } } }]
+"#);
+        let nodes = expand(&c).unwrap();
+        let child = nodes.iter().find(|n| n.id == "c").unwrap();
+        assert!(
+            child
+                .deferred_refs
+                .iter()
+                .any(|r| r.referenced_id == "p" && r.dotted_path == "name"),
+            "{:?}",
+            child.deferred_refs
+        );
+
+        let c = cfg(r#"
+version: 1
+pipeline:
+  source: { type: rest, config: {} }
+  sink:   { type: jsonl, config: { path: ./o, append: true } }
+matrix:
+  - id: p
+  - id: r
+    transforms: [{ type: set, config: { values: { src: "${p.id}" } } }]
+"#);
+        let err = expand(&c).unwrap_err().to_string();
+        assert!(err.contains("not its parent"), "{err}");
     }
 
     #[test]
@@ -4850,7 +4950,7 @@ pipeline:
             "singer",
             &serde_json::json!({})
         ));
-        for kind in ["sqs", "pubsub", "rabbitmq", "nats"] {
+        for kind in ["sqs", "pubsub", "rabbitmq", "nats", "webhook", "websocket"] {
             assert!(
                 crate::registry::source_reads_a_delta(kind, &serde_json::json!({})),
                 "{kind}"
@@ -5431,6 +5531,18 @@ pipeline:
             .unwrap_err()
             .to_string();
         assert!(err.contains("partition") && err.contains("faucet"), "{err}");
+    }
+
+    #[test]
+    fn a_fan_out_select_that_is_not_jsonpath_is_refused() {
+        let yaml = format!(
+            "{TWO_ROWS}  - id: regions\n    fan_out: {{ source: {{ type: csv, config: {{ path: r.csv }} }}, select: \"$[?(@.a\", as: name }}\n"
+        );
+        let err = expand(&cfg(&yaml)).unwrap_err().to_string();
+        assert!(
+            err.contains("matrix row 'regions'") && err.contains("not a valid JSONPath"),
+            "{err}"
+        );
     }
 
     /// #789 CLI-59: a `parent:` naming a `fan_out:` row would run nothing.

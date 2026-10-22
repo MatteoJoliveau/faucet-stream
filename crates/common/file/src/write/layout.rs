@@ -25,6 +25,11 @@ pub const UPLOAD_ROLE: &str = "-upload-";
 /// Prefix of the swap area an overwrite run (`write_mode: overwrite`) writes
 /// into before its files are moved into place.
 pub const SWAP_PREFIX: &str = ".faucet-overwrite-";
+/// What separates the swap area's name from an overwrite run token
+/// (`.faucet-overwrite-<tag>.run-<token>`). Only characters every store keeps
+/// as they are (a `~` comes back percent-encoded from some), so the token is
+/// recognised by its exact shape at the end of this template's own name.
+pub const SWAP_RUN_SEPARATOR: &str = ".run-";
 /// Digits in a part number (`00001`).
 pub const PART_WIDTH: usize = 5;
 
@@ -186,6 +191,26 @@ impl NameTemplate {
         format!("{SWAP_PREFIX}{tag}")
     }
 
+    /// The swap area's name for overwrite run `run`
+    /// ([`faucet_core::idempotency::OVERWRITE_RUN_KEY`]):
+    /// [`swap_dir_name`](Self::swap_dir_name) without a token, else
+    /// `<swap_dir_name>.run-<token>`, so concurrent runs never share one.
+    pub fn swap_run_dir_name(&self, run: Option<&str>) -> String {
+        match run {
+            Some(token) => format!("{}{SWAP_RUN_SEPARATOR}{token}", self.swap_dir_name()),
+            None => self.swap_dir_name(),
+        }
+    }
+
+    /// The run token of `name` when it is a tokened swap area of this
+    /// template; `None` for any other name, the untokened area included.
+    pub fn swap_run_token(&self, name: &str) -> Option<String> {
+        let token = name
+            .strip_prefix(&self.swap_dir_name())?
+            .strip_prefix(SWAP_RUN_SEPARATOR)?;
+        faucet_core::idempotency::is_overwrite_run_token(token).then(|| token.to_string())
+    }
+
     /// `(part, name)` of every name in `names` that belongs to this template,
     /// sorted by part.
     pub fn select(&self, names: Vec<String>) -> Vec<(u64, String)> {
@@ -300,6 +325,16 @@ mod tests {
     fn swap_names_scratch_and_selection() {
         let (_, l) = t("out/x y-{part}.jsonl", false);
         assert_eq!(l.swap_dir_name(), ".faucet-overwrite-x_y-_part_.jsonl");
+        let run = l.swap_run_dir_name(Some("67000000abcdef"));
+        assert_eq!(run, ".faucet-overwrite-x_y-_part_.jsonl.run-67000000abcdef");
+        assert_eq!(l.swap_run_dir_name(None), l.swap_dir_name());
+        assert!(is_swap_dir_name(&run));
+        assert_eq!(l.swap_run_token(&run).as_deref(), Some("67000000abcdef"));
+        assert_eq!(l.swap_run_token(&l.swap_dir_name()), None);
+        assert_eq!(
+            l.swap_run_token(&format!("{}.run-nope", l.swap_dir_name())),
+            None
+        );
         assert!(is_swap_dir_name(&l.swap_dir_name()));
         assert!(!is_swap_dir_name("x y-00001.jsonl"));
         for role in ["", "-body", "-old", "-seal", "-prev"] {

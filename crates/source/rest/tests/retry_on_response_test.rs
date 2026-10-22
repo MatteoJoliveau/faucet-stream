@@ -250,3 +250,116 @@ fn invalid_matchers_fail_at_load() {
     let err = RestStream::new(c).err().unwrap().to_string();
     assert!(err.contains("retry_on_response[0]"), "{err}");
 }
+
+/// Throttles each path `throttles` times (counted per path), after a delay
+/// long enough that concurrent partitions overlap.
+struct PerPathThrottle {
+    calls: Arc<std::sync::Mutex<std::collections::HashMap<String, usize>>>,
+    throttles: usize,
+}
+impl Respond for PerPathThrottle {
+    fn respond(&self, req: &Request) -> ResponseTemplate {
+        let mut calls = self.calls.lock().unwrap();
+        let n = calls.entry(req.url.path().to_string()).or_insert(0);
+        *n += 1;
+        let t = if *n <= self.throttles {
+            ResponseTemplate::new(400).set_body_json(json!({"error": {"code": 17}}))
+        } else {
+            ResponseTemplate::new(200).set_body_json(json!({"data": [{"id": 1}]}))
+        };
+        t.set_delay(Duration::from_millis(50))
+    }
+}
+
+#[tokio::test]
+async fn concurrent_requests_each_get_their_own_match_budget() {
+    let server = MockServer::start().await;
+    let calls = Arc::new(std::sync::Mutex::new(std::collections::HashMap::new()));
+    Mock::given(method("GET"))
+        .respond_with(PerPathThrottle {
+            calls: calls.clone(),
+            throttles: 2,
+        })
+        .mount(&server)
+        .await;
+    let mut c = RestStreamConfig::new(&server.uri(), "/p/{n}")
+        .records_path("$.data[*]")
+        .pagination(PaginationStyle::None)
+        .retry_backoff(Duration::from_millis(1));
+    c.retry_on_response = vec![meta_matcher()];
+    c.max_retries = 2;
+    c.partition_concurrency = Some(4);
+    c.partitions = (0..4)
+        .map(|n| std::collections::HashMap::from([("n".to_string(), json!(n))]))
+        .collect();
+    let records = RestStream::new(c)
+        .unwrap()
+        .fetch_all()
+        .await
+        .expect("each partition is within its own max_retries");
+    assert_eq!(records.len(), 4);
+    let calls = calls.lock().unwrap();
+    assert_eq!(calls.len(), 4);
+    assert!(calls.values().all(|n| *n == 3), "{calls:?}");
+}
+
+/// A 2xx async-job fetch that matches a `match_success` rule is retried, not
+/// parsed as the result.
+#[tokio::test]
+async fn async_job_fetch_retries_a_matching_success_response() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/jobs"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({"id": "j1"})))
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/jobs/j1"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({"state": "Complete"})))
+        .mount(&server)
+        .await;
+    let fetches = Arc::new(AtomicUsize::new(0));
+    struct Fetch(Arc<AtomicUsize>);
+    impl Respond for Fetch {
+        fn respond(&self, _: &Request) -> ResponseTemplate {
+            if self.0.fetch_add(1, Ordering::SeqCst) == 0 {
+                ResponseTemplate::new(200)
+                    .insert_header("x-ratelimit-remaining", "0")
+                    .set_body_json(json!({"data": []}))
+            } else {
+                ResponseTemplate::new(200).set_body_json(json!({"data": [{"id": 1}, {"id": 2}]}))
+            }
+        }
+    }
+    Mock::given(method("GET"))
+        .and(path("/jobs/j1/result"))
+        .respond_with(Fetch(fetches.clone()))
+        .mount(&server)
+        .await;
+    let mut c = RestStreamConfig::new(&server.uri(), "")
+        .records_path("$.data[*]")
+        .retry_backoff(Duration::from_millis(1));
+    c.retry_on_response = vec![
+        serde_json::from_value(json!({
+            "match_success": true,
+            "status": [200],
+            "header": "x-ratelimit-remaining",
+            "values": ["0"],
+            "backoff_secs": 1
+        }))
+        .unwrap(),
+    ];
+    c.async_job = Some(
+        serde_json::from_value(json!({
+            "submit": {"method": "POST", "url": "/jobs", "json": {"query": "SELECT 1"}},
+            "job_id": "$.id",
+            "poll": {"url": "/jobs/${job_id}", "interval_secs": 0, "timeout_secs": 30},
+            "status": {"path": "$.state", "success": ["Complete"], "failure": ["Failed"]},
+            "fetch": {"method": "GET", "url": "/jobs/${job_id}/result"}
+        }))
+        .unwrap(),
+    );
+    let records = RestStream::new(c).unwrap().fetch_all().await.unwrap();
+    assert_eq!(records, vec![json!({"id": 1}), json!({"id": 2})]);
+    assert_eq!(fetches.load(Ordering::SeqCst), 2);
+}

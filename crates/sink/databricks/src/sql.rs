@@ -161,6 +161,11 @@ pub fn cast_expr(expr: &str, full_type: &str) -> String {
         )
     } else if t == "variant" {
         format!("parse_json({expr})")
+    } else if t == "binary" {
+        // Binary values travel as standard base64 text (the fidelity
+        // rendering); `CAST(… AS binary)` would store the text's UTF-8 bytes.
+        // `to_binary` decodes and fails on text that is not base64.
+        format!("to_binary({expr}, 'BASE64')")
     } else {
         format!("CAST({expr} AS {})", full_type.trim())
     }
@@ -244,6 +249,20 @@ pub fn describe_sql(catalog: Option<&str>) -> String {
          THEN 'YES' ELSE 'NO' END FROM {src} \
          WHERE lower(table_schema) = lower(:faucet_schema) AND lower(table_name) = lower(:faucet_table) \
          ORDER BY ordinal_position"
+    )
+}
+
+/// The tables of `:faucet_schema` whose names start with `:faucet_prefix`
+/// (case-insensitively), one `table_name` per row.
+pub fn staging_tables_sql(catalog: Option<&str>) -> String {
+    let src = match catalog {
+        Some(c) => format!("{}.information_schema.tables", quote_ident(c)),
+        None => "information_schema.tables".to_owned(),
+    };
+    format!(
+        "SELECT table_name FROM {src} \
+         WHERE lower(table_schema) = lower(:faucet_schema) \
+         AND startswith(lower(table_name), lower(:faucet_prefix))"
     )
 }
 
@@ -1191,6 +1210,11 @@ mod tests {
             "from_json(x, 'map<string,int>', map('mode', 'FAILFAST'))"
         );
         assert_eq!(cast_expr("x", "variant"), "parse_json(x)");
+        // Binary arrives as base64 text and is decoded, not cast as text.
+        assert_eq!(cast_expr("x", "binary"), "to_binary(x, 'BASE64')");
+        assert_eq!(cast_expr("x", " BINARY "), "to_binary(x, 'BASE64')");
+        let b64 = faucet_core::fidelity::binary(&[0xde, 0xad, 0xbe, 0xef]);
+        assert_eq!(b64, serde_json::json!("3q2+7w=="));
     }
 
     #[test]
@@ -1217,6 +1241,8 @@ mod tests {
     #[test]
     fn describe_and_decode() {
         assert!(describe_sql(Some("main")).contains("FROM `main`.information_schema.columns"));
+        assert!(staging_tables_sql(Some("main")).contains("FROM `main`.information_schema.tables"));
+        assert!(staging_tables_sql(None).contains("FROM information_schema.tables"));
         assert!(describe_sql(None).contains("FROM information_schema.columns"));
         let got = columns_from_rows(vec![
             vec![

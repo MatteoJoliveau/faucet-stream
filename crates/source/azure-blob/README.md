@@ -35,7 +35,7 @@ Source-specific fields:
 | `file_format` | enum | `json_lines` | `json_lines` / `json_array` / `raw_text` / `csv` / `xml` / `xlsx`. |
 | `include` | string | *(unset)* | Glob over the whole object key selecting what to read (e.g. `exports/*.parquet`). Without it, zero-byte folder markers and keys with a `_`- or `.`-prefixed segment below the prefix (`_SUCCESS`, `_temporary/…`, `.crc`) are skipped; with it, exactly the matching keys are read. |
 | `max_objects` | int | — | Hard cap on objects read. |
-| `max_object_bytes` | int | `2147483648` | Largest object, once decompressed, that a whole-object format (JSON array, raw text, CSV, XML, Excel, Avro, ORC, buffered Parquet) may reach; a larger one fails the run instead of exhausting memory. |
+| `max_object_bytes` | int | `2147483648` | Largest object, once decompressed, that a whole-object format (JSON array, raw text, CSV, XML, Excel, Avro, ORC, buffered Parquet) may reach; a larger one fails the run instead of exhausting memory. It also bounds one line of a streamed JSON Lines object, so an object with no newline fails the same way. |
 | `concurrency` | int | `10` | Max concurrent object reads, on the streaming path as well as the batch one. The streaming prefetch is ordered, so records stay in listing order; `0` is clamped to 1. For `json_lines` it overlaps only the request setup (peak memory stays `O(batch_size)`); for `json_array` / `raw_text` up to `concurrency` whole bodies are resident. |
 | `batch_size` | int | `1000` | Records per `StreamPage`; `0` = one page per object. |
 | `verify_length` | bool | `true` | Verify each object's byte count against the `size` Azure reports; a short (truncated) or over-long transfer fails with `FaucetError::Source`. See [Read-integrity verification](#read-integrity-verification). |
@@ -181,6 +181,10 @@ pipeline:
       prefix: events/2026/
       file_format: json_lines
 ```
+
+## Lineage dataset URI
+
+`az://<account>/<container>/<prefix>` — e.g. `az://prodeu/exports/orders/`, the same shape the Azure Blob sink names what it writes, so lineage and the catalog see one dataset when a pipeline reads another's output. The account comes from `account`, a connection string's `AccountName`, or `devstoreaccount1` for the emulator; without one the URI is `az://<container>/<prefix>`.
 
 ## Timeouts, cancellation and retries
 

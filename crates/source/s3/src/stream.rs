@@ -468,13 +468,19 @@ impl S3Source {
             None => {}
         }
         if self.config.verify_checksum {
-            let advertised = crate::verify::S3Checksums {
-                crc32: response.checksum_crc32().map(str::to_string),
-                crc32c: response.checksum_crc32_c().map(str::to_string),
-                crc64nvme: response.checksum_crc64_nvme().map(str::to_string),
-                sha256: response.checksum_sha256().map(str::to_string),
-                etag: response.e_tag().map(str::to_string),
-            };
+            let advertised = crate::verify::without_composite(
+                crate::verify::S3Checksums {
+                    crc32: response.checksum_crc32().map(str::to_string),
+                    crc32c: response.checksum_crc32_c().map(str::to_string),
+                    crc64nvme: response.checksum_crc64_nvme().map(str::to_string),
+                    sha256: response.checksum_sha256().map(str::to_string),
+                    etag: response.e_tag().map(str::to_string),
+                },
+                matches!(
+                    response.checksum_type(),
+                    Some(aws_sdk_s3::types::ChecksumType::Composite)
+                ),
+            );
             match crate::verify::checksum_check(&advertised) {
                 Some(check) => checks.push(check),
                 None => tracing::warn!(
@@ -1177,8 +1183,10 @@ const DISCOVER_MAX_OBJECTS: usize = 1000;
 /// prefix from a single delimiter listing; when the listing yielded no common
 /// prefixes, fall back to one descriptor per object (capped at
 /// `DISCOVER_MAX_OBJECTS`). Each patch selects the dataset via the source's
-/// `prefix` config field — a full object key used as a prefix selects exactly
-/// that object. Pure — unit-testable without an S3 client.
+/// `prefix` config field. An object dataset also sets `include` to the
+/// glob-escaped key: a key used as a prefix alone also lists every sibling key
+/// that extends it (`raw/a.json` → `raw/a.jsonl`), which would read those
+/// objects in more than one row. Pure — unit-testable without an S3 client.
 fn descriptors_from_listing(
     prefixes: Vec<String>,
     objects: Vec<String>,
@@ -1196,7 +1204,10 @@ fn descriptors_from_listing(
         .into_iter()
         .take(DISCOVER_MAX_OBJECTS)
         .map(|k| {
-            let patch = serde_json::json!({ "prefix": k });
+            let patch = serde_json::json!({
+                "prefix": k,
+                "include": glob::Pattern::escape(&k),
+            });
             faucet_core::DatasetDescriptor::new(k, "object", patch)
         })
         .collect()
@@ -1495,9 +1506,41 @@ mod tests {
         assert_eq!(out.len(), 2);
         assert_eq!(out[0].name, "raw/a.jsonl");
         assert_eq!(out[0].kind, "object");
-        assert_eq!(out[0].config_patch, json!({ "prefix": "raw/a.jsonl" }));
+        assert_eq!(
+            out[0].config_patch,
+            json!({ "prefix": "raw/a.jsonl", "include": "raw/a.jsonl" })
+        );
         assert!(out[0].schema.is_none());
         assert!(out[0].estimated_rows.is_none());
+    }
+
+    #[test]
+    fn object_dataset_selects_exactly_its_key() {
+        let out = descriptors_from_listing(
+            vec![],
+            vec![
+                "raw/a.json".to_string(),
+                "raw/a.jsonl".to_string(),
+                "raw/odd[1]*?.json".to_string(),
+            ],
+        );
+        for d in &out {
+            let prefix = d.config_patch["prefix"].as_str().unwrap();
+            let filter =
+                faucet_common_file::ObjectFilter::new(d.config_patch["include"].as_str()).unwrap();
+            let listed = [
+                "raw/a.json",
+                "raw/a.jsonl",
+                "raw/a.json.gz",
+                "raw/odd[1]*?.json",
+            ];
+            let read: Vec<&str> = listed
+                .iter()
+                .copied()
+                .filter(|k| k.starts_with(prefix) && filter.keep(k, Some(1), prefix))
+                .collect();
+            assert_eq!(read, vec![d.name.as_str()], "dataset {}", d.name);
+        }
     }
 
     #[test]

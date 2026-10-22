@@ -399,17 +399,66 @@ pub fn expand_location(location: &str) -> Result<Vec<PathBuf>, FaucetError> {
     // A file sink's `{part}` template, and the `-{part}` it inserts before the
     // extension when a rollover cap is set, name numbered files (#862 M-026).
     if location.contains("{part}") {
-        return expand_location(&location.replace("{part}", "*"));
+        return numbered_parts(&location.replace("{part}", "*"), location);
     }
     match expand_plain(location) {
         Err(e) if !location.contains(['*', '?', '[']) && !Path::new(location).exists() => {
             match rolled_over_glob(location) {
-                Some(glob) => expand_plain(&glob).map_err(|_| e),
+                Some(glob) => numbered_parts(&glob, location).map_err(|_| e),
                 None => Err(e),
             }
         }
         other => other,
     }
+}
+
+/// The files `glob` matches whose file-name `*` stands for a part number
+/// (digits only), so `orders-*.jsonl` finds `orders-00001.jsonl` but never a
+/// sibling pipeline's `orders-eu.jsonl`.
+fn numbered_parts(glob: &str, location: &str) -> Result<Vec<PathBuf>, FaucetError> {
+    let pattern = Path::new(glob)
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or_default()
+        .to_string();
+    let files: Vec<PathBuf> = expand_plain(glob)
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|p| {
+            p.file_name()
+                .and_then(|n| n.to_str())
+                .is_some_and(|name| is_numbered_part(name, &pattern))
+        })
+        .collect();
+    if files.is_empty() {
+        return Err(FaucetError::Source(format!(
+            "DLQ location '{location}' matched no files (expected a .jsonl file, a directory of \
+             .jsonl files, or a glob)"
+        )));
+    }
+    Ok(files)
+}
+
+/// Whether `name` matches `pattern` with every `*` replaced by one or more
+/// digits. Pure.
+fn is_numbered_part(name: &str, pattern: &str) -> bool {
+    let mut parts = pattern.split('*');
+    let first = parts.next().unwrap_or_default();
+    let Some(mut rest) = name.strip_prefix(first) else {
+        return false;
+    };
+    for literal in parts {
+        let digits = rest.bytes().take_while(u8::is_ascii_digit).count();
+        if digits == 0 {
+            return false;
+        }
+        rest = &rest[digits..];
+        match rest.strip_prefix(literal) {
+            Some(r) => rest = r,
+            None => return false,
+        }
+    }
+    rest.is_empty()
 }
 
 /// The glob matching the numbered parts a rollover cap splits `path` into:
@@ -462,27 +511,101 @@ fn expand_plain(location: &str) -> Result<Vec<PathBuf>, FaucetError> {
 
 /// Read and classify every line of every file, collecting envelopes and
 /// tallies. Blank lines are ignored; malformed / non-envelope lines are
-/// counted but never abort the scan.
+/// counted but never abort the scan. Holds every envelope: prefer
+/// [`scan_each`] for anything that does not need them all at once.
 pub fn scan_files(files: &[PathBuf], dec: &DlqDecryptor) -> Result<ScanResult, FaucetError> {
-    let mut out = ScanResult::default();
+    let mut envelopes = Vec::new();
+    let tally = scan_each(files, dec, |env| {
+        envelopes.push(env);
+        Ok(())
+    })?;
+    Ok(ScanResult {
+        envelopes,
+        malformed: tally.malformed,
+        non_envelope: tally.non_envelope,
+        undecryptable: tally.undecryptable,
+        files_read: tally.files_read,
+    })
+}
+
+/// Whether `file`'s first non-blank line is sealed by the jsonl sink's
+/// `encryption:` block (reads one line).
+pub fn starts_sealed(file: &Path) -> Result<bool, FaucetError> {
+    use std::io::BufRead;
+    let read_err = |e: std::io::Error| {
+        FaucetError::Source(format!("reading DLQ file '{}': {e}", file.display()))
+    };
+    let reader = std::io::BufReader::new(std::fs::File::open(file).map_err(read_err)?);
+    for line in reader.lines() {
+        let line = line.map_err(read_err)?;
+        if !line.trim().is_empty() {
+            return Ok(line.trim().starts_with(SEALED_LINE_PREFIX));
+        }
+    }
+    Ok(false)
+}
+
+/// The tolerant-parse tallies of a [`scan_each`].
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct ScanTally {
+    /// Non-blank lines that were not valid JSON.
+    pub malformed: usize,
+    /// Valid-JSON lines that were not DLQ envelopes.
+    pub non_envelope: usize,
+    /// Sealed lines that could not be decrypted.
+    pub undecryptable: usize,
+    /// Files that were read.
+    pub files_read: usize,
+}
+
+/// Stream every line of every file (newline stripped, as `str::lines` does)
+/// to `visit`, one line in memory at a time.
+pub fn for_each_line(
+    file: &Path,
+    mut visit: impl FnMut(&str) -> Result<(), FaucetError>,
+) -> Result<(), FaucetError> {
+    use std::io::BufRead;
+    let read_err = |e: std::io::Error| {
+        FaucetError::Source(format!("reading DLQ file '{}': {e}", file.display()))
+    };
+    let mut reader = std::io::BufReader::new(std::fs::File::open(file).map_err(read_err)?);
+    let mut line = String::new();
+    loop {
+        line.clear();
+        if reader.read_line(&mut line).map_err(read_err)? == 0 {
+            return Ok(());
+        }
+        let text = line.strip_suffix('\n').unwrap_or(&line);
+        let text = text.strip_suffix('\r').unwrap_or(text);
+        visit(text)?;
+    }
+}
+
+/// Classify every line of every file and hand each envelope to `visit`,
+/// reading line by line so memory stays bounded by the longest line.
+/// Discarded lines are skipped.
+pub fn scan_each(
+    files: &[PathBuf],
+    dec: &DlqDecryptor,
+    mut visit: impl FnMut(UnwrappedEnvelope) -> Result<(), FaucetError>,
+) -> Result<ScanTally, FaucetError> {
+    let mut out = ScanTally::default();
     for file in files {
-        let text = std::fs::read_to_string(file).map_err(|e| {
-            FaucetError::Source(format!("reading DLQ file '{}': {e}", file.display()))
-        })?;
-        out.files_read += 1;
         let discarded = discarded_lines(file)?;
-        for line in text.lines() {
+        for_each_line(file, |line| {
             if !discarded.is_empty() && discarded.contains(&line_id(line)) {
-                continue;
+                return Ok(());
             }
             match classify_line_with(line, dec) {
                 LineOutcome::Blank => {}
                 LineOutcome::Malformed => out.malformed += 1,
                 LineOutcome::NonEnvelope => out.non_envelope += 1,
                 LineOutcome::Undecryptable => out.undecryptable += 1,
-                LineOutcome::Envelope(env) => out.envelopes.push(*env),
+                LineOutcome::Envelope(env) => visit(*env)?,
             }
-        }
+            Ok(())
+        })?;
+        out.files_read += 1;
     }
     Ok(out)
 }
@@ -578,6 +701,11 @@ impl DlqReaderSource {
     }
 }
 
+/// The error a panicked blocking reader task surfaces as.
+fn reader_panicked(e: tokio::task::JoinError) -> FaucetError {
+    FaucetError::Source(format!("DLQ reader task panicked: {e}"))
+}
+
 #[async_trait]
 impl Source for DlqReaderSource {
     async fn fetch_with_context(
@@ -589,15 +717,66 @@ impl Source for DlqReaderSource {
         let target = self.target.clone();
         let dec = self.dec.clone();
         // Blocking file IO off the async runtime.
-        let scan = tokio::task::spawn_blocking(move || scan_files(&files, &dec))
-            .await
-            .map_err(|e| FaucetError::Source(format!("DLQ reader task panicked: {e}")))??;
-        Ok(scan
-            .envelopes
-            .into_iter()
-            .filter(|env| replay_selects(env, reason.as_deref(), target.as_ref()))
-            .map(|env| env.payload)
-            .collect())
+        tokio::task::spawn_blocking(move || {
+            let mut out = Vec::new();
+            scan_each(&files, &dec, |env| {
+                if replay_selects(&env, reason.as_deref(), target.as_ref()) {
+                    out.push(env.payload);
+                }
+                Ok(())
+            })
+            .map(|_| out)
+        })
+        .await
+        .map_err(reader_panicked)?
+    }
+
+    /// Reads the files line by line on a blocking thread and yields
+    /// `batch_size` payloads at a time, so a large DLQ is never held whole.
+    fn stream_pages<'a>(
+        &'a self,
+        _context: &'a HashMap<String, Value>,
+        batch_size: usize,
+    ) -> std::pin::Pin<
+        Box<dyn futures::Stream<Item = Result<faucet_core::StreamPage, FaucetError>> + Send + 'a>,
+    > {
+        let chunk = if batch_size == 0 {
+            usize::MAX
+        } else {
+            batch_size
+        };
+        let files = self.files.clone();
+        let reason = self.reason.clone();
+        let target = self.target.clone();
+        let dec = self.dec.clone();
+        Box::pin(faucet_core::async_stream::try_stream! {
+            let (tx, mut rx) = tokio::sync::mpsc::channel::<Result<Vec<Value>, FaucetError>>(2);
+            let reader = tokio::task::spawn_blocking(move || {
+                let mut page = Vec::new();
+                let scanned = scan_each(&files, &dec, |env| {
+                    if replay_selects(&env, reason.as_deref(), target.as_ref()) {
+                        page.push(env.payload);
+                        if page.len() >= chunk {
+                            tx.blocking_send(Ok(std::mem::take(&mut page)))
+                                .map_err(|_| FaucetError::Source("DLQ reader stopped".into()))?;
+                        }
+                    }
+                    Ok(())
+                });
+                let last = match scanned {
+                    Ok(_) if page.is_empty() => return,
+                    Ok(_) => Ok(page),
+                    Err(e) => Err(e),
+                };
+                let _ = tx.blocking_send(last);
+            });
+            while let Some(page) = rx.recv().await {
+                yield faucet_core::StreamPage { records: page?, bookmark: None };
+            }
+            reader
+                .await
+                .map_err(reader_panicked)?;
+        })
     }
 
     fn connector_name(&self) -> &'static str {
@@ -646,6 +825,70 @@ mod tests {
             Some("d/.h-*.jsonl")
         );
         assert_eq!(rolled_over_glob("d/noext").as_deref(), Some("d/noext-*"));
+    }
+
+    #[test]
+    fn the_rollover_fallback_matches_only_numbered_parts() {
+        let dir = tempfile::tempdir().unwrap();
+        let sibling = dir.path().join("orders-eu.jsonl");
+        std::fs::write(&sibling, "x\n").unwrap();
+        let missing = format!("{}/orders.jsonl", dir.path().display());
+        assert!(
+            expand_location(&missing).is_err(),
+            "a sibling DLQ is not a part"
+        );
+        let tpl = format!("{}/orders-{{part}}.jsonl", dir.path().display());
+        assert!(expand_location(&tpl).is_err());
+        let part = dir.path().join("orders-00002.jsonl");
+        std::fs::write(&part, "x\n").unwrap();
+        assert_eq!(expand_location(&missing).unwrap(), vec![part.clone()]);
+        assert_eq!(expand_location(&tpl).unwrap(), vec![part]);
+        assert!(is_numbered_part("a-1-b-22.jsonl", "a-*-b-*.jsonl"));
+        assert!(!is_numbered_part("a--b-22.jsonl", "a-*-b-*.jsonl"));
+        assert!(!is_numbered_part("a-1.jsonl.bak", "a-*.jsonl"));
+        assert!(!is_numbered_part("b-1.jsonl", "a-*.jsonl"));
+        assert!(!is_numbered_part("a-1-c-2.jsonl", "a-*-b-*.jsonl"));
+        assert!(is_numbered_part("plain.jsonl", "plain.jsonl"));
+    }
+
+    #[test]
+    fn sealed_probe_reads_the_first_non_blank_line() {
+        let (_dir, blank) = write_tmp("blank.jsonl", "\n  \n");
+        assert!(!starts_sealed(&blank).unwrap());
+        let (_dir2, plain) = write_tmp("plain.jsonl", "\n{\"a\":1}\n");
+        assert!(!starts_sealed(&plain).unwrap());
+        let err = starts_sealed(&blank.with_file_name("absent.jsonl"))
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("reading DLQ file") && err.contains("absent.jsonl"),
+            "{err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_panicked_reader_task_is_a_source_error() {
+        let join = tokio::task::spawn_blocking(|| panic!("boom"))
+            .await
+            .unwrap_err();
+        let err = reader_panicked(join).to_string();
+        assert!(err.contains("DLQ reader task panicked"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn batch_size_zero_streams_one_page() {
+        use futures::StreamExt;
+        let mut body = String::new();
+        for i in 0..3 {
+            body.push_str(&envelope_line("quality", json!({"id": i})));
+            body.push('\n');
+        }
+        let (_dir, path) = write_tmp("dlq.jsonl", &body);
+        let source = DlqReaderSource::new(vec![path], None, DlqDecryptor::default());
+        let ctx = HashMap::new();
+        let pages: Vec<_> = source.stream_pages(&ctx, 0).collect().await;
+        assert_eq!(pages.len(), 1);
+        assert_eq!(pages[0].as_ref().unwrap().records.len(), 3);
     }
 
     #[test]
@@ -725,6 +968,43 @@ mod tests {
         assert_eq!(scan.malformed, 1);
         assert_eq!(scan.non_envelope, 1);
         assert_eq!(scan.files_read, 1);
+    }
+
+    #[tokio::test]
+    async fn the_reader_streams_payloads_page_by_page() {
+        use futures::StreamExt;
+        let mut body = String::new();
+        for i in 0..5 {
+            body.push_str(&envelope_line("quality", json!({"id": i})));
+            body.push_str("\r\n");
+        }
+        body.push_str(&envelope_line("contract", json!({"id": 99})));
+        let (_dir, path) = write_tmp("dlq.jsonl", &body);
+        let source =
+            DlqReaderSource::new(vec![path], Some("quality".into()), DlqDecryptor::default());
+        let ctx = HashMap::new();
+        let pages: Vec<_> = source.stream_pages(&ctx, 2).collect().await;
+        let sizes: Vec<usize> = pages
+            .iter()
+            .map(|p| p.as_ref().unwrap().records.len())
+            .collect();
+        assert_eq!(sizes, vec![2, 2, 1]);
+        assert_eq!(pages[2].as_ref().unwrap().records[0], json!({"id": 4}));
+        let all = source.fetch_with_context(&ctx).await.unwrap();
+        assert_eq!(all.len(), 5);
+    }
+
+    #[tokio::test]
+    async fn the_streamed_reader_reports_a_missing_file() {
+        use futures::StreamExt;
+        let source = DlqReaderSource::new(
+            vec![PathBuf::from("/nonexistent/dlq.jsonl")],
+            None,
+            DlqDecryptor::default(),
+        );
+        let ctx = HashMap::new();
+        let pages: Vec<_> = source.stream_pages(&ctx, 2).collect().await;
+        assert!(pages.iter().any(Result::is_err), "{pages:?}");
     }
 
     #[test]

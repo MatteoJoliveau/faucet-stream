@@ -31,7 +31,7 @@ sink:
 | `max_bytes_per_file` | none | Roll once a file holds this many bytes, counted as the records' JSON size before compression (on the columnar Parquet path, their in-memory Arrow size). |
 | `create_dirs` | `true` | Create missing directories. |
 | `batch_size` | 1000 | Page-size hint; the sink writes whatever page it is handed. |
-| `csv` | `{delimiter: ",", has_headers: true, quote: "\""}` | CSV dialect. `has_headers` writes the header row; `quote` is the quote character; `on_unknown_field` is `widen` (default: a field that appears later becomes a new column, and earlier rows are padded with empty cells), `warn` (the header is fixed by the first page and a later field is dropped with a warning) or `error` (fail the write naming the field). |
+| `csv` | `{delimiter: ",", has_headers: true, quote: "\""}` | CSV dialect. `has_headers` writes the header row; `quote` is the quote character; `on_unknown_field` is `widen` (default: a field that appears later becomes a new column, and earlier rows are padded with empty cells), `warn` (the header is fixed by the first page and a later field is dropped with a warning) or `error` (fail the write naming the field). `if_exists: append` to a single file needs `has_headers: true`: a file without a header row does not record its column order, so appended rows could land under other columns. |
 | `excel` | `{}` | `sheet` name for the workbook. |
 | `xml` | `{root_element: records, record_element: record}` | XML framing. |
 | `avro` | `{}` | Writer `schema` (inferred from the records when unset) and block `codec` (`null`, `deflate`, `snappy`, `zstd`). |
@@ -168,6 +168,17 @@ leaves the destination empty. `if_exists` must be `replace`.
 
 The begin, write and commit steps may run on different sink instances (the CLI
 does that), so all state lives on the filesystem.
+
+**Concurrent runs.** Under the CLI each overwrite run gets its own token, shared
+by its begin, writer and commit instances, and stages in its own
+`.faucet-overwrite-<name>.run-<token>` directory: two overwrite runs of one output
+at once never drop or move in each other's files, and the last commit wins. A
+tokened begin drops the untokened `.faucet-overwrite-<name>` directory, and
+another run's directory only once that run's token is more than 24 hours old (a
+crashed run's); an interrupted move such a directory recorded is not finished,
+because the new run replaces every file of the template when it commits. A
+library caller without a token keeps the single untokened directory, so two such
+runs of one output must not overlap.
 
 ## Other behaviour
 

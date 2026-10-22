@@ -27,8 +27,8 @@ built-in roles form a ladder:
 
 | Role | Permitted |
 |------|-----------|
-| `viewer` | read-only: `GET /v1/runs*`, `GET /v1/schemas*`, `GET /v1/catalog/*`, `GET /v1/usage`, `GET`/`POST /v1/status` and `GET`/`POST /v1/mirror/{name}` for a registered `template`, `GET /v1/changes*`, `GET /v1/templates*`, `GET /v1/local-outputs`, `GET /v1/tenants*` |
-| `operator` | everything a viewer can do **plus** submit / cancel / delete runs, trigger registered pipeline templates, propose and approve / reject change requests (as far as the `approvals:` policy allows), `POST /v1/doctor`, `POST /v1/plan`, `/v1/status` and `/v1/mirror/{name}` with an inline `config`, firing triggers, deleting local sink outputs, running for tenants and fanning templates out across them, and managing tenant connections (including hosted OAuth connect flows) |
+| `viewer` | read-only: `GET /v1/runs*`, `GET /v1/schemas*`, `GET /v1/catalog/*`, `GET /v1/usage`, `GET`/`POST /v1/status` and `GET`/`POST /v1/mirror/{name}` for a registered `template` (without caller `params`), `GET /v1/changes*`, `GET /v1/templates*`, `GET /v1/local-outputs`, `GET /v1/tenants*` |
+| `operator` | everything a viewer can do **plus** submit / cancel / delete runs, trigger registered pipeline templates, propose and approve / reject change requests (as far as the `approvals:` policy allows), `POST /v1/doctor`, `POST /v1/plan`, `/v1/status` and `/v1/mirror/{name}` with an inline `config` or template `params`, firing triggers, deleting local sink outputs, running for tenants and fanning templates out across them, and managing tenant connections (including hosted OAuth connect flows) |
 | `admin` | everything, including the template lifecycle (register, launch, roll back, deprecate, assign channels, delete, sync, publish), the tenant lifecycle (create, update, suspend, delete), pipeline state (`/v1/state/{pipeline}/{row}`) and `GET /v1/audit` |
 
 ```yaml
@@ -149,7 +149,7 @@ someone does.
 | *any unclassified `/v1` route* | — | — | ✓ |
 
 ¹ Reaching the route; the `approvals:` policy then decides whether the approval counts.
-² With a registered `template`. An inline `config` is loaded on the server, so it needs `operator` (`403` for a viewer).
+² With a registered `template` and its declared param defaults. An inline `config` is loaded on the server, and caller `params` decide what it connects to, so either needs `operator` (`403` for a viewer).
 
 Two entries are POSTs a **read** token can reach, because they change nothing:
 
@@ -262,7 +262,8 @@ typed fields. A transform's config is read the same way (a `sql` transform's
 lineage paths, every endpoint an `auth:` provider calls (`token_url`, `url`,
 a `flow` provider's `steps[].request.url` and `base_url_from`, a service
 account's `token_uri` — in the config or inside `key_json`), a transform that
-reads a file (`lookup`'s `jsonl`), and the `reconcile:` count probe (a SQL probe
+reads a file (`lookup`'s `jsonl`), every notification channel URL (a webhook
+`url`, a Slack `webhook_url`, a PagerDuty `endpoint`), and the `reconcile:` count probe (a SQL probe
 runs sandboxed like every other SQL connector). An `auth:` provider in a
 caller's config may not name a local file at all: pass a service-account key
 inline as `key_json` rather than `key_file`, and leave out `oauth2_refresh`'s
@@ -394,7 +395,7 @@ template) `POST /v1/templates/{id}/runs`, `run_template` and a template trigger.
 | `GET` | `/v1/usage` | `200` | Cost & usage report over recorded invocations (`by`, `since`, `until`, `pipeline`, `limit`, `include_records`) — viewer / `UsageRead`; requires the `catalog` build feature |
 | `GET` | `/v1/local-outputs` | `200` | List tracked local sink output files with age + state (`dataset_id`, `pipeline`, `include_expired`, `limit`) — viewer / `LocalOutputRead` |
 | `DELETE` | `/v1/local-outputs/{id}` | `200` | Delete one recorded output file now (operator / `LocalOutputManage`); `404` for an unknown id |
-| `POST` | `/v1/local-outputs/cleanup` | `200` | Bulk clean: `older_than_days` \| `expired` \| `dataset_id` \| `run_id` \| `all`, plus `dry_run` (operator / `LocalOutputManage`) |
+| `POST` | `/v1/local-outputs/cleanup` | `200` | Bulk clean: `older_than_days` \| `expired` \| `dataset_id` (optionally with `older_than_days`) \| `run_id` \| `all`, plus `dry_run` (operator / `LocalOutputManage`) |
 | `POST` | `/v1/templates` | `201` | Register a pipeline template (admin / `TemplateAdmin`) — requires the `templates` build feature |
 | `GET` | `/v1/templates` | `200` | List templates — newest version each, plus release state (viewer / `TemplateRead`) |
 | `GET` | `/v1/templates/{id}` | `200` | One template version + its whole release state. `?version=stable` (default), another channel, or `?version=N` |
@@ -826,7 +827,9 @@ the `catalog` feature.
   `{"older_than_days": N}`, `{"expired": true}` (each output's own window),
   `{"dataset_id": "…"}`, `{"run_id": "…"}` ("clean up after that run" — its
   history record is untouched), or `{"all": true}`. Sending none or several is a
-  `400` rather than a guess. Add `"dry_run": true` to see what would go.
+  `400` rather than a guess — except `{"dataset_id": "…", "older_than_days": N}`,
+  which purges that one dataset's outputs older than N days (the dataset page's
+  age purge). Add `"dry_run": true` to see what would go.
 
   A scope that ignores retention windows — `all`, and `older_than_days: 0`, which
   matches every output — also needs `"confirm": true`, or it is refused with a

@@ -4702,6 +4702,7 @@ dependencies = [
 name = "faucet-cli"
 version = "1.15.0"
 dependencies = [
+ "aho-corasick",
  "arrow 58.3.0",
  "assert_cmd",
  "async-stream",
@@ -4899,6 +4900,7 @@ dependencies = [
  "serde_json",
  "tokio",
  "tracing",
+ "wiremock",
 ]
 
 [[package]]
@@ -4911,6 +4913,8 @@ dependencies = [
  "schemars 1.2.1",
  "serde",
  "serde_json",
+ "tokio",
+ "wiremock",
 ]
 
 [[package]]
@@ -5405,6 +5409,7 @@ dependencies = [
  "faucet-source-graphql",
  "faucet-source-iceberg",
  "faucet-source-mysql",
+ "faucet-source-mysql-cdc",
  "faucet-source-oracle",
  "faucet-source-parquet",
  "faucet-source-postgres",
@@ -5453,6 +5458,7 @@ dependencies = [
  "futures",
  "indexmap 2.14.0",
  "metrics",
+ "metrics-util",
  "rdkafka",
  "reqwest 0.13.3",
  "schemars 1.2.1",
@@ -6241,6 +6247,7 @@ dependencies = [
  "tempfile",
  "tokio",
  "tracing",
+ "uuid",
  "wiremock",
 ]
 
@@ -6462,6 +6469,7 @@ dependencies = [
  "serde_json",
  "tokio",
  "tracing",
+ "tracing-subscriber",
  "wiremock",
 ]
 
@@ -6963,6 +6971,7 @@ dependencies = [
  "faucet-conformance",
  "faucet-core",
  "futures",
+ "glob",
  "md-5 0.10.6",
  "parquet 58.3.0",
  "schemars 1.2.1",

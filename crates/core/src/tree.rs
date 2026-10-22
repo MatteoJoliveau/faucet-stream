@@ -143,16 +143,13 @@ impl TreeFlattenSpec {
         CompiledTreeFlatten::compile(self)
     }
 
-    /// Compile and wrap as a [`TransformStage::Custom`] (1→0..N). With
-    /// `groups` the stage is a [`TransformStage::PageFn`], so a record that
-    /// cannot be zipped fails the page instead of passing through.
+    /// Compile and wrap as a [`TransformStage::PageFn`] (1→0..N per record).
+    /// A record that cannot be flattened without losing data (a duplicate
+    /// column, a tree deeper than `max_depth`, a group that cannot be zipped)
+    /// fails the page instead of passing through as one unflattened row; a
+    /// record without the root array still passes through unchanged.
     pub fn into_stage(&self) -> Result<TransformStage, FaucetError> {
         let compiled = self.compile()?;
-        if compiled.spec.groups.is_empty() {
-            return Ok(TransformStage::Custom(Arc::new(move |rec| {
-                compiled.apply(rec)
-            })));
-        }
         Ok(TransformStage::PageFn(Arc::new(move |page: Vec<Value>| {
             let mut out = Vec::with_capacity(page.len());
             for rec in page {
@@ -802,10 +799,30 @@ mod tests {
         assert_eq!(path_get(&v, "Header.ColData[9].value"), None);
     }
 
+    fn page_fn(stage: TransformStage) -> Option<crate::stage::PageFnBox> {
+        match stage {
+            TransformStage::PageFn(f) => Some(f),
+            _ => None,
+        }
+    }
+
     #[test]
-    fn into_stage_produces_a_custom_stage() {
-        let stage = spec().into_stage().unwrap();
-        assert!(matches!(stage, TransformStage::Custom(_)));
+    fn page_fn_is_none_for_a_record_stage() {
+        let custom = TransformStage::Custom(Arc::new(|v| vec![v]));
+        assert!(page_fn(custom).is_none());
+    }
+
+    #[test]
+    fn into_stage_fails_the_page_instead_of_passing_an_unflattenable_record_through() {
+        let f = page_fn(spec().into_stage().unwrap()).expect("a page stage");
+        let mut shallow = spec();
+        shallow.max_depth = 1;
+        let g = page_fn(shallow.into_stage().unwrap()).expect("a page stage");
+        assert!(f(vec![nested_rows_report()]).is_ok());
+        let err = g(vec![nested_rows_report()]).unwrap_err().to_string();
+        assert!(err.contains("max_depth") || err.contains("deeper"), "{err}");
+        // A record without the root still passes through unchanged.
+        assert_eq!(f(vec![json!({"x": 1})]).unwrap(), vec![json!({"x": 1})]);
     }
 
     /// #746: a leaf carrying two positional cell arrays, each named by its own

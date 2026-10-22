@@ -12,7 +12,7 @@ This is the flagship faucet-stream source: point it at any JSON-over-HTTP API, d
 ## Feature highlights
 
 - **Nine pagination styles** — `Cursor`, `CursorInBody` (POST-search cursor in the request body), `OffsetInBody` (offset/limit in the request body), `RecordFieldCursor` (keyset — page by the running max/min of a record field), `LinkHeader`, `NextLinkInBody`, `PageNumber`, `Offset`, and `None`, each with its own termination/loop guard so a misbehaving API can't loop forever.
-- **Eight auth methods** — `bearer`, `basic`, `api_key` (header), `api_key_query`, `oauth2` (client credentials with token caching), `token_endpoint` (fetch a token from an arbitrary endpoint), `custom` headers, and `none` — plus shared `auth: { ref }` providers via the CLI's top-level `auth:` catalog.
+- **Eight auth methods** — `bearer`, `basic`, `api_key` (header), `api_key_query`, `oauth2` (client credentials with token caching), `token_endpoint` (fetch a token from an arbitrary endpoint), `custom` headers, and `none` — plus shared `auth: { ref }` providers via the CLI's top-level `auth:` catalog. A per-request signer such as `oauth1` signs the exact URL sent, after every query parameter (parent-row values, repeated params, query binds, API key, a next-page link's own query) is in place.
 - **Mutual TLS** — present a client certificate (PEM pair or PKCS#12) on every request via a `tls:` block (feature `mtls`), for APIs that require client-certificate auth.
 - **Memory-bounded streaming** — overrides `Source::stream_pages`, so `Pipeline::run` writes each page to the sink as it arrives; peak memory stays `O(page)` regardless of total record count.
 - **Resilient by default** — exponential backoff with jitter (capped at 60 s), `429` `Retry-After` (delta-seconds or HTTP-date) honouring, and a `tolerated_http_errors` allowlist for legitimately-absent resources.
@@ -138,6 +138,15 @@ pagination: { type: RecordFieldCursor, field: JournalNumber, into: query, param:
 
 Both stop on a short page (fewer than `limit`/`page_size` records) and guard against a non-advancing cursor.
 
+`RecordFieldCursor` sends the cursor as an exclusive bound by default, so the
+server must return rows strictly past it and `field` must be unique: rows that
+share the boundary value at a page cut would never be read (a warning fires when
+a full page ends on such a tie). For a non-unique field such as `updated_at`,
+use a server filter that returns rows `>=` the cursor and set `inclusive: true`:
+the rows already emitted at the boundary value are dropped by whole-record
+fingerprint, so every row is read exactly once. A full page whose rows all share
+one value still fails the run, since the cursor cannot get past it.
+
 **Resumable cursor (`persist_cursor`).** With `persist_cursor: true`, a `Cursor` / `CursorInBody` stream emits its terminal cursor as the run's `StreamPage` bookmark (persisted via a `state:` store) and, on the next run, seeds that saved cursor into the first request — so an envelope-cursor feed (e.g. a `/transactions/sync` endpoint) resumes incrementally instead of re-pulling from the start. It resumes **one** cursor, so it is refused with more than one `requests:` entry.
 
 ### Multi-array fan-out (`records_multi`) & envelope carry (`record_ancestors`)
@@ -167,7 +176,7 @@ record_ancestors: { event_id: id, event_created: created }
 | `max_retries` | int | `3` | Max retries on transient failures. |
 | `retry_backoff` | int (seconds) | `1` | Base for exponential backoff. Per-attempt sleep is `retry_backoff × 2^attempt`, **capped at 60 s** and scaled by random jitter in `[0.5, 1.5)` (decorrelated across concurrent retries). On `429`, the server's `Retry-After` (delta-seconds **or** an RFC 7231 HTTP-date) is honoured instead; a stated wait over 3600 s fails the run rather than sleeping. |
 | `tolerated_http_errors` | array<int> | `[]` | HTTP status codes treated as an empty page **on the first request only**. Mid-pagination, a tolerated status surfaces as an error instead of silently ending the stream (otherwise a transient failure on page _N_ would drop every later page as a "successful" run). Only safe for genuinely-empty resources. |
-| `retry_on_response` | array of matchers | `[]` | Treat a non-2xx response as **throttling** and retry it with backoff — for APIs that signal a rate limit with a 4xx other than 429 plus a code in the body. Each matcher has `status` (list; empty = any non-2xx), `body_path` (JSONPath into the JSON error body) + `values` (numbers and strings compare by text), optional `header` (must be present; compared with `values` when there is no `body_path`), optional `match_success: true` (also match a 2xx, e.g. `x-ratelimit-remaining: 0`; requires `body_path` or `header`), optional `backoff_from` (read the wait from the response: `{type: header, config: {name, unit}}`, `{type: header_json, config: {name, path, unit}}`, `{type: body, config: {path, unit}}` or `{type: cost_bucket, config: {requested, available, restore_rate}}`; `unit` is `seconds`, `ms`, `minutes`, `epoch_s`, `epoch_ms` or `rfc3339`, an absolute instant measured from the response's `Date` header), optional `backoff_secs` (fixed wait), and optional `max_wait_secs` (default 3600; a longer wait — from `backoff_from`, `backoff_secs` or `Retry-After` — fails the run instead of parking it). The wait is `backoff_from`, else `backoff_secs`, else `Retry-After`, else the exponential `retry_backoff`. A match is counted as a rate-limit response (`faucet_source_throttled_total`, `faucet_source_retries_total{class="rate_limited"}`, `faucet_source_throttle_wait_seconds`), is checked before `tolerated_http_errors`, and applies to data pages, `async_job` requests (success-matching only on submit/poll, not streamed results) and discovery requests. After `max_retries` consecutive matches the original error (status + body) is surfaced; a 2xx that still matches fails rather than being read as data. A non-JSON body never matches. |
+| `retry_on_response` | array of matchers | `[]` | Treat a non-2xx response as **throttling** and retry it with backoff — for APIs that signal a rate limit with a 4xx other than 429 plus a code in the body. Each matcher has `status` (list; empty = any non-2xx), `body_path` (JSONPath into the JSON error body) + `values` (numbers and strings compare by text), optional `header` (must be present; compared with `values` when there is no `body_path`), optional `match_success: true` (also match a 2xx, e.g. `x-ratelimit-remaining: 0`; requires `body_path` or `header`), optional `backoff_from` (read the wait from the response: `{type: header, config: {name, unit}}`, `{type: header_json, config: {name, path, unit}}`, `{type: body, config: {path, unit}}` or `{type: cost_bucket, config: {requested, available, restore_rate}}`; `unit` is `seconds`, `ms`, `minutes`, `epoch_s`, `epoch_ms` or `rfc3339`, an absolute instant measured from the response's `Date` header), optional `backoff_secs` (fixed wait), and optional `max_wait_secs` (default 3600; a longer wait — from `backoff_from`, `backoff_secs` or `Retry-After` — fails the run instead of parking it). The wait is `backoff_from`, else `backoff_secs`, else `Retry-After`, else the exponential `retry_backoff`. A match is counted as a rate-limit response (`faucet_source_throttled_total`, `faucet_source_retries_total{class="rate_limited"}`, `faucet_source_throttle_wait_seconds`), is checked before `tolerated_http_errors`, and applies to data pages, `async_job` requests (success-matching only on submit/poll, not streamed results) and discovery requests. After `max_retries` consecutive matches on one request the original error (status + body) is surfaced — each request (page, partition, key range, job call) has its own count, so concurrent requests never share a budget; a 2xx that still matches fails rather than being read as data. A non-JSON body never matches. |
 
 **Throttling is metered (#734):** every `429` counts in `faucet_source_throttled_total`, the time actually slept on it (not the header's value — a cancelled sleep records the partial wait) in `faucet_source_throttle_wait_seconds`, and every retry by class in `faucet_source_retries_total{class}`. The totals land on the run's usage record, so `faucet run` / `faucet usage` print `throttled 312× · waited 41 min`, and a run that spent more than 10 % of its time rate-limited logs a warning. See [source-side throttling](https://faucet-hq.github.io/faucet-stream/cookbook/resilience.html#source-side-throttling).
 
@@ -465,6 +474,13 @@ key is tiled with `faucet_core::shard::plan_pk_shards` (the same primitive the
 SQL sources shard with) and fetched as concurrent `$filter` ranges; entities
 without such a key fall back to sequential paging. Ranges are planned per run —
 never bookmarked.
+
+When `$metadata` is available, each emitted row's sink patch also carries the
+entity's column `schema` from its EDM types, so a typed sink declares real
+columns: `Edm.DateTimeOffset` / `Edm.Date` become timestamp / date strings and
+`Edm.Decimal` is declared as exact decimal text (`{"type": "string", "format":
+"decimal"}`), never a binary float column; `Edm.Double` / `Edm.Single` stay
+`number`.
 
 ### Response-decode pipeline (`decode`)
 
@@ -956,8 +972,13 @@ The `pagination` field selects a `PaginationStyle` (tagged by `type`). `max_page
 | `CursorInBody` | `next_token_path`, `body_cursor_field` | POST-search endpoints: the next-page cursor is read from the response body and written **into the request JSON body** at `body_cursor_field` (rather than a query param). Stops when the cursor is null/absent or repeats. E.g. a CRM `POST …/search` — `$.paging.next.after` → `after`. A JSON Pointer (`/variables/after`) targets a nested location (a new key of an existing object, or an existing value). |
 | `LinkHeader` | — | No `rel="next"` in the `Link` response header, or the same link repeats. |
 | `NextLinkInBody` | `next_link_path` | Next-page URL is absent, null, empty, or repeats. |
-| `PageNumber` | `param_name`, `start_page`, `page_size`, `page_size_param` | A zero-record page, or the same body returned twice in a row (content-stagnation detection for APIs that clamp out-of-range pages). |
+| `PageNumber` | `param_name`, `start_page`, `page_size`, `page_size_param` | A zero-record page, or a body already returned earlier in the pass (content-stagnation detection for APIs that clamp out-of-range pages). |
 | `Offset` | `offset_param`, `limit_param`, `limit`, `total_path`, `rows_path`, `stop_when_short` *(optional)* | A zero-record page, offset reaches `total` (via `total_path`), or an identical repeated page. Without `total_path` a short page does **not** stop paging — the server may cap `limit` — so the walk ends on the empty page after it; set `stop_when_short: true` for a server that never caps a page but rejects an offset past the end (`400`/`416`). The offset advances by the records received, or by the matches of `rows_path` (required when `records_path` fans out to nested children or `record_ancestors` is set). |
+
+"Repeats" means any cursor, link or page already seen in the same pass, not
+only the previous one, so a server alternating between two cursors or two
+pages (A→B→A) stops instead of looping; a next link pointing back at a URL
+already fetched counts as a repeat.
 
 An HTTP **`204 No Content`** (or any 2xx with an empty body) is treated as an empty page, so a feed that ends with a `204` after its last data page (e.g. `$top`/`$skip` paging) terminates cleanly rather than erroring.
 

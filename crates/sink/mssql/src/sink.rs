@@ -59,6 +59,16 @@ pub struct MssqlSink {
 }
 
 impl MssqlSink {
+    /// Join the overwrite run `token`
+    /// ([`faucet_core::idempotency::OVERWRITE_RUN_KEY`]): every instance of
+    /// one run (begin, writers, commit) stages in `<table>__faucet_ovw_<token>`,
+    /// so a concurrent overwrite run of the same table neither drops nor
+    /// shares it.
+    pub fn with_overwrite_run(mut self, token: &str) -> Result<Self, FaucetError> {
+        self.inner.driver_mut().set_overwrite_run(token)?;
+        Ok(self)
+    }
+
     /// Connect, validate, build the pool, and (in `json_column` + `create_table`
     /// mode) create the table if it doesn't exist.
     pub async fn new(config: MssqlSinkConfig) -> Result<Self, FaucetError> {
@@ -81,6 +91,9 @@ pub(crate) struct MssqlDriver {
     /// Pre-quoted staging table (`[schema].[table__faucet_ovw]`) used while a
     /// `write_mode: overwrite` run is in flight (#492).
     staging_table_quoted: String,
+    /// The overwrite run this instance belongs to (#930): staging is then
+    /// `<table>__faucet_ovw_<token>`, apart from any concurrent run's.
+    overwrite_run: Option<String>,
     /// Cached columns of the relation writes target, as `sys.columns` declares them.
     columns_cache: Mutex<Option<Vec<ColumnInfo>>>,
     /// Set when a timed-out statement's connection could not be replaced
@@ -136,6 +149,7 @@ impl MssqlDriver {
             pool,
             table_quoted,
             staging_table_quoted,
+            overwrite_run: None,
             columns_cache: Mutex::new(None),
             poisoned: std::sync::atomic::AtomicBool::new(false),
             calls: faucet_core::CallSlot::new(faucet_common_mssql::statement_call_context(
@@ -330,8 +344,101 @@ impl MssqlDriver {
         format!(
             "{}{}",
             self.config.table,
-            faucet_core::idempotency::OVERWRITE_STAGING_SUFFIX
+            faucet_core::idempotency::overwrite_staging_suffix(self.overwrite_run.as_deref())
         )
+    }
+
+    /// Join overwrite run `token`: stage under its own name.
+    pub(crate) fn set_overwrite_run(&mut self, token: &str) -> Result<(), FaucetError> {
+        faucet_core::idempotency::check_overwrite_run_token(token)?;
+        self.overwrite_run = Some(token.to_string());
+        self.staging_table_quoted = quote_table(&self.staging_literal())?;
+        Ok(())
+    }
+
+    /// Drop the staging other overwrite runs of this table abandoned
+    /// ([`faucet_core::idempotency::abandoned_overwrite_staging`]); a live
+    /// run's staging and this run's own are never touched.
+    /// The names of the tables beside the destination named like a tokened
+    /// staging of it.
+    async fn tokened_staging_names(
+        &self,
+        conn: &mut MssqlPooledConnection<'_>,
+    ) -> Result<Vec<String>, FaucetError> {
+        let (schema, table) = split_table(&self.config.table);
+        let list = staging_sweep_query(schema, table);
+        let rows = self
+            .on_conn(conn, "query", true, async |c| {
+                c.simple_query(list.as_str())
+                    .await
+                    .map_err(|e| FaucetError::Sink(format!("mssql overwrite: list staging: {e}")))?
+                    .into_first_result()
+                    .await
+                    .map_err(|e| FaucetError::Sink(format!("mssql overwrite: list staging: {e}")))
+            })
+            .await?;
+        Ok(rows
+            .iter()
+            .filter_map(|row| row.try_get::<&str, _>(0).ok().flatten().map(str::to_string))
+            .filter(|name| faucet_core::idempotency::overwrite_staging_token(table, name).is_some())
+            .collect())
+    }
+
+    /// Drop the untokened `<table>__faucet_ovw` an earlier release (or a run
+    /// without a token) left: it never had per-run isolation.
+    async fn drop_legacy_staging(
+        &self,
+        conn: &mut MssqlPooledConnection<'_>,
+    ) -> Result<(), FaucetError> {
+        let legacy = format!(
+            "{}{}",
+            self.config.table,
+            faucet_core::idempotency::OVERWRITE_STAGING_SUFFIX
+        );
+        self.control(
+            conn,
+            &format!(
+                "IF OBJECT_ID(N'{}', N'U') IS NOT NULL DROP TABLE {}",
+                legacy.replace('\'', "''"),
+                quote_table(&legacy)?
+            ),
+        )
+        .await
+    }
+
+    async fn drop_abandoned_staging(
+        &self,
+        conn: &mut MssqlPooledConnection<'_>,
+    ) -> Result<(), FaucetError> {
+        let (schema, table) = split_table(&self.config.table);
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        for name in self.tokened_staging_names(conn).await? {
+            if faucet_core::idempotency::abandoned_overwrite_staging(
+                table,
+                &name,
+                self.overwrite_run.as_deref(),
+                now,
+            ) {
+                let qualified = match schema {
+                    Some(s) => format!("{s}.{name}"),
+                    None => name.clone(),
+                };
+                tracing::warn!(staging = %qualified, "mssql overwrite: dropping staging an earlier run abandoned");
+                self.control(
+                    conn,
+                    &format!(
+                        "IF OBJECT_ID(N'{}', N'U') IS NOT NULL DROP TABLE {}",
+                        qualified.replace('\'', "''"),
+                        quote_table(&qualified)?
+                    ),
+                )
+                .await?;
+            }
+        }
+        Ok(())
     }
 
     /// The bracket-quoted relation the append/insert path targets. For
@@ -845,57 +952,83 @@ impl MssqlDriver {
 }
 
 /// The upsert/delete groups for one page. A single plan (one MERGE per kind)
-/// unless a deleted key may equal an upserted one under the column's collation
-/// (case, trailing spaces, or a non-ASCII key the check cannot fold); only then
-/// does page order matter, so the page is split into op runs
-/// ([`faucet_core::plan_writes_ordered`]).
+/// unless two of its keys may be equal under the column's collation (case,
+/// trailing spaces, or a non-ASCII key the check cannot fold exactly): one
+/// MERGE whose source holds two rows matching one target row fails (8672), and
+/// a delete and an upsert of one row must apply in page order. Then the page
+/// is split, in page order, into runs of one operation that never hold two
+/// collation-equal keys, so each MERGE matches a row at most once and the
+/// later record wins — under a case-sensitive collation too.
 fn page_plans(records: &[Value], spec: &faucet_core::WriteSpec) -> Vec<faucet_core::WritePlan> {
     let single = faucet_core::plan_writes(records, spec);
-    if collation_collision(&single) {
-        faucet_core::plan_writes_ordered(records, spec)
-    } else {
-        vec![single]
+    if !collation_collision(&single, &spec.key) {
+        return vec![single];
     }
-}
-
-/// A key folded the way a case-insensitive collation compares it; `None` when
-/// it holds a non-ASCII string, which accent-insensitive collations may fold
-/// further than this check can.
-fn folded_key(values: impl Iterator<Item = Value>) -> Option<Vec<String>> {
-    values
-        .map(|v| match v {
-            Value::String(s) if s.is_ascii() => Some(s.trim_end_matches(' ').to_ascii_lowercase()),
-            Value::String(_) => None,
-            other => Some(other.to_string()),
-        })
-        .collect()
-}
-
-/// Whether some deleted key may equal some upserted key under the collation.
-fn collation_collision(plan: &faucet_core::WritePlan) -> bool {
-    if plan.deletes.is_empty() || plan.upserts.is_empty() {
-        return false;
-    }
-    let key: Vec<&String> = plan
-        .deletes
-        .first()
-        .map(|k| k.0.iter().map(|(c, _)| c).collect())
-        .unwrap_or_default();
-    let mut upserted = std::collections::HashSet::new();
-    for rec in &plan.upserts {
-        let values = key
-            .iter()
-            .map(|c| rec.get(c.as_str()).cloned().unwrap_or(Value::Null));
-        match folded_key(values) {
-            Some(k) => {
-                upserted.insert(k);
-            }
-            None => return true,
+    let mut plans = Vec::new();
+    let mut run: Vec<Value> = Vec::new();
+    let mut run_is_delete = None;
+    let mut seen: std::collections::HashSet<Vec<String>> = std::collections::HashSet::new();
+    for rec in records {
+        let one = faucet_core::plan_writes(std::slice::from_ref(rec), spec);
+        let Some(key) = faucet_core::write_mode::record_key(rec, &spec.key) else {
+            continue;
+        };
+        let is_delete = !one.deletes.is_empty();
+        let folded = fold_key(key.0.into_iter().map(|(_, v)| v)).0;
+        if !run.is_empty() && (run_is_delete != Some(is_delete) || seen.contains(&folded)) {
+            plans.push(faucet_core::plan_writes(&std::mem::take(&mut run), spec));
+            seen.clear();
         }
+        run_is_delete = Some(is_delete);
+        seen.insert(folded);
+        run.push(rec.clone());
     }
-    plan.deletes.iter().any(|d| {
-        folded_key(d.0.iter().map(|(_, v)| v.clone())).is_none_or(|k| upserted.contains(&k))
-    })
+    if !run.is_empty() {
+        plans.push(faucet_core::plan_writes(&run, spec));
+    }
+    plans
+}
+
+/// A key folded the way a case-insensitive collation compares it (trailing
+/// spaces dropped, lower-cased), and whether the fold is exact: a non-ASCII
+/// string may fold further under an accent-insensitive collation.
+fn fold_key(values: impl Iterator<Item = Value>) -> (Vec<String>, bool) {
+    let mut exact = true;
+    let folded = values
+        .map(|v| match v {
+            Value::String(s) if s.is_ascii() => s.trim_end_matches(' ').to_ascii_lowercase(),
+            Value::String(s) => {
+                exact = false;
+                s.trim_end_matches(' ').to_lowercase()
+            }
+            other => other.to_string(),
+        })
+        .collect();
+    (folded, exact)
+}
+
+/// Whether two keys of the plan may be equal under the collation: two fold
+/// equal, or a non-ASCII key sits beside the other operation (an
+/// accent-insensitive collation may equate it with one of those keys).
+fn collation_collision(plan: &faucet_core::WritePlan, key: &[String]) -> bool {
+    let mut seen = std::collections::HashSet::new();
+    let mut inexact = false;
+    let upserted = plan.upserts.iter().map(|rec| {
+        fold_key(
+            key.iter()
+                .map(|c| rec.get(c.as_str()).cloned().unwrap_or(Value::Null)),
+        )
+    });
+    let deleted = plan
+        .deletes
+        .iter()
+        .map(|d| fold_key(d.0.iter().map(|(_, v)| v.clone())));
+    let mut equal = false;
+    for (folded, exact) in upserted.chain(deleted) {
+        inexact |= !exact;
+        equal |= !seen.insert(folded);
+    }
+    equal || (inexact && !plan.deletes.is_empty() && !plan.upserts.is_empty())
 }
 
 /// The prepared statements and key typing a scoped cleanup runs with.
@@ -1066,6 +1199,33 @@ fn mssql_type_to_json_schema(type_name: &str, max_length: i16, nullable: bool) -
 }
 
 /// Quote a (possibly schema-qualified) table name: `dbo.events` → `[dbo].[events]`.
+/// A configured table name as `(schema, table)`: the last dot-separated part
+/// is the table, the one before it (if any) the schema.
+fn split_table(table: &str) -> (Option<&str>, &str) {
+    match table.rsplit_once('.') {
+        Some((before, name)) => (Some(before.rsplit('.').next().unwrap_or(before)), name),
+        None => (None, table),
+    }
+}
+
+/// The catalog query listing tables named like a tokened staging of `table`
+/// in `schema` (the user's default schema when `None`).
+fn staging_sweep_query(schema: Option<&str>, table: &str) -> String {
+    let pattern = faucet_core::idempotency::like_literal(
+        &faucet_core::idempotency::overwrite_staging_prefix(table),
+        '\\',
+    )
+    .replace('\'', "''");
+    let schema_id = match schema {
+        Some(s) => format!("SCHEMA_ID(N'{}')", s.replace('\'', "''")),
+        None => "SCHEMA_ID()".to_string(),
+    };
+    format!(
+        "SELECT name FROM sys.tables WHERE name LIKE N'{pattern}%' ESCAPE N'\\' \
+         AND schema_id = {schema_id}"
+    )
+}
+
 fn quote_table(table: &str) -> Result<String, FaucetError> {
     let parts: Vec<String> = table
         .split('.')
@@ -1444,6 +1604,10 @@ impl MssqlDriver {
             &format!("IF OBJECT_ID(N'{staging_lit}', N'U') IS NOT NULL DROP TABLE {staging}"),
         )
         .await?;
+        if self.overwrite_run.is_some() {
+            self.drop_legacy_staging(&mut conn).await?;
+        }
+        self.drop_abandoned_staging(&mut conn).await?;
         if first_run {
             return Ok(());
         }
@@ -1917,8 +2081,17 @@ impl StagingDriver for MssqlDriver {
     }
 
     /// Probe for the `<table>__faucet_ovw` staging table (read-only).
+    /// A run's own staging; without a run token (the `faucet status` probe)
+    /// the untokened staging or any run's tokened staging of the table.
     async fn staged(&self, _calls: &CallSlot) -> Result<bool, FaucetError> {
-        self.table_exists(&self.staging_literal()).await
+        if self.table_exists(&self.staging_literal()).await? {
+            return Ok(true);
+        }
+        if self.overwrite_run.is_some() {
+            return Ok(false);
+        }
+        let mut conn = self.checkout().await?;
+        Ok(!self.tokened_staging_names(&mut conn).await?.is_empty())
     }
 }
 
@@ -2004,8 +2177,35 @@ mod tests {
         assert_eq!(page_plans(&accented, &spec).len(), 2);
         let numbers = [json!({"id": 1, "op": "d"}), json!({"id": 2, "v": 1})];
         assert_eq!(page_plans(&numbers, &spec).len(), 1);
-        let only_upserts = [json!({"id": "a"}), json!({"id": "A"})];
-        assert_eq!(page_plans(&only_upserts, &spec).len(), 1);
+        // Two upserts (or deletes) equal only under a case-insensitive
+        // collation go to separate MERGEs, the later one last.
+        let only_upserts = [json!({"id": "a", "v": 1}), json!({"id": "A", "v": 2})];
+        let plans = page_plans(&only_upserts, &spec);
+        assert_eq!(plans.len(), 2);
+        assert_eq!(plans[1].upserts[0]["v"], 2);
+        let bob = [
+            json!({"id": "Bob", "v": 1}),
+            json!({"id": "bob", "v": 2}),
+            json!({"id": "Bob", "v": 3}),
+        ];
+        let plans = page_plans(&bob, &spec);
+        let applied: Vec<_> = plans
+            .iter()
+            .flat_map(|p| p.upserts.iter())
+            .map(|r| r["v"].clone())
+            .collect();
+        assert_eq!(applied, [json!(1), json!(2), json!(3)]);
+        let deletes = [
+            json!({"id": "x", "op": "d"}),
+            json!({"id": "X ", "op": "d"}),
+        ];
+        assert_eq!(page_plans(&deletes, &spec).len(), 2);
+        let distinct = [
+            json!({"id": "a"}),
+            json!({"id": "b"}),
+            json!({"id": "José"}),
+        ];
+        assert_eq!(page_plans(&distinct, &spec).len(), 1);
     }
 
     // dataset_uri test is skipped: MssqlSink::new() requires a live pool
@@ -2061,6 +2261,19 @@ mod tests {
         let cols = faucet_core::plan_columns(&[serde_json::json!({ "a": 1 })]).unwrap();
         let sql = build_create_table_sql("t", "[t]", &cols, &[]).unwrap();
         assert!(!sql.contains("PRIMARY KEY"), "{sql}");
+    }
+
+    #[test]
+    fn staging_sweep_lists_this_tables_tokened_staging() {
+        assert_eq!(split_table("dbo.events"), (Some("dbo"), "events"));
+        assert_eq!(split_table("db.dbo.events"), (Some("dbo"), "events"));
+        assert_eq!(split_table("events"), (None, "events"));
+        assert_eq!(
+            staging_sweep_query(Some("dbo"), "o'rders"),
+            "SELECT name FROM sys.tables WHERE name LIKE N'o''rders\\_\\_faucet\\_ovw\\_%' \
+             ESCAPE N'\\' AND schema_id = SCHEMA_ID(N'dbo')"
+        );
+        assert!(staging_sweep_query(None, "t").ends_with("schema_id = SCHEMA_ID()"));
     }
 
     #[test]

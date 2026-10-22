@@ -212,9 +212,31 @@ fn tokenize(input: &str) -> Result<Vec<Token>, FaucetError> {
     Ok(out)
 }
 
+/// The deepest filter expression accepted: nesting (`not`, parentheses) plus
+/// `and` / `or` chain length. Building, typing and dropping the tree all
+/// recurse over it, so an unbounded filter could exhaust the stack.
+pub const MAX_DEPTH: usize = 256;
+
+fn too_deep() -> FaucetError {
+    err(format!(
+        "expression nests or chains more than {MAX_DEPTH} levels deep; \
+         use `in (…)` for long value lists"
+    ))
+}
+
+fn deeper(a: usize, b: usize) -> Result<usize, FaucetError> {
+    let d = a.max(b) + 1;
+    if d > MAX_DEPTH {
+        Err(too_deep())
+    } else {
+        Ok(d)
+    }
+}
+
 struct Parser {
     tokens: Vec<Token>,
     pos: usize,
+    nesting: usize,
 }
 
 impl Parser {
@@ -241,35 +263,52 @@ impl Parser {
         }
     }
 
-    fn or(&mut self) -> Result<Expr, FaucetError> {
-        let mut left = self.and()?;
+    // Each parser returns the expression with its tree depth, so a filter
+    // nested or chained past `MAX_DEPTH` is refused before the parser, the
+    // predicate builder or a drop recurses that deep.
+    fn or(&mut self) -> Result<(Expr, usize), FaucetError> {
+        let (mut left, mut depth) = self.and()?;
         while self.eat_keyword("or") {
-            left = Expr::Or(Box::new(left), Box::new(self.and()?));
+            let (right, d) = self.and()?;
+            depth = deeper(depth, d)?;
+            left = Expr::Or(Box::new(left), Box::new(right));
         }
-        Ok(left)
+        Ok((left, depth))
     }
 
-    fn and(&mut self) -> Result<Expr, FaucetError> {
-        let mut left = self.unary()?;
+    fn and(&mut self) -> Result<(Expr, usize), FaucetError> {
+        let (mut left, mut depth) = self.unary()?;
         while self.eat_keyword("and") {
-            left = Expr::And(Box::new(left), Box::new(self.unary()?));
+            let (right, d) = self.unary()?;
+            depth = deeper(depth, d)?;
+            left = Expr::And(Box::new(left), Box::new(right));
         }
-        Ok(left)
+        Ok((left, depth))
     }
 
-    fn unary(&mut self) -> Result<Expr, FaucetError> {
-        if self.eat_keyword("not") {
-            return Ok(Expr::Not(Box::new(self.unary()?)));
+    fn unary(&mut self) -> Result<(Expr, usize), FaucetError> {
+        let negate = self.eat_keyword("not");
+        if !negate && self.peek() != Some(&Token::LParen) {
+            return Ok((self.comparison()?, 1));
         }
-        if self.peek() == Some(&Token::LParen) {
+        self.nesting += 1;
+        if self.nesting > MAX_DEPTH {
+            return Err(too_deep());
+        }
+        let out = if negate {
+            self.unary()
+                .and_then(|(e, d)| Ok((Expr::Not(Box::new(e)), deeper(d, 1)?)))
+        } else {
             self.pos += 1;
-            let e = self.or()?;
-            if self.next() != Some(Token::RParen) {
-                return Err(err("expected `)`"));
-            }
-            return Ok(e);
-        }
-        self.comparison()
+            self.or().and_then(|e| {
+                if self.next() != Some(Token::RParen) {
+                    return Err(err("expected `)`"));
+                }
+                Ok(e)
+            })
+        };
+        self.nesting -= 1;
+        out
     }
 
     fn literal(&mut self) -> Result<Literal, FaucetError> {
@@ -348,11 +387,52 @@ fn parse_number(n: &str) -> Result<Literal, FaucetError> {
     if let Ok(i) = n.parse::<i64>() {
         return Ok(Literal::Int(i));
     }
-    n.parse::<f64>()
+    let f = n
+        .parse::<f64>()
         .ok()
         .filter(|f| f.is_finite())
-        .map(Literal::Float)
-        .ok_or_else(|| err(format!("{n:?} is not a number")))
+        .ok_or_else(|| err(format!("{n:?} is not a number")))?;
+    // A literal a double cannot hold exactly would be compared as a rounded
+    // value (a `decimal` column included): refuse it, so the filter never
+    // silently matches different rows. Quoted, it keeps every digit.
+    if decimal_key(n) != decimal_key(&f.to_string()) {
+        return Err(err(format!(
+            "number {n} has more digits than a double holds; quote it ('{n}') to compare \
+             a decimal column exactly"
+        )));
+    }
+    Ok(Literal::Float(f))
+}
+
+/// `(negative, significant digits, exponent)` of a decimal number's text, so
+/// two spellings of the same value compare equal (`1.50` and `1.5e0`).
+fn decimal_key(text: &str) -> Option<(bool, String, i64)> {
+    let (negative, rest) = match text.strip_prefix('-') {
+        Some(r) => (true, r),
+        None => (false, text.strip_prefix('+').unwrap_or(text)),
+    };
+    let (mantissa, exp) = match rest.find(['e', 'E']) {
+        Some(i) => (&rest[..i], rest[i + 1..].parse::<i64>().ok()?),
+        None => (rest, 0),
+    };
+    let (int, frac) = mantissa.split_once('.').unwrap_or((mantissa, ""));
+    if !(int.chars().chain(frac.chars())).all(|c| c.is_ascii_digit()) {
+        return None;
+    }
+    let digits = format!("{int}{frac}");
+    let lead = digits.len() - digits.trim_start_matches('0').len();
+    let digits = digits
+        .trim_start_matches('0')
+        .trim_end_matches('0')
+        .to_string();
+    if digits.is_empty() {
+        return Some((false, String::new(), 0));
+    }
+    // Exponent of the first significant digit.
+    let point = exp
+        .checked_add(int.len() as i64)?
+        .checked_sub(lead as i64)?;
+    Some((negative, digits, point))
 }
 
 /// Parse a filter expression.
@@ -361,8 +441,12 @@ pub fn parse(input: &str) -> Result<Expr, FaucetError> {
     if tokens.is_empty() {
         return Err(err("expression is empty"));
     }
-    let mut p = Parser { tokens, pos: 0 };
-    let e = p.or()?;
+    let mut p = Parser {
+        tokens,
+        pos: 0,
+        nesting: 0,
+    };
+    let (e, _) = p.or()?;
     if let Some(t) = p.peek() {
         return Err(err(format!("unexpected trailing token {t:?}")));
     }
@@ -447,6 +531,20 @@ pub fn datum_for(column: &str, lit: &Literal, ty: &PrimitiveType) -> Result<Datu
         (PrimitiveType::Float, Literal::Float(f)) => Ok(Datum::float(*f as f32)),
         (PrimitiveType::Double, Literal::Int(i)) => Ok(Datum::double(*i as f64)),
         (PrimitiveType::Double, Literal::Float(f)) => Ok(Datum::double(*f)),
+        (PrimitiveType::Float, Literal::Str(s)) => s
+            .trim()
+            .parse::<f32>()
+            .ok()
+            .filter(|f| f.is_finite())
+            .map(Datum::float)
+            .ok_or_else(mismatch),
+        (PrimitiveType::Double, Literal::Str(s)) => s
+            .trim()
+            .parse::<f64>()
+            .ok()
+            .filter(|f| f.is_finite())
+            .map(Datum::double)
+            .ok_or_else(mismatch),
         (
             PrimitiveType::Decimal { scale, .. },
             Literal::Int(_) | Literal::Float(_) | Literal::Str(_),
@@ -815,6 +913,65 @@ mod tests {
         ] {
             let e = pred(src).unwrap_err().to_string();
             assert!(e.contains(needle), "{src}: {e}");
+        }
+    }
+
+    /// A filter nested or chained past `MAX_DEPTH` is a config error, not a
+    /// stack overflow; one just inside the bound parses.
+    #[test]
+    fn deep_filters_are_refused() {
+        let deep_not = format!("{}a = 1", "not ".repeat(100_000));
+        let deep_parens = format!("{}a = 1{}", "(".repeat(100_000), ")".repeat(100_000));
+        let long_chain = vec!["a = 1"; 100_000].join(" and ");
+        for f in [&deep_not, &deep_parens, &long_chain] {
+            let e = parse(f).unwrap_err().to_string();
+            assert!(e.contains("levels deep"), "{e}");
+        }
+        // Just inside the bound: parsed and typed on a default test stack.
+        pred(&format!("{}b = true", "not ".repeat(MAX_DEPTH - 1))).unwrap();
+        pred(&vec!["b = true"; MAX_DEPTH - 1].join(" or ")).unwrap();
+        pred(&format!(
+            "{}b = true{}",
+            "(".repeat(MAX_DEPTH),
+            ")".repeat(MAX_DEPTH)
+        ))
+        .unwrap();
+        assert!(parse(&vec!["b = true"; MAX_DEPTH + 1].join(" and ")).is_err());
+    }
+
+    /// An unquoted number a double cannot hold exactly is refused rather
+    /// than rounded; quoted, it keeps every digit for a decimal column, and a
+    /// float column still takes it.
+    #[test]
+    fn high_precision_numbers_are_never_rounded() {
+        for n in ["12345678901234567.89", "99999999999999999999"] {
+            let e = parse(&format!("a = {n}")).unwrap_err().to_string();
+            assert!(e.contains("quote it"), "{e}");
+        }
+        for n in ["1.5", "0.1", "2e3", "-0.25", "1.50", "123456789012.34"] {
+            assert!(parse(&format!("a = {n}")).is_ok(), "{n}");
+        }
+        let ty = PrimitiveType::Decimal {
+            precision: 20,
+            scale: 2,
+        };
+        let exact = datum_for("a", &Literal::Str("12345678901234567.89".into()), &ty).unwrap();
+        assert_eq!(exact.to_string(), "12345678901234567.89");
+        let d = datum_for("x", &Literal::Str("0.5".into()), &PrimitiveType::Double).unwrap();
+        assert_eq!(d, Datum::double(0.5));
+        assert!(datum_for("x", &Literal::Str("abc".into()), &PrimitiveType::Double).is_err());
+    }
+
+    #[test]
+    fn decimal_key_and_float_strings() {
+        assert_eq!(decimal_key("1x5"), None);
+        assert_eq!(decimal_key("0.000"), Some((false, String::new(), 0)));
+        assert_eq!(decimal_key("-00"), Some((false, String::new(), 0)));
+        let f = datum_for("x", &Literal::Str(" 0.5 ".into()), &PrimitiveType::Float).unwrap();
+        assert_eq!(f, Datum::float(0.5));
+        for bad in ["abc", "inf", "NaN"] {
+            let e = datum_for("x", &Literal::Str(bad.into()), &PrimitiveType::Float).unwrap_err();
+            assert!(e.to_string().contains(&format!("'{bad}'")), "{e}");
         }
     }
 

@@ -749,6 +749,30 @@ pub async fn partition_roots(
     partition_roots_on(&mut conn, oids).await
 }
 
+/// The fractional digits the server prints `money` with under the
+/// `lc_monetary` locale this role and database get — the setting the
+/// walsender renders change values in.
+pub async fn money_fraction_digits(
+    connection_url: &str,
+    tls: &crate::config::CdcTls,
+) -> Result<u32, FaucetError> {
+    let mut conn = control_connection(connection_url, tls).await?;
+    let one: String = sqlx::query_scalar("SELECT (1::money)::text")
+        .fetch_one(&mut conn)
+        .await
+        .map_err(|e| pg_err("postgres-cdc money format", e))?;
+    money_digits_of(&one)
+}
+
+/// The fraction digits of the server's rendering of `1::money`.
+fn money_digits_of(one: &str) -> Result<u32, FaucetError> {
+    crate::pgoutput::values::fraction_digits_of_money(one).ok_or_else(|| {
+        FaucetError::Source(format!(
+            "postgres-cdc: cannot read the money format from the server's rendering {one:?}"
+        ))
+    })
+}
+
 /// A plain (non-replication) connection for catalog lookups.
 pub async fn control_connection(
     connection_url: &str,
@@ -1121,6 +1145,17 @@ where
 #[allow(clippy::disallowed_methods)] // tests drive time and raw clients directly
 mod tests {
     use super::*;
+
+    #[test]
+    fn money_digits_read_the_rendering_or_refuse_it() {
+        assert_eq!(money_digits_of("$1.00").unwrap(), 2);
+        assert_eq!(money_digits_of("￥1").unwrap(), 0);
+        let e = money_digits_of("$2.50").unwrap_err().to_string();
+        assert!(
+            e.contains("cannot read the money format") && e.contains("$2.50"),
+            "{e}"
+        );
+    }
 
     struct FakeSource {
         reads: std::sync::Arc<std::sync::atomic::AtomicUsize>,
