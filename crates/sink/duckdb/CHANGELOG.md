@@ -7,6 +7,16 @@ and the project aims to follow [Semantic Versioning](https://semver.org/spec/v2.
 (see the versioning policy in CONTRIBUTING.md — connector crates version
 independently).
 
+## [1.4.0](https://github.com/MatteoJoliveau/faucet-stream/compare/faucet-sink-duckdb-v1.3.0...faucet-sink-duckdb-v1.4.0) - 2026-11-02
+
+### Bug Fixes
+
+- DuckDB commit-race retry, chaos history-outage log check, comma-free CI cache keys ([#1023](https://github.com/MatteoJoliveau/faucet-stream/pull/1023))
+
+### Features
+
+- Web console redesign + Overview, Grafana dashboards, one GitHub release per release PR, demo template tests ([#1007](https://github.com/MatteoJoliveau/faucet-stream/pull/1007))
+
 ## [1.3.0](https://github.com/faucet-hq/faucet-stream/compare/faucet-sink-duckdb-v1.2.0...faucet-sink-duckdb-v1.3.0) - 2026-10-29
 
 ### Bug Fixes

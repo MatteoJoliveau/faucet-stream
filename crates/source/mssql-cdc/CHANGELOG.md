@@ -6,6 +6,12 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and the project aims to follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 (see the versioning policy in CONTRIBUTING.md — connector crates version
 independently).
+## [1.2.3](https://github.com/MatteoJoliveau/faucet-stream/compare/faucet-source-mssql-cdc-v1.2.2...faucet-source-mssql-cdc-v1.2.3) - 2026-11-02
+
+### Bug Fixes
+
+- #1007 review findings, history pool, MSSQL reconnect stack, code-scanning and advisories ([#1018](https://github.com/MatteoJoliveau/faucet-stream/pull/1018))
+
 ## [1.2.2](https://github.com/faucet-hq/faucet-stream/compare/faucet-source-mssql-cdc-v1.2.1...faucet-source-mssql-cdc-v1.2.2) - 2026-10-29
 
 ### Bug Fixes
